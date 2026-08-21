@@ -169,11 +169,12 @@ _active_subagents_lock = threading.Lock()
 _active_subagents: Dict[str, Dict[str, Any]] = {}
 
 # A routine backlink worker owns one parent-session/site/run tuple while it is
-# active.  The reservation is deliberately released when the child exits so a
-# provider failure can be resumed with the same run/site without allowing two
-# workers to operate concurrently.
+# active.  Entries include the thread that acquired them.  A synchronous
+# caller can safely reclaim a stale reservation left by a provider exception;
+# a different thread still gets blocked so two live workers cannot submit the
+# same station concurrently.
 _backlink_worker_lock = threading.Lock()
-_backlink_worker_keys: set[tuple[str, str, str]] = set()
+_backlink_worker_keys: Dict[tuple[str, str, str], Dict[str, Any]] = {}
 
 
 def set_spawn_paused(paused: bool) -> bool:
@@ -721,7 +722,7 @@ def _build_child_system_prompt(
     )
     if backlink_submission:
         parts.append(
-            "\n外链提交边界：只能使用 terminal 调用 OpenCLI，以及当前任务明确提供的"
+            "\n外链提交边界：只能使用 terminal 调用 ego-browser，以及当前任务明确提供的"
             "backlinkhub_advance_submission_round 和 backlinkhub_record_submission_result。"
             "只处理当前站点和当前轮次；不得使用 Task、Claim、Attempt、审批或其他工具，"
             "不得修改代码或候选库。每条候选完成后关闭本次标签并立即回写，再领取下一条。"
@@ -731,19 +732,17 @@ def _build_child_system_prompt(
             "\n- 一个站点/轮次同时只运行一个连续执行者；不要按单条候选再次调用 delegate_task，"
             "但执行者因 API/网络故障结束后，主 Hermes 可以使用相同 run_id/site_id 恢复一次，"
             "不得重复已经回写的候选，也不要切换到其他站点。"
-            "\n- 浏览器入口固定为 "
-            "/Users/bobo/.hermes/skills/productivity/backlink-round-execution/scripts/opencli-browser；"
-            "不要把它当作 Python 文件执行，也不要直接调用原始 opencli。"
-            "\n- 每次 terminal 都是独立 shell，禁止依赖 RUNNER/SESSION 等跨调用变量。"
-            "先生成一个字面会话名（如 bh_thesitemath_ab12_cd34），此候选后续每条命令都原样写完整路径和该会话名："
-            "`/Users/bobo/.hermes/skills/productivity/backlink-round-execution/scripts/opencli-browser "
-            "bh_thesitemath_ab12_cd34 open \"<网址>\"`；"
-            "`.../opencli-browser bh_thesitemath_ab12_cd34 state --source ax`；"
-            "`.../opencli-browser bh_thesitemath_ab12_cd34 find --role button --name \"Submit\" --limit 12 --text-max 160`。"
-            "随后只使用 find 返回的编号执行 fill/type/select/upload/check/click/wait，最后用同一字面会话名 close。"
-            "\n- snapshot、inspect、dom、text、get_text、page、elements、content、observe、map、help "
-            "会被自动归一为一次 state；goto/navigate 会被归一为 open；不要反复试错。"
-            "\n- 登录时优先复用 user-default：点击 Google 登录、账号选择和普通 Continue；"
+            "\n- 浏览器入口固定为 `ego-browser nodejs`。每次 terminal 都是独立 shell，"
+            "但必须用同一个任务空间名称（如 `bh_thesitemath_ab12_cd34`）继续当前候选。"
+            "每轮脚本先调用 `useOrCreateTaskSpace(\"bh_thesitemath_ab12_cd34\")`，"
+            "再用 `openOrReuseTab(url, {wait:true})`、`snapshotText()`、`click()`、"
+            "`fillInput()`、`select()`、`uploadFile()`、`waitForElement()` 和 `closeTab()`。"
+            "可以在一个 heredoc 中合并观察、填写、等待和结果判断，减少往返。"
+            "不要调用其他浏览器执行器、原生 Hermes browser、Task、Claim、Attempt 或其他委派工具。"
+            "\n- 普通页面优先 `snapshotText()`；可访问性树为空或 iframe/动态表单无法操作时，"
+            "改用 `captureScreenshot()` + 坐标操作，必要时使用一次受控 `js()`/`cdp()`。"
+            "不得把整页 DOM、邮件正文或一次性链接带回主会话。"
+            "\n- 登录时优先复用 ego 迁移的 Chrome 登录态：只点击一次 Google 登录、账号选择和普通 Continue；"
             "只有密码、OTP、二次验证或安全挑战才停止并记 failed_retryable。"
             "\n- 每次失败回写必须同时带 run_id、site_id、platform_id、work_item_id、method、notes、"
             "failure_reason 和 evidence；ID 必须来自当前候选，不得沿用旧轮次。"
@@ -823,8 +822,12 @@ def _is_backlink_submission_task(
     )
     if any(marker.casefold() in text for marker in backlink_markers):
         return True
-    return "opencli" in text and any(
-        marker in text for marker in ("submit", "submission", "提交")
+    return (
+        any(
+            browser_marker in text
+            for browser_marker in ("opencli", "ego-browser", "ego-lite")
+        )
+        and any(marker in text for marker in ("submit", "submission", "提交"))
     )
 
 
@@ -876,8 +879,16 @@ def _reserve_backlink_workers(
     parent_agent: Any,
     task_list: List[Dict[str, Any]],
     default_toolsets: Optional[List[str]],
+    *,
+    background: bool = False,
 ) -> tuple[list[tuple[str, str, str]], str | None]:
-    """Reserve station workers and reject duplicate or incomplete identities."""
+    """Reserve station workers and reject only live concurrent duplicates.
+
+    Backlink execution is normally synchronous.  If a provider or browser
+    transport raises before the outer delegation ``finally`` runs, the next
+    serial recovery call must be able to reclaim that stale in-process lease.
+    A reservation owned by another thread remains a real concurrency conflict.
+    """
 
     parent_session_id = getattr(parent_agent, "session_id", None)
     if not isinstance(parent_session_id, str) or not parent_session_id.strip():
@@ -901,26 +912,50 @@ def _reserve_backlink_workers(
     if len(set(keys)) != len(keys):
         return [], "Only one BacklinkHub worker may be created per site and run."
 
+    owner_thread_id = threading.get_ident()
     with _backlink_worker_lock:
-        duplicate = next((key for key in keys if key in _backlink_worker_keys), None)
-        if duplicate is not None:
-            _, site_id, run_id = duplicate
+        for key in keys:
+            reservation = _backlink_worker_keys.get(key)
+            if reservation is None:
+                continue
+            if (
+                reservation.get("thread_id") == owner_thread_id
+                and not reservation.get("background")
+                and not background
+            ):
+                # The parent is serial: reaching this point again means the
+                # previous child returned or failed and left stale state.
+                # Reclaim it instead of blocking the next candidate.
+                _backlink_worker_keys.pop(key, None)
+                logger.info(
+                    "Reclaimed stale backlink worker lease for site/run %s/%s",
+                    key[1],
+                    key[2],
+                )
+                continue
+            _, site_id, run_id = key
             return [], (
-                "BacklinkHub worker already created for this parent session: "
-                f"site_id={site_id}, run_id={run_id}. Continue inside the existing "
-                "worker; do not create a new worker per candidate."
+                "BacklinkHub worker is still active for this parent session: "
+                f"site_id={site_id}, run_id={run_id}. Wait for that worker to "
+                "finish instead of creating a concurrent worker."
             )
-        _backlink_worker_keys.update(keys)
+        for key in keys:
+            _backlink_worker_keys[key] = {
+                "thread_id": owner_thread_id,
+                "acquired_at": time.monotonic(),
+                "background": bool(background),
+            }
     return keys, None
 
 
 def _release_backlink_workers(keys: List[tuple[str, str, str]]) -> None:
-    """Release reservations when no child was successfully dispatched."""
+    """Release reservations after a child completes or dispatch fails."""
 
     if not keys:
         return
     with _backlink_worker_lock:
-        _backlink_worker_keys.difference_update(keys)
+        for key in keys:
+            _backlink_worker_keys.pop(key, None)
 
 
 def _get_backlink_max_iterations(cfg: Dict[str, Any], default_max: Any) -> int:
@@ -2430,7 +2465,7 @@ def delegate_task(
             return tool_error(f"Task {i} is missing a 'goal'.")
 
     backlink_worker_keys, backlink_worker_error = _reserve_backlink_workers(
-        parent_agent, task_list, toolsets
+        parent_agent, task_list, toolsets, background=background
     )
     if backlink_worker_error:
         return tool_error(backlink_worker_error)

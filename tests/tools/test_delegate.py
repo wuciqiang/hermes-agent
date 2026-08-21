@@ -147,14 +147,14 @@ class TestChildSystemPrompt(unittest.TestCase):
 
     def test_backlink_submission_prompt_scopes_worker_tools(self):
         prompt = _build_child_system_prompt(
-            "Submit one claimed backlink with OpenCLI",
+            "Submit one claimed backlink with ego-browser",
             backlink_submission=True,
         )
-        self.assertIn("只能使用 terminal 调用 OpenCLI", prompt)
+        self.assertIn("只能使用 terminal 调用 ego-browser", prompt)
         self.assertIn("backlinkhub_advance_submission_round", prompt)
         self.assertIn("backlinkhub_record_submission_result", prompt)
-        self.assertIn("每次 terminal 都是独立 shell", prompt)
-        self.assertNotIn("RUNNER=<", prompt)
+        self.assertIn("ego-browser nodejs", prompt)
+        self.assertNotIn("opencli-browser", prompt)
 
     def test_regular_prompt_does_not_add_backlink_boundary(self):
         prompt = _build_child_system_prompt("Review a Python module")
@@ -170,7 +170,7 @@ class TestBacklinkWorkerIdentity(unittest.TestCase):
 
         self.assertEqual(identity, ("site_thesitemath", "round_20260818_ab12"))
 
-    def test_same_parent_site_and_run_can_only_be_reserved_once(self):
+    def test_same_parent_site_and_run_reclaims_serial_stale_lease(self):
         parent = _make_mock_parent()
         parent.session_id = "parent-session"
         tasks = [
@@ -187,22 +187,40 @@ class TestBacklinkWorkerIdentity(unittest.TestCase):
         keys, error = _reserve_backlink_workers(parent, tasks, None)
         try:
             self.assertIsNone(error)
-            duplicate_keys, duplicate_error = _reserve_backlink_workers(
+            resumed_keys, resumed_error = _reserve_backlink_workers(
                 parent, tasks, None
             )
-            self.assertEqual(duplicate_keys, [])
-            self.assertIn("already created", duplicate_error)
-        finally:
-            _release_backlink_workers(keys)
-
-        # A crashed provider worker releases its reservation, so the same
-        # station/run can be resumed without allowing concurrent duplicates.
-        resumed_keys, resumed_error = _reserve_backlink_workers(parent, tasks, None)
-        try:
             self.assertIsNone(resumed_error)
             self.assertEqual(resumed_keys, keys)
         finally:
-            _release_backlink_workers(resumed_keys)
+            _release_backlink_workers(resumed_keys or keys)
+
+    def test_background_duplicate_stays_blocked(self):
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session-background"
+        tasks = [
+            {
+                "goal": "提交外链",
+                "context": (
+                    "BacklinkHub site_id=site_thesitemath "
+                    "run_id=round_20260818_ab12"
+                ),
+                "toolsets": ["terminal", "backlinkhub"],
+            }
+        ]
+
+        keys, error = _reserve_backlink_workers(
+            parent, tasks, None, background=True
+        )
+        try:
+            self.assertIsNone(error)
+            duplicate_keys, duplicate_error = _reserve_backlink_workers(
+                parent, tasks, None, background=True
+            )
+            self.assertEqual(duplicate_keys, [])
+            self.assertIn("still active", duplicate_error)
+        finally:
+            _release_backlink_workers(keys)
 
     def test_backlink_worker_requires_both_identifiers(self):
         parent = _make_mock_parent()

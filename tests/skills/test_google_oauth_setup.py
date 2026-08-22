@@ -147,6 +147,21 @@ class TestGetAuthUrl:
         assert flow.autogenerate_code_verifier is True
         assert flow.authorization_kwargs == {"access_type": "offline", "prompt": "consent"}
 
+    def test_email_service_requests_only_gmail_readonly(self, setup_module):
+        setup_module.get_auth_url("email")
+
+        expected = ["https://www.googleapis.com/auth/gmail.readonly"]
+        assert FakeFlow.created[-1].scopes == expected
+        saved = json.loads(setup_module.PENDING_AUTH_PATH.read_text())
+        assert saved["scopes"] == expected
+
+    def test_unknown_service_is_rejected(self, setup_module, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            setup_module.get_auth_url("email,unknown")
+
+        assert exc_info.value.code == 2
+        assert "Unknown service" in capsys.readouterr().err
+
 
 class TestExchangeAuthCode:
     def test_reuses_saved_pkce_material_for_plain_code(self, setup_module):

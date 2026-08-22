@@ -1673,6 +1673,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
         "max_tokens": max_tokens,
+        "request_overrides": runtime.get("request_overrides"),
     }
 
 
@@ -14596,8 +14597,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # - Slack DM threading needs event_message_id fallback (reply thread)
         # - Telegram forum topics use message_thread_id; Hermes-created private
         #   DM topic lanes require both thread metadata and a reply anchor
-        # - Feishu only honors reply_in_thread when sending a reply, so topic
+        # - Feishu only honors reply_in_thread when sending a reply, so
         #   progress uses the triggering event message as the reply target
+        #   even for top-level DMs that do not expose a thread_id yet
         # - Other platforms should use explicit source.thread_id only
         _progress_thread_id = _resolve_progress_thread_id(
             source.platform, source.thread_id, event_message_id,
@@ -14608,11 +14610,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
-        _progress_reply_to = (
-            event_message_id
-            if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
-            else None
-        )
+        _progress_reply_to = None
+        if source.platform == Platform.FEISHU and event_message_id:
+            _progress_reply_to = event_message_id
+        elif source.platform == Platform.MATTERMOST and source.thread_id and event_message_id:
+            _progress_reply_to = event_message_id
 
         async def send_progress_messages():
             if not progress_queue:
@@ -14995,15 +14997,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
-        if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
-            # Feishu topics only keep messages inside the topic when they are
-            # sent via the reply API with reply_in_thread=true. Status/interim,
-            # approval, and stream-consumer paths usually only receive metadata,
-            # so carry the triggering message id as a Feishu-specific fallback.
+        if source.platform == Platform.FEISHU and event_message_id:
+            # Feishu only keeps messages in the child reply/thread when they
+            # are sent through the reply API with reply_in_thread=true.
+            # Status/interim, approval, and stream-consumer paths usually only
+            # receive metadata, so carry the triggering message id as a
+            # Feishu-specific fallback. Top-level DMs do not have thread_id.
             _status_thread_metadata: Optional[Dict[str, Any]] = {
-                "thread_id": _progress_thread_id,
                 "reply_to_message_id": event_message_id,
             }
+            if _progress_thread_id:
+                _status_thread_metadata["thread_id"] = _progress_thread_id
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 

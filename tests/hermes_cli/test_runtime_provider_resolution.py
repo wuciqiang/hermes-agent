@@ -1732,6 +1732,32 @@ def test_named_custom_runtime_propagates_extra_body_direct_path(monkeypatch):
     }
 
 
+def test_named_custom_runtime_propagates_default_headers_direct_path(monkeypatch):
+    """Custom provider headers should survive runtime resolution."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "my-gpt")
+    monkeypatch.setattr(
+        rp, "_get_named_custom_provider",
+        lambda p: {
+            "name": "my-gpt",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "test-key",
+            "model": "gpt-5.5",
+            "default_headers": {
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            },
+        },
+    )
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+
+    resolved = rp.resolve_runtime_provider(requested="my-gpt")
+
+    assert resolved["default_headers"] == {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+
+
 def test_named_custom_runtime_propagates_model_pool_path(monkeypatch):
     """Model should propagate even when credential pool handles credentials."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "my-server")
@@ -1791,6 +1817,36 @@ def test_named_custom_runtime_propagates_extra_body_pool_path(monkeypatch):
     assert resolved["request_overrides"] == {
         "extra_body": {"enable_thinking": True}
     }
+
+
+def test_named_custom_runtime_propagates_default_headers_pool_path(monkeypatch):
+    """Custom provider headers should survive credential-pool resolution."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "my-gpt")
+    monkeypatch.setattr(
+        rp, "_get_named_custom_provider",
+        lambda p: {
+            "name": "my-gpt",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "test-key",
+            "model": "gpt-5.5",
+            "default_headers": {"User-Agent": "Mozilla/5.0"},
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "_try_resolve_from_custom_pool",
+        lambda *a, **k: {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "pool-key",
+            "source": "pool:custom:my-gpt",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="my-gpt")
+
+    assert resolved["default_headers"] == {"User-Agent": "Mozilla/5.0"}
 
 
 def test_named_custom_runtime_no_model_when_absent(monkeypatch):
@@ -2299,6 +2355,50 @@ class TestProviderEntryApiKeyEnvAlias:
         assert normalized is not None
         assert "extra_body" in _VALID_CUSTOM_PROVIDER_FIELDS
         assert normalized["extra_body"] == entry["extra_body"]
+
+    def test_default_headers_is_supported_schema(self):
+        from hermes_cli.config import (
+            _VALID_CUSTOM_PROVIDER_FIELDS,
+            _normalize_custom_provider_entry,
+        )
+        entry = {
+            "name": "vendor",
+            "base_url": "https://api.vendor.example.com/v1",
+            "extra_headers": {
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            },
+        }
+        normalized = _normalize_custom_provider_entry(dict(entry), provider_key="vendor")
+        assert normalized is not None
+        assert "default_headers" in _VALID_CUSTOM_PROVIDER_FIELDS
+        assert "extra_headers" in _VALID_CUSTOM_PROVIDER_FIELDS
+        assert normalized["default_headers"] == entry["extra_headers"]
+
+
+def test_get_named_custom_provider_includes_default_headers(monkeypatch):
+    monkeypatch.setattr(rp, "load_config", lambda: {
+        "providers": {
+            "squarefaceicon-gpt": {
+                "name": "Squarefaceicon GPT",
+                "api": "https://api.squarefaceicon.org/v1",
+                "key_env": "SQUAREFACEICON_GPT_API_KEY",
+                "extra_headers": {
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json",
+                },
+                "default_model": "gpt-5.5",
+            },
+        },
+    })
+
+    result = rp._get_named_custom_provider("squarefaceicon-gpt")
+
+    assert result is not None
+    assert result["default_headers"] == {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
 # =============================================================================
 # Tencent TokenHub — API-key provider runtime resolution
 # =============================================================================

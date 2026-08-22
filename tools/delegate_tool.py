@@ -19,6 +19,8 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 import os
@@ -40,6 +42,13 @@ from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
 
+# The ego-browser install is outside the shell PATH used by Hermes gateway
+# workers. Keep the absolute path in the worker contract so Luna does not
+# waste attempts probing for the obsolete `ego-lite`/`ego` commands.
+_EGO_BROWSER_BIN = str(Path.home() / ".local" / "bin" / "ego-browser")
+DEFAULT_BACKLINK_SUMMARY_CHARS = 1400
+DEFAULT_BACKLINK_TRACE_ENTRIES = 12
+
 
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset(
@@ -51,6 +60,13 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "execute_code",  # children should reason step-by-step, not write scripts
     ]
 )
+
+# Routine BacklinkHub operations are append-only, idempotent, and do not hold
+# process-local claims.  They may be exposed to a deliberately scoped backlink
+# worker; ordinary delegated children still have the toolset stripped below.
+# Keeping the toolset in this blocklist by default preserves the old boundary;
+# only the explicit backlink-worker path removes it.
+DELEGATE_BLOCKED_TOOLSETS = frozenset({"backlinkhub"})
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +171,14 @@ _active_subagents_lock = threading.Lock()
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: Dict[str, Dict[str, Any]] = {}
+
+# A routine backlink worker owns one parent-session/site/run tuple while it is
+# active.  Entries include the thread that acquired them.  A synchronous
+# caller can safely reclaim a stale reservation left by a provider exception;
+# a different thread still gets blocked so two live workers cannot submit the
+# same station concurrently.
+_backlink_worker_lock = threading.Lock()
+_backlink_worker_keys: Dict[tuple[str, str, str], Dict[str, Any]] = {}
 
 
 def set_spawn_paused(paused: bool) -> bool:
@@ -276,6 +300,19 @@ def _extract_output_tail(
 
     tail.reverse()  # restore chronological order for display
     return tail
+
+
+def _compact_backlink_summary(
+    summary: Any, *, max_chars: int = DEFAULT_BACKLINK_SUMMARY_CHARS
+) -> str:
+    """Keep station-worker results useful without replaying browser transcripts."""
+
+    text = str(summary or "").strip()
+    if len(text) <= max_chars:
+        return text
+    head = max_chars * 2 // 3
+    tail = max_chars - head - 32
+    return text[:head].rstrip() + "\n...[摘要已压缩]...\n" + text[-tail:].lstrip()
 
 
 def _stringify_tool_content(content: Any) -> str:
@@ -502,7 +539,7 @@ def _get_max_spawn_depth() -> int:
     floored = max(_MIN_SPAWN_DEPTH, ival)
     if floored != ival:
         logger.warning(
-            "delegation.max_spawn_depth=%d below floor %d; using %d",
+            "delegation.max_spawn_depth=%d below floor %d; clamping to %d",
             ival,
             _MIN_SPAWN_DEPTH,
             floored,
@@ -591,6 +628,12 @@ def _preserve_parent_mcp_toolsets(
 
 
 DEFAULT_MAX_ITERATIONS = 50
+# A backlink child is a station-level worker, not a one-candidate worker.
+# Keep enough room for several compact candidate loops plus close/writeback so
+# the station worker can finish without spawning replacement contexts.
+# A small station quota should finish in one bounded worker.  Keep the general
+# delegation default separate so code-review/research children are unaffected.
+DEFAULT_BACKLINK_MAX_ITERATIONS = 60
 # No default wall-clock cap on child agents: legitimate heavy subagent work
 # (deep reviews, research fan-outs, slow reasoning models) was being killed
 # mid-task. Errors should come from what the child actually does; stuck-child
@@ -661,6 +704,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    backlink_submission: bool = False,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -695,6 +739,47 @@ def _build_child_system_prompt(
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
+    if backlink_submission:
+        parts.append(
+            "\n外链提交边界：只能使用 terminal 调用 ego-browser，以及当前任务明确提供的"
+            "backlinkhub_advance_submission_round 和 backlinkhub_record_submission_result。"
+            "只处理当前站点和当前轮次；不得使用 Task、Claim、Attempt、审批或其他工具，"
+            "不得修改代码或候选库。每条候选完成后关闭本次标签并立即回写，再领取下一条。"
+        )
+        parts.append(
+            "\n外链执行固定规则（不要自行探索命令）："
+            "\n- 一个站点/轮次同时只运行一个连续执行者；不要按单条候选再次调用 delegate_task，"
+            "但执行者因 API/网络故障结束后，主 Hermes 可以使用相同 run_id/site_id 恢复一次，"
+            "不得重复已经回写的候选，也不要切换到其他站点。"
+            f"\n- 浏览器唯一入口是 `{_EGO_BROWSER_BIN} nodejs`。执行环境的 PATH 可能不包含 ~/.local/bin，"
+            "所以不要调用裸的 `ego-browser`，也不要寻找或调用 `ego-lite`、`ego` 或 OpenCLI。"
+            "heredoc 中的 ego helpers 已预加载，禁止 require/import 任何 ego 模块或猜测模块路径。"
+            "每次 terminal 都是独立 shell。整个站点轮次只使用一个任务空间，名称固定为 "
+            "`bh_<site_id>_<run_id>`；所有候选复用该空间和登录态，禁止为 work item 创建独立空间。"
+            "每条候选只打开一个临时标签，每轮脚本先调用 `useOrCreateTaskSpace(\"bh_<site_id>_<run_id>\")`，"
+            "再用 `openOrReuseTab(url, {wait:true})`、`snapshotText()`、`click()`、"
+            "`fillInput()`、`uploadFile()`、`waitForElement()` 和 `closeTab()`。ego 没有 `select()` helper；"
+            "下拉框用 `click()` 后按键选择，或用一次 `js()` 设置 value 并触发 input/change 事件。"
+            "可以在一个 heredoc 中合并观察、填写、等待和结果判断，减少往返。"
+            "每条候选通常两次浏览器调用，只有登录、动态表单或技术恢复确有需要时才增加；"
+            "调用次数本身不是失败条件。关闭标签后不要再调用 listTabs。"
+            "不要调用其他浏览器执行器、原生 Hermes browser、Task、Claim、Attempt 或其他委派工具。"
+            "\n- 普通页面优先 `snapshotText()`；可访问性树为空或 iframe/动态表单无法操作时，"
+            "改用 `captureScreenshot()` + 坐标操作，必要时使用一次受控 `js()`/`cdp()`。"
+            "不得把整页 DOM、邮件正文或一次性链接带回主会话。"
+            "\n- 登录时优先复用 ego 迁移的 Chrome 登录态：只点击一次 Google 登录、账号选择和普通 Continue；"
+            "只有密码、OTP、二次验证或安全挑战才停止并记 failed_retryable。"
+            "遇到 EGO_TASK_SPACE_USER_IN_CONTROL 或 user is controlling 时立即停止浏览器操作，"
+            "不得重试、创建替代空间或自行 takeOverTaskSpace，也不要声称用户手动接管。"
+            "最终点击前中断回写 failed_retryable，failure_reason 使用 ego_task_space_control_interrupted；"
+            "最终点击后中断回写 attempted_unconfirmed；两者都不得写 failed_final。"
+            "用户明确说继续后，下一执行器先对同一个 `bh_<site_id>_<run_id>` 调用 takeOverTaskSpace 再恢复。"
+            "达到目标或队列耗尽后，确认最后一条已回写，再用单独的最终 heredoc 调用 "
+            "completeTaskSpace(\"bh_<site_id>_<run_id>\", {keep:false})；等待用户继续时保留空间。"
+            "\n- 每次回写只填写 outcome、method、notes、evidence 以及失败时的 failure_reason；"
+            "四个候选身份字段由 BacklinkHub 按本执行器刚领取的候选自动补齐和校验，"
+            "不要手工拼接或猜测 ID。"
+        )
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -756,14 +841,241 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     return None
 
 
-def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
-    """Remove toolsets that contain only blocked tools."""
+def _is_backlink_submission_task(
+    goal: Optional[str], context: Optional[str] = None
+) -> bool:
+    """Detect the narrow browser-worker workflow needing the extra boundary."""
+    text = f"{goal or ''}\n{context or ''}".casefold()
+    backlink_markers = (
+        "backlinkhub",
+        "backlink",
+        "外链",
+        "submission round",
+        "提交外链",
+    )
+    if any(marker.casefold() in text for marker in backlink_markers):
+        return True
+    return (
+        "ego-browser" in text
+        and any(marker in text for marker in ("submit", "submission", "提交"))
+    )
+
+
+_BACKLINK_SITE_ID_RE = re.compile(
+    r"\bsite_id\s*[:=]\s*([A-Za-z0-9_-]+)|\b(site_[a-z0-9_]+)\b",
+    re.IGNORECASE,
+)
+_BACKLINK_RUN_ID_RE = re.compile(
+    r"\brun_id\s*[:=]\s*([A-Za-z0-9_.:-]+)|"
+    r"\b((?:round|daily)_[0-9]{8}_[A-Za-z0-9_.:-]+)\b",
+    re.IGNORECASE,
+)
+_BACKLINK_SITE_REFERENCE_RE = re.compile(
+    r"(?m)^backlink_site_reference=([^\r\n]+)$",
+    re.IGNORECASE,
+)
+_BACKLINK_RUN_REFERENCE_RE = re.compile(
+    r"(?m)^backlink_run_reference=([^\r\n]+)$",
+    re.IGNORECASE,
+)
+_BACKLINK_WORKER_TURN_RE = re.compile(
+    r"(?m)^backlink_worker_turn=([^\r\n]+)$",
+    re.IGNORECASE,
+)
+
+
+def _backlink_reference_scope(value: str) -> str:
+    """Normalize a worker reservation reference without inventing a site ID."""
+
+    raw = str(value or "").strip()
+    if not raw or raw == "*":
+        return "*"
+    try:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+        host = str(parsed.hostname or "").strip(".").casefold()
+        if host.startswith("www."):
+            host = host[4:]
+        if host:
+            return host
+    except (TypeError, ValueError):
+        pass
+    return " ".join(raw.casefold().split())
+
+
+def _backlink_worker_identity(
+    goal: Optional[str], context: Optional[str]
+) -> tuple[str, str] | None:
+    """Extract an exact or provisional station-worker reservation identity.
+
+    A new routine has no authoritative run_id until its first BacklinkHub
+    advance.  In that case the parent supplies the original site reference and
+    a stable turn marker.  This identity is only an in-process concurrency
+    reservation; BacklinkHub remains the authority that resolves domains and
+    aliases to the real site_id.
+    """
+
+    text = f"{goal or ''}\n{context or ''}"
+    site_match = _BACKLINK_SITE_ID_RE.search(text)
+    run_match = _BACKLINK_RUN_ID_RE.search(text)
+    if site_match and run_match:
+        site_id = next(value for value in site_match.groups() if value)
+        run_id = next(value for value in run_match.groups() if value)
+        return site_id.casefold(), run_id
+
+    reference_match = _BACKLINK_SITE_REFERENCE_RE.search(text)
+    run_reference_match = _BACKLINK_RUN_REFERENCE_RE.search(text)
+    turn_match = _BACKLINK_WORKER_TURN_RE.search(text)
+    if not reference_match or not run_reference_match or not turn_match:
+        return None
+    site_reference = _backlink_reference_scope(reference_match.group(1))
+    run_reference = run_reference_match.group(1).strip()
+    worker_turn = turn_match.group(1).strip()
+    if not site_reference or not worker_turn:
+        return None
+    run_scope = run_reference if run_reference and run_reference != "*" else f"turn:{worker_turn}"
+    return f"reference:{site_reference}", run_scope
+
+
+def _is_backlink_worker_task(
+    task: Dict[str, Any], default_toolsets: Optional[List[str]]
+) -> bool:
+    """Return whether a delegated task is an actual BacklinkHub executor."""
+
+    goal = task.get("goal")
+    context = task.get("context")
+    if not _is_backlink_submission_task(goal, context):
+        return False
+    text = f"{goal or ''}\n{context or ''}".casefold()
+    requested = task.get("toolsets") or default_toolsets or ()
+    return (
+        "backlinkhub" in text
+        or "backlinkhub" in requested
+        or ("site_id" in text and "run_id" in text)
+    )
+
+
+def _reserve_backlink_workers(
+    parent_agent: Any,
+    task_list: List[Dict[str, Any]],
+    default_toolsets: Optional[List[str]],
+    *,
+    background: bool = False,
+) -> tuple[list[tuple[str, str, str]], str | None]:
+    """Reserve station workers and reject only live concurrent duplicates.
+
+    Backlink execution is normally synchronous.  If a provider or browser
+    transport raises before the outer delegation ``finally`` runs, the next
+    serial recovery call must be able to reclaim that stale in-process lease.
+    A reservation owned by another thread remains a real concurrency conflict.
+    """
+
+    parent_session_id = getattr(parent_agent, "session_id", None)
+    if not isinstance(parent_session_id, str) or not parent_session_id.strip():
+        return [], None
+
+    keys: list[tuple[str, str, str]] = []
+    for task in task_list:
+        if not _is_backlink_worker_task(task, default_toolsets):
+            continue
+        identity = _backlink_worker_identity(task.get("goal"), task.get("context"))
+        if identity is None:
+            return [], (
+                "BacklinkHub worker requires either explicit site_id/run_id or "
+                "a parent-supplied site reference and worker turn identity."
+            )
+        site_id, run_id = identity
+        keys.append((parent_session_id, site_id, run_id))
+
+    if not keys:
+        return [], None
+    if len(set(keys)) != len(keys):
+        return [], "Only one BacklinkHub worker may be created per site and run."
+
+    owner_thread_id = threading.get_ident()
+    with _backlink_worker_lock:
+        for key in keys:
+            reservation = _backlink_worker_keys.get(key)
+            if reservation is None:
+                continue
+            if (
+                reservation.get("thread_id") == owner_thread_id
+                and not reservation.get("background")
+                and not background
+            ):
+                # The parent is serial: reaching this point again means the
+                # previous child returned or failed and left stale state.
+                # Reclaim it instead of blocking the next candidate.
+                _backlink_worker_keys.pop(key, None)
+                logger.info(
+                    "Reclaimed stale backlink worker lease for site/run %s/%s",
+                    key[1],
+                    key[2],
+                )
+                continue
+            _, site_id, run_id = key
+            return [], (
+                "BacklinkHub worker is still active for this parent session: "
+                f"site_id={site_id}, run_id={run_id}. Wait for that worker to "
+                "finish instead of creating a concurrent worker."
+            )
+        for key in keys:
+            _backlink_worker_keys[key] = {
+                "thread_id": owner_thread_id,
+                "acquired_at": time.monotonic(),
+                "background": bool(background),
+            }
+    return keys, None
+
+
+def _release_backlink_workers(keys: List[tuple[str, str, str]]) -> None:
+    """Release reservations after a child completes or dispatch fails."""
+
+    if not keys:
+        return
+    with _backlink_worker_lock:
+        for key in keys:
+            _backlink_worker_keys.pop(key, None)
+
+
+def _get_backlink_max_iterations(cfg: Dict[str, Any], default_max: Any) -> int:
+    """Return the compact per-station budget used by backlink workers.
+
+    Backlink workers are intentionally long-lived at station scope, but they
+    should not inherit a large general-purpose delegation budget.  The
+    explicit config key is an escape hatch; otherwise cap the normal budget at
+    the workflow default so a model cannot create a child per candidate.
+    """
+    configured = cfg.get("backlink_max_iterations")
+    if configured is None:
+        try:
+            return min(int(default_max), DEFAULT_BACKLINK_MAX_ITERATIONS)
+        except (TypeError, ValueError):
+            return DEFAULT_BACKLINK_MAX_ITERATIONS
+    try:
+        return max(20, int(configured))
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.backlink_max_iterations=%r is invalid; using default %d",
+            configured,
+            DEFAULT_BACKLINK_MAX_ITERATIONS,
+        )
+        return DEFAULT_BACKLINK_MAX_ITERATIONS
+
+
+def _strip_blocked_tools(
+    toolsets: List[str], *, allow_backlinkhub: bool = False
+) -> List[str]:
+    """Remove blocked toolsets, with an explicit backlink-worker exception."""
     blocked_toolset_names = {
         "delegation",
         "clarify",
         "memory",
         "code_execution",
-    }
+    } | set(DELEGATE_BLOCKED_TOOLSETS)
+    if allow_backlinkhub:
+        blocked_toolset_names.discard("backlinkhub")
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
@@ -1044,6 +1356,8 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
+    backlink_submission = _is_backlink_submission_task(goal, context)
+
     if toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
@@ -1054,13 +1368,21 @@ def _build_child_agent(
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
-        child_toolsets = _strip_blocked_tools(child_toolsets)
+        child_toolsets = _strip_blocked_tools(
+            child_toolsets, allow_backlinkhub=backlink_submission
+        )
     elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
+        child_toolsets = _strip_blocked_tools(
+            parent_enabled, allow_backlinkhub=backlink_submission
+        )
     elif parent_toolsets:
-        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
+        child_toolsets = _strip_blocked_tools(
+            sorted(parent_toolsets), allow_backlinkhub=backlink_submission
+        )
     else:
-        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+        child_toolsets = _strip_blocked_tools(
+            DEFAULT_TOOLSETS, allow_backlinkhub=backlink_submission
+        )
 
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
@@ -1077,6 +1399,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        backlink_submission=backlink_submission,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1180,11 +1503,23 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
-    # Inherit the parent's fallback provider chain so subagents can recover
-    # from rate-limits and credential exhaustion exactly like the top-level
-    # agent does.  _fallback_chain is a list accepted by AIAgent's
-    # fallback_model parameter (which handles both list and dict forms).
+    # Inherit the parent's fallback provider chain so ordinary subagents can
+    # recover from rate-limits and credential exhaustion.  A backlink worker
+    # performs external side effects, so it must not jump to an unrelated
+    # provider mid-run: keep only the configured api-icu Terra fallback.
     parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    if backlink_submission and parent_fallback:
+        parent_fallback = [
+            entry
+            for entry in parent_fallback
+            if isinstance(entry, dict)
+            and str(entry.get("provider") or "").strip().casefold() == "api-icu"
+            and str(entry.get("model") or "").strip().casefold() == "gpt-5.6-terra"
+        ][:1]
+        if not parent_fallback:
+            logger.info(
+                "Backlink worker has no api-icu Terra fallback; keeping the primary model only"
+            )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1765,6 +2100,12 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
 
         summary = result.get("final_response") or ""
+        backlink_submission = _is_backlink_submission_task(goal, None)
+        summary_for_parent = (
+            _compact_backlink_summary(summary)
+            if backlink_submission
+            else summary
+        )
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
@@ -1815,23 +2156,40 @@ def _run_single_child(
                         # Fallback for messages without tool_call_id
                         tool_trace[-1].update(result_meta)
 
-        # Determine exit reason
-        if interrupted:
+        # Determine exit reason from the child result.  Previously every
+        # incomplete child was labelled max_iterations, which misreported
+        # provider/network failures (including a failed 45th API call) as a
+        # hard iteration limit and prevented correct recovery decisions.
+        raw_exit_reason = result.get("turn_exit_reason")
+        if isinstance(raw_exit_reason, str) and raw_exit_reason.strip() and raw_exit_reason != "unknown":
+            exit_reason = raw_exit_reason
+        elif interrupted:
             exit_reason = "interrupted"
         elif completed:
             exit_reason = "completed"
         else:
-            exit_reason = "max_iterations"
+            child_max_iterations = getattr(child, "max_iterations", None)
+            if not isinstance(child_max_iterations, int):
+                child_max_iterations = DEFAULT_MAX_ITERATIONS
+            if isinstance(api_calls, int) and api_calls >= child_max_iterations:
+                exit_reason = "max_iterations"
+            elif result.get("error"):
+                exit_reason = "provider_error"
+            else:
+                exit_reason = "incomplete"
 
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
 
+        if backlink_submission and len(tool_trace) > DEFAULT_BACKLINK_TRACE_ENTRIES:
+            tool_trace = tool_trace[-DEFAULT_BACKLINK_TRACE_ENTRIES:]
+
         entry: Dict[str, Any] = {
             "task_index": task_index,
             "status": status,
-            "summary": summary,
+            "summary": summary_for_parent,
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
@@ -1925,13 +2283,21 @@ def _run_single_child(
             }
         )[:40]
 
-        _output_tail = _extract_output_tail(result, max_entries=8, max_chars=600)
+        _output_tail = _extract_output_tail(
+            result,
+            max_entries=4 if backlink_submission else 8,
+            max_chars=240 if backlink_submission else 600,
+        )
 
         complete_kwargs: Dict[str, Any] = {
-            "preview": summary[:160] if summary else entry.get("error", ""),
+            "preview": summary_for_parent[:160]
+            if summary_for_parent
+            else entry.get("error", ""),
             "status": status,
             "duration_seconds": duration,
-            "summary": summary[:500] if summary else entry.get("error", ""),
+            "summary": summary_for_parent[:500]
+            if summary_for_parent
+            else entry.get("error", ""),
             "input_tokens": (
                 int(_input_tokens) if isinstance(_input_tokens, (int, float)) else 0
             ),
@@ -2196,6 +2562,27 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
+    backlink_worker_keys, backlink_worker_error = _reserve_backlink_workers(
+        parent_agent, task_list, toolsets, background=background
+    )
+    if backlink_worker_error:
+        return tool_error(backlink_worker_error)
+
+    # Backlink work is station-scoped: one Luna child should process the
+    # station's candidates in sequence. Give that worker a workflow-specific
+    # budget instead of the general delegation budget, which previously made
+    # repeated one-candidate children unnecessarily expensive.
+    if any(
+        _is_backlink_submission_task(task.get("goal"), task.get("context"))
+        for task in task_list
+    ):
+        effective_max_iter = _get_backlink_max_iterations(cfg, default_max_iter)
+        logger.info(
+            "delegate_task: using backlink station budget=%d for %d task(s)",
+            effective_max_iter,
+            len(task_list),
+        )
+
     overall_start = time.monotonic()
     results = []
 
@@ -2246,6 +2633,9 @@ def delegate_task(
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
+    except Exception:
+        _release_backlink_workers(backlink_worker_keys)
+        raise
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
@@ -2291,7 +2681,10 @@ def delegate_task(
                     pass
 
             def _async_runner(_child=child, _goal=_t["goal"]):
-                return _run_single_child(0, _goal, _child, parent_agent)
+                try:
+                    return _run_single_child(0, _goal, _child, parent_agent)
+                finally:
+                    _release_backlink_workers(backlink_worker_keys)
 
             def _async_interrupt(_child=child):
                 try:
@@ -2302,17 +2695,21 @@ def delegate_task(
                 except Exception:
                     pass
 
-            dispatch = dispatch_async_delegation(
-                goal=_t["goal"],
-                context=_t.get("context"),
-                toolsets=_t.get("toolsets") or toolsets,
-                role=_normalize_role(_t.get("role") or top_role),
-                model=creds["model"],
-                session_key=_session_key,
-                runner=_async_runner,
-                interrupt_fn=_async_interrupt,
-                max_async_children=_get_max_async_children(),
-            )
+            try:
+                dispatch = dispatch_async_delegation(
+                    goal=_t["goal"],
+                    context=_t.get("context"),
+                    toolsets=_t.get("toolsets") or toolsets,
+                    role=_normalize_role(_t.get("role") or top_role),
+                    model=creds["model"],
+                    session_key=_session_key,
+                    runner=_async_runner,
+                    interrupt_fn=_async_interrupt,
+                    max_async_children=_get_max_async_children(),
+                )
+            except Exception:
+                _release_backlink_workers(backlink_worker_keys)
+                raise
 
             if dispatch.get("status") == "dispatched":
                 return json.dumps(
@@ -2333,67 +2730,94 @@ def delegate_task(
                 )
             # Rejected (at capacity or schedule failure) — surface as a tool
             # error so the model can fall back to synchronous delegation.
+            _release_backlink_workers(backlink_worker_keys)
             return tool_error(
                 dispatch.get("error", "Async delegation could not be scheduled.")
             )
 
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
-        results.append(result)
+        try:
+            result = _run_single_child(0, _t["goal"], child, parent_agent)
+            results.append(result)
+        finally:
+            _release_backlink_workers(backlink_worker_keys)
     else:
         # Batch -- run in parallel with per-task progress lines
         completed_count = 0
         spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
-        with ThreadPoolExecutor(max_workers=max_children) as executor:
-            futures = {}
-            for i, t, child in children:
-                future = executor.submit(
-                    _run_single_child,
-                    task_index=i,
-                    goal=t["goal"],
-                    child=child,
-                    parent_agent=parent_agent,
-                )
-                futures[future] = i
+        try:
+            with ThreadPoolExecutor(max_workers=max_children) as executor:
+                futures = {}
+                for i, t, child in children:
+                    future = executor.submit(
+                        _run_single_child,
+                        task_index=i,
+                        goal=t["goal"],
+                        child=child,
+                        parent_agent=parent_agent,
+                    )
+                    futures[future] = i
 
-            # Poll futures with interrupt checking.  as_completed() blocks
-            # until ALL futures finish — if a child agent gets stuck,
-            # the parent blocks forever even after interrupt propagation.
-            # Instead, use wait() with a short timeout so we can bail
-            # when the parent is interrupted.
-            # Map task_index -> child agent, so fabricated entries for
-            # still-pending futures can carry the correct _delegate_role.
-            _child_by_index = {i: child for (i, _, child) in children}
-
-            pending = set(futures.keys())
-            while pending:
-                if getattr(parent_agent, "_interrupt_requested", False) is True:
-                    # Parent interrupted — collect whatever finished and
-                    # abandon the rest.  Children already received the
-                    # interrupt signal; we just can't wait forever.
-                    for f in pending:
-                        idx = futures[f]
-                        if f.done():
-                            try:
-                                entry = f.result()
-                            except Exception as exc:
+                # Poll futures with interrupt checking.  as_completed() blocks
+                # until ALL futures finish — if a child agent gets stuck,
+                # the parent blocks forever even after interrupt propagation.
+                # Instead, use wait() with a short timeout so we can bail
+                # when the parent is interrupted.
+                _child_by_index = {i: child for (i, _, child) in children}
+                pending = set(futures.keys())
+                while pending:
+                    if getattr(parent_agent, "_interrupt_requested", False) is True:
+                        # Parent interrupted — collect whatever finished and
+                        # abandon the rest.  Children already received the
+                        # interrupt signal; we just can't wait forever.
+                        for f in pending:
+                            idx = futures[f]
+                            if f.done():
+                                try:
+                                    entry = f.result()
+                                except Exception as exc:
+                                    entry = {
+                                        "task_index": idx,
+                                        "status": "error",
+                                        "summary": None,
+                                        "error": str(exc),
+                                        "api_calls": 0,
+                                        "duration_seconds": 0,
+                                        "_child_role": getattr(
+                                            _child_by_index.get(idx), "_delegate_role", None
+                                        ),
+                                    }
+                            else:
                                 entry = {
                                     "task_index": idx,
-                                    "status": "error",
+                                    "status": "interrupted",
                                     "summary": None,
-                                    "error": str(exc),
+                                    "error": "Parent agent interrupted — child did not finish in time",
                                     "api_calls": 0,
                                     "duration_seconds": 0,
                                     "_child_role": getattr(
                                         _child_by_index.get(idx), "_delegate_role", None
                                     ),
                                 }
-                        else:
+                            results.append(entry)
+                            completed_count += 1
+                        break
+
+                    from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
+
+                    done, pending = _cf_wait(
+                        pending, timeout=0.5, return_when=FIRST_COMPLETED
+                    )
+                    for future in done:
+                        try:
+                            entry = future.result()
+                        except Exception as exc:
+                            idx = futures[future]
                             entry = {
                                 "task_index": idx,
-                                "status": "interrupted",
+                                "status": "error",
                                 "summary": None,
-                                "error": "Parent agent interrupted — child did not finish in time",
+                                "error": str(exc),
                                 "api_calls": 0,
                                 "duration_seconds": 0,
                                 "_child_role": getattr(
@@ -2402,58 +2826,35 @@ def delegate_task(
                             }
                         results.append(entry)
                         completed_count += 1
-                    break
 
-                from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
-
-                done, pending = _cf_wait(
-                    pending, timeout=0.5, return_when=FIRST_COMPLETED
-                )
-                for future in done:
-                    try:
-                        entry = future.result()
-                    except Exception as exc:
-                        idx = futures[future]
-                        entry = {
-                            "task_index": idx,
-                            "status": "error",
-                            "summary": None,
-                            "error": str(exc),
-                            "api_calls": 0,
-                            "duration_seconds": 0,
-                            "_child_role": getattr(
-                                _child_by_index.get(idx), "_delegate_role", None
-                            ),
-                        }
-                    results.append(entry)
-                    completed_count += 1
-
-                    # Print per-task completion line above the spinner
-                    idx = entry["task_index"]
-                    label = (
-                        task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
-                    )
-                    dur = entry.get("duration_seconds", 0)
-                    status = entry.get("status", "?")
-                    icon = "✓" if status == "completed" else "✗"
-                    remaining = n_tasks - completed_count
-                    completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
-                    if spinner_ref:
-                        try:
-                            spinner_ref.print_above(completion_line)
-                        except Exception:
+                        # Print per-task completion line above the spinner
+                        idx = entry["task_index"]
+                        label = (
+                            task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
+                        )
+                        dur = entry.get("duration_seconds", 0)
+                        status = entry.get("status", "?")
+                        icon = "✓" if status == "completed" else "✗"
+                        remaining = n_tasks - completed_count
+                        completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
+                        if spinner_ref:
+                            try:
+                                spinner_ref.print_above(completion_line)
+                            except Exception:
+                                print(f"  {completion_line}")
+                        else:
                             print(f"  {completion_line}")
-                    else:
-                        print(f"  {completion_line}")
 
-                    # Update spinner text to show remaining count
-                    if spinner_ref and remaining > 0:
-                        try:
-                            spinner_ref.update_text(
-                                f"🔀 {remaining} task{'s' if remaining != 1 else ''} remaining"
-                            )
-                        except Exception as e:
-                            logger.debug("Spinner update_text failed: %s", e)
+                        # Update spinner text to show remaining count
+                        if spinner_ref and remaining > 0:
+                            try:
+                                spinner_ref.update_text(
+                                    f"🔀 {remaining} task{'s' if remaining != 1 else ''} remaining"
+                                )
+                            except Exception as e:
+                                logger.debug("Spinner update_text failed: %s", e)
+        finally:
+            _release_backlink_workers(backlink_worker_keys)
 
         # Sort by task_index so results match input order
         results.sort(key=lambda r: r["task_index"])

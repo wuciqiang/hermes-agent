@@ -260,6 +260,11 @@ def _run_agent(
     from run_agent import AIAgent
 
     cfg = load_config()
+    agent_cfg = cfg.get("agent") or {}
+    try:
+        max_iterations = int(agent_cfg.get("max_turns") or 90)
+    except (TypeError, ValueError):
+        max_iterations = 90
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -338,12 +343,14 @@ def _run_agent(
         provider=runtime.get("provider"),
         api_mode=runtime.get("api_mode"),
         model=effective_model,
+        max_iterations=max_iterations,
         enabled_toolsets=toolsets_list,
         quiet_mode=True,
         platform="cli",
         session_db=session_db,
         credential_pool=runtime.get("credential_pool"),
         fallback_model=_fb or None,
+        request_overrides=runtime.get("request_overrides"),
         # Interactive callbacks are intentionally NOT wired beyond this
         # one.  In oneshot mode there's no user sitting at a terminal:
         #   - clarify  → returns a synthetic "pick a default" instruction

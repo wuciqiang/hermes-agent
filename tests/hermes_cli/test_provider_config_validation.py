@@ -191,3 +191,31 @@ class TestNormalizeCustomProviderEntry:
         result = _normalize_custom_provider_entry(entry)
         assert result is not None
         assert "models" not in result
+
+    def test_extra_headers_normalize_to_default_headers(self):
+        """Provider-level extra_headers should reach OpenAI default_headers."""
+        entry = {
+            "name": "acme",
+            "base_url": "https://api.example.com/v1",
+            "extra_headers": {
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+                "X-Skip": None,
+            },
+        }
+        result = _normalize_custom_provider_entry(entry)
+        assert result is not None
+        assert result["default_headers"] == {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        }
+
+    def test_camel_case_default_headers_mapped(self):
+        entry = {
+            "name": "acme",
+            "baseUrl": "https://api.example.com/v1",
+            "defaultHeaders": {"User-Agent": "Mozilla/5.0"},
+        }
+        result = _normalize_custom_provider_entry(entry)
+        assert result is not None
+        assert result["default_headers"] == {"User-Agent": "Mozilla/5.0"}

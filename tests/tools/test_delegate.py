@@ -11,9 +11,11 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import sys
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -28,7 +30,11 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _compact_backlink_summary,
     _extract_output_tail,
+    _backlink_worker_identity,
+    _reserve_backlink_workers,
+    _release_backlink_workers,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -142,10 +148,161 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_backlink_submission_prompt_scopes_worker_tools(self):
+        prompt = _build_child_system_prompt(
+            "Submit one claimed backlink with ego-browser",
+            backlink_submission=True,
+        )
+        self.assertIn("只能使用 terminal 调用 ego-browser", prompt)
+        self.assertIn("backlinkhub_advance_submission_round", prompt)
+        self.assertIn("backlinkhub_record_submission_result", prompt)
+        ego_browser = Path.home() / ".local" / "bin" / "ego-browser"
+        self.assertIn(f"{ego_browser} nodejs", prompt)
+        self.assertIn("不要寻找或调用 `ego-lite`、`ego` 或 OpenCLI", prompt)
+        self.assertNotIn("opencli-browser", prompt)
+
+    def test_regular_prompt_does_not_add_backlink_boundary(self):
+        prompt = _build_child_system_prompt("Review a Python module")
+        self.assertNotIn("BacklinkHub", prompt)
+
+
+class TestBacklinkWorkerIdentity(unittest.TestCase):
+    def test_extracts_explicit_site_and_run(self):
+        identity = _backlink_worker_identity(
+            "继续提交 site_thesitemath",
+            "site_id=site_thesitemath; run_id=round_20260818_ab12",
+        )
+
+        self.assertEqual(identity, ("site_thesitemath", "round_20260818_ab12"))
+
+    def test_new_run_uses_domain_reference_without_guessing_site_id(self):
+        identity = _backlink_worker_identity(
+            "执行 BacklinkHub 外链提交",
+            (
+                "backlink_site_reference=https://www.spritepacker.app/path\n"
+                "backlink_run_reference=*\n"
+                "backlink_worker_turn=turn-20260822-1"
+            ),
+        )
+
+        self.assertEqual(
+            identity,
+            ("reference:spritepacker.app", "turn:turn-20260822-1"),
+        )
+
+    def test_first_advance_can_reserve_worker_before_run_id_exists(self):
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session-first-advance"
+        tasks = [
+            {
+                "goal": "执行 BacklinkHub 外链提交",
+                "context": (
+                    "backlink_site_reference=localresizer.com\n"
+                    "backlink_run_reference=*\n"
+                    "backlink_worker_turn=turn-20260822-2"
+                ),
+                "toolsets": ["terminal", "backlinkhub"],
+            }
+        ]
+
+        keys, error = _reserve_backlink_workers(parent, tasks, None)
+        try:
+            self.assertIsNone(error)
+            self.assertEqual(
+                keys,
+                [
+                    (
+                        "parent-session-first-advance",
+                        "reference:localresizer.com",
+                        "turn:turn-20260822-2",
+                    )
+                ],
+            )
+        finally:
+            _release_backlink_workers(keys)
+
+    def test_same_parent_site_and_run_reclaims_serial_stale_lease(self):
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session"
+        tasks = [
+            {
+                "goal": "提交外链",
+                "context": (
+                    "BacklinkHub site_id=site_thesitemath "
+                    "run_id=round_20260818_ab12"
+                ),
+                "toolsets": ["terminal", "backlinkhub"],
+            }
+        ]
+
+        keys, error = _reserve_backlink_workers(parent, tasks, None)
+        try:
+            self.assertIsNone(error)
+            resumed_keys, resumed_error = _reserve_backlink_workers(
+                parent, tasks, None
+            )
+            self.assertIsNone(resumed_error)
+            self.assertEqual(resumed_keys, keys)
+        finally:
+            _release_backlink_workers(resumed_keys or keys)
+
+    def test_background_duplicate_stays_blocked(self):
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session-background"
+        tasks = [
+            {
+                "goal": "提交外链",
+                "context": (
+                    "BacklinkHub site_id=site_thesitemath "
+                    "run_id=round_20260818_ab12"
+                ),
+                "toolsets": ["terminal", "backlinkhub"],
+            }
+        ]
+
+        keys, error = _reserve_backlink_workers(
+            parent, tasks, None, background=True
+        )
+        try:
+            self.assertIsNone(error)
+            duplicate_keys, duplicate_error = _reserve_backlink_workers(
+                parent, tasks, None, background=True
+            )
+            self.assertEqual(duplicate_keys, [])
+            self.assertIn("still active", duplicate_error)
+        finally:
+            _release_backlink_workers(keys)
+
+    def test_backlink_worker_rejects_missing_exact_and_provisional_identity(self):
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session-missing-id"
+        tasks = [
+            {
+                "goal": "提交外链",
+                "context": "BacklinkHub site_id=site_thesitemath",
+                "toolsets": ["terminal", "backlinkhub"],
+            }
+        ]
+
+        keys, error = _reserve_backlink_workers(parent, tasks, None)
+
+        self.assertEqual(keys, [])
+        self.assertIn("requires either explicit site_id/run_id", error)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
-        result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
+        result = _strip_blocked_tools(
+            [
+                "terminal",
+                "file",
+                "delegation",
+                "clarify",
+                "memory",
+                "code_execution",
+                "backlinkhub",
+            ]
+        )
         self.assertEqual(sorted(result), ["file", "terminal"])
 
     def test_preserves_allowed_toolsets(self):
@@ -197,6 +354,41 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(result["results"][0]["status"], "completed")
         self.assertEqual(result["results"][0]["summary"], "Done!")
         mock_run.assert_called_once()
+
+    @patch("run_agent.AIAgent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_finished_backlink_worker_can_be_resumed_with_same_run(
+        self, mock_run, MockAgent
+    ):
+        """The worker reservation is scoped to a live execution, not its history."""
+        parent = _make_mock_parent()
+        parent.session_id = "resume-parent-session"
+        parent.enabled_toolsets = ["terminal", "backlinkhub"]
+        parent._fallback_chain = []
+        MockAgent.return_value = MagicMock()
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "station stopped after provider error",
+            "api_calls": 45,
+            "duration_seconds": 1.0,
+        }
+        kwargs = {
+            "goal": "继续提交外链",
+            "context": (
+                "BacklinkHub site_id=site_thesitemath "
+                "run_id=round_20260819_resume"
+            ),
+            "toolsets": ["terminal", "backlinkhub"],
+            "parent_agent": parent,
+        }
+
+        first = json.loads(delegate_task(**kwargs))
+        resumed = json.loads(delegate_task(**kwargs))
+
+        self.assertNotIn("error", first)
+        self.assertNotIn("error", resumed)
+        self.assertEqual(mock_run.call_count, 2)
 
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode(self, mock_run):
@@ -499,7 +691,9 @@ class TestToolNamePreservation(unittest.TestCase):
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
 
-            def capture_and_return(user_message, task_id=None, stream_callback=None):
+            def capture_and_return(
+                user_message, task_id=None, stream_callback=None
+            ):
                 captured["saved"] = list(mock_child._delegate_saved_tool_names)
                 return {"final_response": "ok", "completed": True, "api_calls": 1}
 
@@ -587,9 +781,7 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertGreater(trace[0]["result_bytes"], 0)
 
     def test_output_tail_flattens_list_content_blocks(self):
-        """_extract_output_tail (live overlay) must flatten content-block lists
-        so error markers buried inside blocks are detected and previews are
-        real text, not a "[{'type': 'text'...}]" repr blob."""
+        """Content-block lists should produce readable error-aware previews."""
         result = {
             "messages": [
                 {"role": "assistant", "tool_calls": [
@@ -608,17 +800,35 @@ class TestDelegateObservability(unittest.TestCase):
             ]
         }
         tail = _extract_output_tail(result, max_entries=8, max_chars=600)
-        by_tool = {t["tool"]: t for t in tail}
+        by_tool = {entry["tool"]: entry for entry in tail}
 
-        # Block-wrapped error is correctly flagged (crude str() would miss it).
         self.assertTrue(by_tool["terminal"]["is_error"])
         self.assertEqual(by_tool["terminal"]["preview"], "Error: command not found")
-        # Non-error multimodal result is not flagged, and the text is readable.
         self.assertFalse(by_tool["vision"]["is_error"])
         self.assertIn("all good", by_tool["vision"]["preview"])
-        # No raw content-block repr leaked into any preview.
         for entry in tail:
             self.assertNotIn("'type'", entry["preview"])
+
+    def test_backlink_summary_is_compacted(self):
+        compacted = _compact_backlink_summary("a" * 2000, max_chars=120)
+
+        self.assertLessEqual(len(compacted), 120)
+        self.assertIn("摘要已压缩", compacted)
+
+    def test_backlink_prompt_forbids_post_close_tab_queries(self):
+        prompt = _build_child_system_prompt(
+            "提交 backlinkhub site_id=site_alpha run_id=round_20260822_x",
+            backlink_submission=True,
+        )
+
+        self.assertIn("整个站点轮次只使用一个任务空间", prompt)
+        self.assertIn("`bh_<site_id>_<run_id>`", prompt)
+        self.assertIn("completeTaskSpace", prompt)
+        self.assertIn("ego_task_space_control_interrupted", prompt)
+        self.assertIn("关闭标签后不要再调用 listTabs", prompt)
+        self.assertIn("ego 没有 `select()` helper", prompt)
+        self.assertIn("禁止 require/import", prompt)
+        self.assertNotIn("每个候选必须使用自己的任务空间", prompt)
 
     def test_tool_trace_detects_error(self):
         """Tool results containing 'error' should be marked as error status."""
@@ -737,6 +947,31 @@ class TestDelegateObservability(unittest.TestCase):
 
             result = json.loads(delegate_task(goal="Test max iter", parent_agent=parent))
             self.assertEqual(result["results"][0]["exit_reason"], "max_iterations")
+
+    def test_exit_reason_provider_error_before_iteration_limit(self):
+        """A failed API call below the child cap is not a budget exhaustion."""
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        child.max_iterations = 90
+        child.model = "gpt-5.6-terra"
+        child.session_prompt_tokens = 100
+        child.session_completion_tokens = 0
+        child.run_conversation.return_value = {
+            "final_response": "",
+            "completed": False,
+            "interrupted": False,
+            "api_calls": 45,
+            "error": "Connection error",
+            "messages": [],
+        }
+
+        result = _run_single_child(0, "resume backlink worker", child, parent)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["exit_reason"], "provider_error")
+        self.assertEqual(result["api_calls"], 45)
 
 
 class TestSubagentCostRollup(unittest.TestCase):
@@ -900,6 +1135,11 @@ class TestBlockedTools(unittest.TestCase):
     def test_blocked_tools_constant(self):
         for tool in ["delegate_task", "clarify", "memory", "send_message", "execute_code"]:
             self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
+
+    def test_blocked_toolsets_constant(self):
+        from tools.delegate_tool import DELEGATE_BLOCKED_TOOLSETS
+
+        self.assertIn("backlinkhub", DELEGATE_BLOCKED_TOOLSETS)
 
     def test_constants(self):
         from tools.delegate_tool import (
@@ -1518,11 +1758,7 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
         self.assertIsNone(result)
 
-    # --- Custom-endpoint identity resolution (issue #7833) ---
-
     def test_custom_different_endpoint_does_not_inherit_parent_pool(self):
-        """A child on custom endpoint B must not inherit the parent's custom
-        endpoint A pool just because both normalize to provider='custom'."""
         parent = _make_mock_parent()
         parent.provider = "custom"
         parent.base_url = "https://endpoint-a.example.com/v1"
@@ -1537,20 +1773,19 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
                 "https://endpoint-b.example.com/v1": "custom:endpoint-b",
             }.get(base_url)
 
-        with patch("agent.credential_pool.get_custom_provider_pool_key", side_effect=fake_key), \
-             patch("agent.credential_pool.load_pool", return_value=child_pool) as load_mock:
+        with patch(
+            "agent.credential_pool.get_custom_provider_pool_key",
+            side_effect=fake_key,
+        ), patch("agent.credential_pool.load_pool", return_value=child_pool) as load_mock:
             result = _resolve_child_credential_pool(
                 "custom", parent, "https://endpoint-b.example.com/v1"
             )
 
-        # Loaded the child's OWN endpoint pool, not the parent's.
         load_mock.assert_called_once_with("custom:endpoint-b")
         self.assertIs(result, child_pool)
         self.assertIsNot(result, parent._credential_pool)
 
     def test_custom_same_endpoint_shares_parent_pool(self):
-        """A child on the SAME custom endpoint as the parent reuses the parent's
-        pool so rotation/cooldown state stays synchronized."""
         parent = _make_mock_parent()
         parent.provider = "custom"
         parent.base_url = "https://endpoint-a.example.com/v1"
@@ -1567,9 +1802,6 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         self.assertIs(result, parent._credential_pool)
 
     def test_custom_unregistered_endpoint_returns_none(self):
-        """A raw delegation.base_url with no matching custom_providers entry
-        must NOT inherit the parent's pool — return None so the child keeps its
-        fixed delegated credential."""
         parent = _make_mock_parent()
         parent.provider = "custom"
         parent.base_url = "https://endpoint-a.example.com/v1"
@@ -1659,6 +1891,56 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             MockAgent.call_args[1]["enabled_toolsets"],
             ["web", "browser"],
         )
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_allows_scoped_backlinkhub_worker(
+        self, mock_cfg
+    ):
+        """A backlink worker may use only the two routine tools plus terminal."""
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "backlinkhub"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Submit the claimed page with ego-browser",
+                context=None,
+                toolsets=["terminal", "backlinkhub"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        assert MockAgent.call_args.kwargs["enabled_toolsets"] == [
+            "terminal",
+            "backlinkhub",
+        ]
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_strips_backlinkhub_for_unrelated_child(
+        self, mock_cfg
+    ):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "backlinkhub"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Review a Python module",
+                context=None,
+                toolsets=["terminal", "backlinkhub"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        assert MockAgent.call_args.kwargs["enabled_toolsets"] == ["terminal"]
 
 
 class TestChildCredentialLeasing(unittest.TestCase):
@@ -2213,15 +2495,20 @@ class TestMaxSpawnDepth(unittest.TestCase):
     def test_max_spawn_depth_clamped_below_one(self, mock_cfg):
         import logging
         from tools.delegate_tool import _get_max_spawn_depth
-        with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
-            result = _get_max_spawn_depth()
+        target_logger = _get_max_spawn_depth.__globals__["logger"]
+        was_disabled = target_logger.disabled
+        target_logger.disabled = False
+        try:
+            with self.assertLogs(target_logger, level=logging.WARNING) as cm:
+                result = _get_max_spawn_depth()
+        finally:
+            target_logger.disabled = was_disabled
         self.assertEqual(result, 1)
-        self.assertTrue(any("below floor 1" in m for m in cm.output))
+        self.assertTrue(any("clamping to 1" in m for m in cm.output))
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 99})
-    def test_max_spawn_depth_no_upper_ceiling(self, mock_cfg):
-        """No upper ceiling — high values pass through unchanged (cost is the limiter)."""
+    def test_max_spawn_depth_allows_explicit_value(self, mock_cfg):
         from tools.delegate_tool import _get_max_spawn_depth
         self.assertEqual(_get_max_spawn_depth(), 99)
 
@@ -2286,8 +2573,14 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
     def test_unknown_role_coerces_to_leaf(self):
         """role='nonsense' → _normalize_role warns and returns 'leaf'."""
         import logging
-        with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
-            child = self._run_with_mock_child("nonsense")
+        target_logger = delegate_task.__globals__["logger"]
+        was_disabled = target_logger.disabled
+        target_logger.disabled = False
+        try:
+            with self.assertLogs(target_logger, level=logging.WARNING) as cm:
+                child = self._run_with_mock_child("nonsense")
+        finally:
+            target_logger.disabled = was_disabled
         self.assertEqual(child._delegate_role, "leaf")
         self.assertTrue(any("coercing" in m.lower() for m in cm.output))
 
@@ -2616,7 +2909,9 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
                 m.thinking_callback = None
                 orch_mock["agent"] = m
 
-                def _orchestrator_run(user_message=None, task_id=None, stream_callback=None):
+                def _orchestrator_run(
+                    user_message=None, task_id=None, stream_callback=None
+                ):
                     # Re-entrant: orchestrator spawns two leaves
                     delegate_task(
                         tasks=[{"goal": "leaf-A"}, {"goal": "leaf-B"}],
@@ -2793,6 +3088,30 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+    def test_backlink_worker_filters_fallback_to_api_icu_terra(self):
+        """External side-effect workers do not switch to unrelated providers."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "api-icu", "model": "gpt-5.6-terra", "api_key": "terra"},
+            {"provider": "kimi", "model": "kimi 3", "api_key": "kimi"},
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="继续提交外链",
+                context="BacklinkHub site_id=site_demo run_id=round_20260819_demo",
+                toolsets=["terminal", "backlinkhub"],
+                model=None,
+                max_iterations=90,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["fallback_model"], [parent._fallback_chain[0]])
 
 
 if __name__ == "__main__":

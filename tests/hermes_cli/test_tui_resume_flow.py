@@ -792,8 +792,8 @@ def test_oneshot_distinguishes_disabled_mcp_from_unknown(monkeypatch, capsys):
     assert "mcp-off" in err
 
 
-def test_oneshot_wires_session_db_for_recall(monkeypatch):
-    """hermes -z bypasses HermesCLI, but recall still needs SessionDB."""
+def test_oneshot_wires_session_db_and_configured_max_turns(monkeypatch):
+    """hermes -z must wire services and agent.max_turns without HermesCLI."""
     from hermes_cli.oneshot import _run_agent
 
     captured = {}
@@ -825,7 +825,13 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.config",
-        mod("hermes_cli.config", load_config=lambda: {"model": {"default": "m"}}),
+        mod(
+            "hermes_cli.config",
+            load_config=lambda: {
+                "model": {"default": "m"},
+                "agent": {"max_turns": 500},
+            },
+        ),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -855,6 +861,7 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert _run_agent("recall this") == "ok"
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
+    assert captured["max_iterations"] == 500
     assert captured["prompt"] == "recall this"
 
 

@@ -3973,6 +3973,19 @@ class AIAgent:
                     _ph_headers = dict(_ph2.default_headers)
             except Exception:
                 pass
+            if not _ph_headers:
+                try:
+                    from agent.agent_init import _custom_provider_default_headers_for_agent
+                    from hermes_cli.config import get_compatible_custom_providers, load_config
+
+                    _ph_headers = _custom_provider_default_headers_for_agent(
+                        provider=self.provider,
+                        model=self.model,
+                        base_url=base_url,
+                        custom_providers=get_compatible_custom_providers(load_config()),
+                    )
+                except Exception:
+                    pass
             if _ph_headers:
                 self._client_kwargs["default_headers"] = _ph_headers
             else:
@@ -5162,6 +5175,50 @@ class AIAgent:
         file reads/writes may do so only when their target paths do not overlap.
         """
         tool_calls = assistant_message.tool_calls
+
+        # BacklinkHub is the one routine with external browser side effects.
+        # Route a parent-session call to a bounded station worker before the
+        # normal executor can dispatch it directly.  The worker returns only a
+        # compact summary; it owns candidate claiming, ego-browser actions,
+        # tab cleanup, and result writeback.  Mixed batches are left untouched
+        # by the helper so ordinary tool-call ordering remains unchanged.
+        try:
+            from agent.agent_runtime_helpers import route_backlink_submission_to_worker
+
+            routed = route_backlink_submission_to_worker(self, tool_calls, messages)
+        except Exception as exc:
+            logger.exception("BacklinkHub worker routing failed before dispatch")
+            routed = {
+                getattr(call, "id", ""): json.dumps(
+                    {
+                        "success": False,
+                        "error": "backlinkhub_worker_router_failed",
+                        "message": str(exc)[:512],
+                        "retryable": True,
+                    },
+                    ensure_ascii=False,
+                )
+                for call in tool_calls
+            }
+        if routed is not None:
+            try:
+                self._touch_activity("delegating BacklinkHub station worker")
+            except Exception:
+                pass
+            for call in tool_calls:
+                call_id = getattr(call, "id", "")
+                result = routed.get(call_id, "")
+                if not isinstance(result, str):
+                    result = json.dumps(result, ensure_ascii=False)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "name": getattr(getattr(call, "function", None), "name", ""),
+                        "content": result,
+                        "tool_call_id": call_id,
+                    }
+                )
+            return
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True

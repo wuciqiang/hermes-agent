@@ -4003,6 +4003,8 @@ def _normalize_custom_provider_entry(
         "apiKey": "api_key",
         "baseUrl": "base_url",
         "apiMode": "api_mode",
+        "defaultHeaders": "default_headers",
+        "extraHeaders": "extra_headers",
         "keyEnv": "key_env",
         "apiKeyEnv": "key_env",  # alias — OpenClaw-compatible + docs variant
         "defaultModel": "default_model",
@@ -4019,7 +4021,7 @@ def _normalize_custom_provider_entry(
         "api_mode", "transport", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
-        "discover_models", "extra_body",
+        "discover_models", "extra_body", "default_headers", "extra_headers",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -4118,7 +4120,31 @@ def _normalize_custom_provider_entry(
     if isinstance(extra_body, dict):
         normalized["extra_body"] = dict(extra_body)
 
+    header_source = entry.get("default_headers")
+    if not isinstance(header_source, dict) or not header_source:
+        header_source = entry.get("extra_headers")
+    headers = normalize_provider_default_headers(header_source)
+    if headers:
+        normalized["default_headers"] = headers
+
     return normalized
+
+
+def normalize_provider_default_headers(value: Any) -> Optional[Dict[str, str]]:
+    """Normalize provider-level OpenAI client default headers.
+
+    ``providers.<name>.extra_headers`` is accepted as a user-friendly alias,
+    but runtime client construction uses OpenAI SDK's ``default_headers`` kwarg.
+    """
+    if not isinstance(value, dict) or not value:
+        return None
+    headers: Dict[str, str] = {}
+    for key, val in value.items():
+        header_name = str(key).strip()
+        if not header_name or val is None:
+            continue
+        headers[header_name] = str(val)
+    return headers or None
 
 
 def _custom_provider_entry_to_provider_config(
@@ -4145,6 +4171,7 @@ def _custom_provider_entry_to_provider_config(
         "rate_limit_delay",
         "discover_models",
         "extra_body",
+        "default_headers",
     ):
         if field in normalized:
             provider_entry[field] = normalized[field]
@@ -4346,6 +4373,7 @@ _KNOWN_ROOT_KEYS = {
 _VALID_CUSTOM_PROVIDER_FIELDS = {
     "name", "base_url", "api_key", "api_mode", "model", "models",
     "context_length", "rate_limit_delay", "extra_body",
+    "default_headers", "extra_headers",
     # key_env is read at runtime by runtime_provider.py and auxiliary_client.py
     # — include it here so the set accurately describes the supported schema.
     "key_env",

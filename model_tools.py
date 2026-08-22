@@ -888,6 +888,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    platform: Optional[str] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -897,6 +898,9 @@ def handle_function_call(
         function_args: Arguments for the function.
         task_id: Unique identifier for terminal/browser session isolation.
         user_task: The user's original task (for browser_snapshot context).
+        platform: Caller identity (for example ``"subagent"``).  Passed to
+                  plugin handlers so process-local protocols can keep parent
+                  and delegated execution separate.
         enabled_tools: Tool names enabled for this session.  When provided,
                        execute_code uses this list to determine which sandbox
                        tools to generate.  Falls back to the process-global
@@ -985,6 +989,7 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                platform=platform,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1107,6 +1112,14 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
+            _dispatch_context = {
+                "task_id": task_id,
+                "session_id": session_id,
+                "user_task": user_task,
+            }
+            if platform:
+                _dispatch_context["platform"] = platform
+
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
@@ -1114,17 +1127,14 @@ def handle_function_call(
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
+                        **_dispatch_context,
                         enabled_tools=sandbox_enabled,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        user_task=user_task,
+                        **_dispatch_context,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 

@@ -151,6 +151,39 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _custom_provider_default_headers_for_agent(
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    custom_providers: List[Dict[str, Any]],
+) -> Optional[Dict[str, str]]:
+    target_url = _normalized_custom_base_url(base_url)
+    if not target_url:
+        return None
+
+    provider_norm = str(provider or "").strip().lower()
+    fallback: Optional[Dict[str, str]] = None
+    for entry in custom_providers or []:
+        if not isinstance(entry, dict):
+            continue
+        if _normalized_custom_base_url(entry.get("base_url")) != target_url:
+            continue
+        headers = entry.get("default_headers")
+        if not isinstance(headers, dict) or not headers:
+            continue
+        entry_key = str(entry.get("provider_key", "") or "").strip().lower()
+        entry_name = str(entry.get("name", "") or "").strip().lower()
+        if provider_norm and provider_norm not in {"custom", entry_key, entry_name}:
+            continue
+        if _custom_provider_model_matches(model, entry):
+            return dict(headers)
+        if fallback is None:
+            fallback = dict(headers)
+
+    return fallback
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -788,6 +821,22 @@ def init_agent(
                     _ph = _gpf(agent.provider)
                     if _ph and _ph.default_headers:
                         client_kwargs["default_headers"] = dict(_ph.default_headers)
+                except Exception:
+                    pass
+            if "default_headers" not in client_kwargs:
+                try:
+                    from hermes_cli.config import (
+                        get_compatible_custom_providers as _gcp_headers,
+                        load_config as _load_headers_cfg,
+                    )
+                    _cp_headers = _custom_provider_default_headers_for_agent(
+                        provider=agent.provider,
+                        model=agent.model,
+                        base_url=effective_base,
+                        custom_providers=_gcp_headers(_load_headers_cfg()),
+                    )
+                    if _cp_headers:
+                        client_kwargs["default_headers"] = _cp_headers
                 except Exception:
                     pass
         else:

@@ -110,6 +110,68 @@ def test_routed_client_preserves_openai_sdk_custom_headers(mock_openai):
 
 
 @patch("run_agent.OpenAI")
+def test_routed_custom_provider_preserves_default_headers(mock_openai):
+    mock_openai.return_value = MagicMock()
+    routed_client = SimpleNamespace(
+        api_key="test-key",
+        base_url="https://api.squarefaceicon.org/v1",
+        _custom_headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
+    )
+
+    with patch("agent.auxiliary_client.resolve_provider_client", return_value=(
+        routed_client,
+        "gpt-5.5",
+    )):
+        agent = AIAgent(
+            provider="squarefaceicon-gpt",
+            model="gpt-5.5",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["User-Agent"] == "Mozilla/5.0"
+    assert headers["Accept"] == "application/json"
+
+
+@patch("run_agent.OpenAI")
+def test_apply_client_headers_uses_custom_provider_headers(mock_openai):
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://api.squarefaceicon.org/v1",
+        model="gpt-5.5",
+        provider="custom",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    with patch("hermes_cli.config.load_config", return_value={
+        "providers": {
+            "squarefaceicon-gpt": {
+                "name": "Squarefaceicon GPT",
+                "api": "https://api.squarefaceicon.org/v1",
+                "default_model": "gpt-5.5",
+                "extra_headers": {
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json",
+                },
+            },
+        },
+    }):
+        agent._apply_client_headers_for_base_url("https://api.squarefaceicon.org/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["User-Agent"] == "Mozilla/5.0"
+    assert headers["Accept"] == "application/json"
+
+
+@patch("run_agent.OpenAI")
 def test_gmi_base_url_picks_up_profile_user_agent(mock_openai):
     """GMI declares User-Agent on its ProviderProfile.default_headers.
 

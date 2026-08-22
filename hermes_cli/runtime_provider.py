@@ -31,7 +31,11 @@ from hermes_cli.auth import (
     resolve_external_process_provider_credentials,
     has_usable_secret,
 )
-from hermes_cli.config import get_compatible_custom_providers, load_config
+from hermes_cli.config import (
+    get_compatible_custom_providers,
+    load_config,
+    normalize_provider_default_headers,
+)
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_int
 
@@ -505,6 +509,14 @@ def _lift_max_output_tokens(entry: Dict[str, Any], result: Dict[str, Any]) -> No
             return
 
 
+def _lift_default_headers(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
+    headers = normalize_provider_default_headers(entry.get("default_headers"))
+    if not headers:
+        headers = normalize_provider_default_headers(entry.get("extra_headers"))
+    if headers:
+        result["default_headers"] = headers
+
+
 def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm:
@@ -585,6 +597,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     if api_mode:
                         result["api_mode"] = api_mode
                     _lift_max_output_tokens(entry, result)
+                    _lift_default_headers(entry, result)
                     return result
             # Also check the 'name' field if present
             display_name = entry.get("name", "")
@@ -607,6 +620,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         if api_mode:
                             result["api_mode"] = api_mode
                         _lift_max_output_tokens(entry, result)
+                        _lift_default_headers(entry, result)
                         return result
 
     # Fall back to custom_providers: list (legacy format)
@@ -650,6 +664,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         extra_body = entry.get("extra_body")
         if isinstance(extra_body, dict):
             result["extra_body"] = dict(extra_body)
+        _lift_default_headers(entry, result)
         api_mode = _parse_api_mode(entry.get("api_mode"))
         if api_mode:
             result["api_mode"] = api_mode
@@ -879,6 +894,9 @@ def _resolve_named_custom_runtime(
             pool_result["model"] = model_name
         if isinstance(custom_provider.get("max_output_tokens"), int):
             pool_result["max_output_tokens"] = custom_provider["max_output_tokens"]
+        default_headers = custom_provider.get("default_headers")
+        if isinstance(default_headers, dict) and default_headers:
+            pool_result["default_headers"] = dict(default_headers)
         request_overrides = _custom_provider_request_overrides(custom_provider)
         if request_overrides:
             pool_result["request_overrides"] = {
@@ -918,6 +936,9 @@ def _resolve_named_custom_runtime(
         result["model"] = custom_provider["model"]
     if isinstance(custom_provider.get("max_output_tokens"), int):
         result["max_output_tokens"] = custom_provider["max_output_tokens"]
+    default_headers = custom_provider.get("default_headers")
+    if isinstance(default_headers, dict) and default_headers:
+        result["default_headers"] = dict(default_headers)
     request_overrides = _custom_provider_request_overrides(custom_provider)
     if request_overrides:
         result["request_overrides"] = request_overrides

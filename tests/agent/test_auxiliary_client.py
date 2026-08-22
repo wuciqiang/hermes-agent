@@ -59,6 +59,7 @@ def _clean_env(monkeypatch):
         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
         "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+        "NVIDIA_API_KEY", "NVIDIA_BASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
     # Module-level unhealthy cache (10-min TTL) leaks between tests;
@@ -92,7 +93,7 @@ def codex_auth_dir(tmp_path, monkeypatch):
     return codex_dir
 
 
-class TestAuxiliaryMaxTokensParam:
+class TestAuxiliaryMaxTokensGitHubCopilot:
     def test_uses_max_completion_tokens_for_github_copilot_custom_base(self):
         with patch("agent.auxiliary_client._resolve_custom_runtime", return_value=("https://api.githubcopilot.com", "key", None)), \
              patch("agent.auxiliary_client._read_nous_auth", return_value=None):
@@ -3582,16 +3583,6 @@ class TestBuildCallKwargsToolDedup:
         assert "tools" not in kwargs
 
 
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    """Strip provider env vars so each test starts clean."""
-    for key in (
-        "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
-        "NVIDIA_API_KEY", "NVIDIA_BASE_URL",
-    ):
-        monkeypatch.delenv(key, raising=False)
-
-
 class TestNvidiaBillingHeaders:
     """NVIDIA NIM billing-origin headers are scoped to NVIDIA cloud."""
 
@@ -3630,6 +3621,43 @@ class TestNvidiaBillingHeaders:
         call_kwargs = mock_openai.call_args[1]
         headers = call_kwargs.get("default_headers", {})
         assert "X-BILLING-INVOKE-ORIGIN" not in headers
+
+
+class TestNamedCustomProviderHeaders:
+    """Provider-level headers should reach OpenAI client construction."""
+
+    def test_resolve_provider_client_passes_default_headers(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {
+                "name": "squarefaceicon-gpt",
+                "base_url": "https://api.squarefaceicon.org/v1",
+                "api_key": "test-key",
+                "api_mode": "codex_responses",
+                "model": "gpt-5.5",
+                "default_headers": {
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json",
+                },
+            },
+        )
+        mock_openai = MagicMock()
+        mock_openai.return_value = MagicMock(name="squarefaceicon-client")
+
+        with patch("agent.auxiliary_client.OpenAI", mock_openai):
+            client, model = resolve_provider_client(
+                provider="squarefaceicon-gpt",
+                model="gpt-5.5",
+                raw_codex=True,
+            )
+
+        assert client is not None
+        assert model == "gpt-5.5"
+        call_kwargs = mock_openai.call_args[1]
+        assert call_kwargs["default_headers"] == {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        }
 
 
 class TestOpenRouterExplicitApiKey:

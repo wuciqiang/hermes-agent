@@ -54,6 +54,47 @@ SCOPES = [
     "https://www.googleapis.com/auth/documents",
 ]
 
+# Keep the full Workspace set for backwards compatibility, but allow a
+# consent flow to request only the service that is actually needed.  In
+# particular, mailbox verification only needs Gmail read access.
+SERVICE_SCOPES = {
+    "email": ["https://www.googleapis.com/auth/gmail.readonly"],
+    "calendar": ["https://www.googleapis.com/auth/calendar"],
+    "drive": ["https://www.googleapis.com/auth/drive"],
+    "contacts": ["https://www.googleapis.com/auth/contacts.readonly"],
+    "sheets": ["https://www.googleapis.com/auth/spreadsheets"],
+    "docs": ["https://www.googleapis.com/auth/documents"],
+}
+
+
+def _scopes_for_services(services: str | None) -> list[str]:
+    """Resolve a comma-separated service list into unique OAuth scopes."""
+
+    value = str(services or "all").strip().lower()
+    if value in {"", "all", "*"}:
+        return list(SCOPES)
+
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    names = ["email" if name == "gmail" else name for name in names]
+    unknown = [name for name in names if name not in SERVICE_SCOPES]
+    if unknown:
+        print(
+            "ERROR: Unknown service(s): '" + "', '".join(unknown) + "'",
+            file=sys.stderr,
+        )
+        print(
+            "Choose from: email, calendar, drive, contacts, sheets, docs, all",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    scopes: list[str] = []
+    for name in names:
+        for scope in SERVICE_SCOPES[name]:
+            if scope not in scopes:
+                scopes.append(scope)
+    return scopes
+
 REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google-auth-httplib2"]
 
 # OAuth redirect for "out of band" manual code copy flow.
@@ -76,12 +117,15 @@ def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
         return {}
 
 
-def _missing_scopes_from_payload(payload: dict) -> list[str]:
+def _missing_scopes_from_payload(
+    payload: dict, expected_scopes: list[str] | None = None
+) -> list[str]:
     raw = payload.get("scopes") or payload.get("scope")
     if not raw:
         return []
     granted = {s.strip() for s in (raw.split() if isinstance(raw, str) else raw) if s.strip()}
-    return sorted(scope for scope in SCOPES if scope not in granted)
+    expected = expected_scopes or SCOPES
+    return sorted(scope for scope in expected if scope not in granted)
 
 
 def _format_missing_scopes(missing_scopes: list[str]) -> str:
@@ -116,11 +160,7 @@ def install_deps():
     except subprocess.CalledProcessError as e:
         pip_error = e
 
-    # Fallback: the interpreter has no pip (the Hermes Docker image's venv is
-    # built with `uv sync`, which does not bootstrap pip). `uv pip install
-    # --python <interpreter>` installs into that exact interpreter without
-    # needing pip present. Targeting sys.executable keeps us on the venv the
-    # script is actually running under, rather than guessing.
+    # uv-managed environments may not include pip in the target interpreter.
     uv = shutil.which("uv")
     if uv:
         try:
@@ -133,7 +173,10 @@ def install_deps():
             return True
         except subprocess.CalledProcessError as e:
             print(f"ERROR: Failed to install dependencies via uv: {e}")
-            print(f"Manually: {uv} pip install --python {sys.executable} {' '.join(REQUIRED_PACKAGES)}")
+            print(
+                f"Manually: {uv} pip install --python {sys.executable} "
+                f"{' '.join(REQUIRED_PACKAGES)}"
+            )
             return False
 
     print(f"ERROR: Failed to install dependencies: {pip_error}")
@@ -166,8 +209,14 @@ def check_auth_live():
         from googleapiclient.discovery import build
         from google.oauth2.credentials import Credentials
         creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
-        service = build("calendar", "v3", credentials=creds)
-        service.calendarList().list(maxResults=1).execute()
+        payload = _load_token_payload(TOKEN_PATH)
+        requested = set(payload.get("requested_scopes") or payload.get("scopes") or SCOPES)
+        if requested == {"https://www.googleapis.com/auth/gmail.readonly"}:
+            service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+            service.users().getProfile(userId="me").execute()
+        else:
+            service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+            service.calendarList().list(maxResults=1).execute()
         print("LIVE_CHECK_OK: Real API call succeeded.")
         return True
     except Exception as e:
@@ -203,8 +252,13 @@ def check_auth(quiet: bool = False):
         return False
 
     payload = _load_token_payload(TOKEN_PATH)
+    expected_scopes = (
+        payload.get("requested_scopes")
+        or payload.get("scopes")
+        or SCOPES
+    )
     if creds.valid:
-        missing_scopes = _missing_scopes_from_payload(payload)
+        missing_scopes = _missing_scopes_from_payload(payload, expected_scopes)
         if missing_scopes:
             print(f"AUTHENTICATED (partial): Token valid but missing {len(missing_scopes)} scopes:")
             for s in missing_scopes:
@@ -222,7 +276,16 @@ def check_auth(quiet: bool = False):
                     indent=2,
                 )
             )
-            missing_scopes = _missing_scopes_from_payload(_load_token_payload(TOKEN_PATH))
+            refreshed_payload = _load_token_payload(TOKEN_PATH)
+            refreshed_expected = (
+                refreshed_payload.get("requested_scopes")
+                or refreshed_payload.get("scopes")
+                or SCOPES
+            )
+            missing_scopes = _missing_scopes_from_payload(
+                refreshed_payload,
+                refreshed_expected,
+            )
             if missing_scopes:
                 print(f"AUTHENTICATED (partial): Token refreshed but missing {len(missing_scopes)} scopes:")
                 for s in missing_scopes:
@@ -274,18 +337,18 @@ def store_client_secret(path: str):
     print(f"OK: Client secret saved to {CLIENT_SECRET_PATH}")
 
 
-def _save_pending_auth(*, state: str, code_verifier: str):
+def _save_pending_auth(
+    *, state: str, code_verifier: str, scopes: list[str] | None = None
+):
     """Persist the OAuth session bits needed for a later token exchange."""
-    PENDING_AUTH_PATH.write_text(
-        json.dumps(
-            {
-                "state": state,
-                "code_verifier": code_verifier,
-                "redirect_uri": REDIRECT_URI,
-            },
-            indent=2,
-        )
-    )
+    payload = {
+        "state": state,
+        "code_verifier": code_verifier,
+        "redirect_uri": REDIRECT_URI,
+    }
+    if scopes:
+        payload["scopes"] = list(scopes)
+    PENDING_AUTH_PATH.write_text(json.dumps(payload, indent=2))
 
 
 def _load_pending_auth() -> dict:
@@ -326,7 +389,7 @@ def _extract_code_and_state(code_or_url: str) -> tuple[str, str | None]:
     return params["code"][0], state
 
 
-def get_auth_url():
+def get_auth_url(services: str = "all"):
     """Print the OAuth authorization URL. User visits this in a browser."""
     if not CLIENT_SECRET_PATH.exists():
         print("ERROR: No client secret stored. Run --client-secret first.")
@@ -335,9 +398,10 @@ def get_auth_url():
     _ensure_deps()
     from google_auth_oauthlib.flow import Flow
 
+    requested_scopes = _scopes_for_services(services)
     flow = Flow.from_client_secrets_file(
         str(CLIENT_SECRET_PATH),
-        scopes=SCOPES,
+        scopes=requested_scopes,
         redirect_uri=REDIRECT_URI,
         autogenerate_code_verifier=True,
     )
@@ -345,7 +409,11 @@ def get_auth_url():
         access_type="offline",
         prompt="consent",
     )
-    _save_pending_auth(state=state, code_verifier=flow.code_verifier)
+    _save_pending_auth(
+        state=state,
+        code_verifier=flow.code_verifier,
+        scopes=requested_scopes,
+    )
     # Print just the URL so the agent can extract it cleanly
     print(auth_url)
 
@@ -368,7 +436,8 @@ def exchange_auth_code(code: str):
     from urllib.parse import parse_qs, urlparse
 
     # Extract granted scopes from the callback URL if the user pasted the full redirect URL.
-    granted_scopes = list(SCOPES)
+    pending_scopes = list(pending_auth.get("scopes") or SCOPES)
+    granted_scopes = list(pending_scopes)
     if isinstance(raw_callback, str) and raw_callback.startswith("http"):
         params = parse_qs(urlparse(raw_callback).query)
         scope_val = (params.get("scope") or [""])[0].strip()
@@ -394,6 +463,7 @@ def exchange_auth_code(code: str):
 
     creds = flow.credentials
     token_payload = _normalize_authorized_user_payload(json.loads(creds.to_json()))
+    token_payload["requested_scopes"] = pending_scopes
 
     # Store only the scopes actually granted by the user, not what was requested.
     # creds.to_json() writes the requested scopes, which causes refresh to fail
@@ -405,7 +475,7 @@ def exchange_auth_code(code: str):
         # granted_scopes was extracted from the callback URL
         token_payload["scopes"] = granted_scopes
 
-    missing_scopes = _missing_scopes_from_payload(token_payload)
+    missing_scopes = _missing_scopes_from_payload(token_payload, pending_scopes)
     if missing_scopes:
         print(f"WARNING: Token missing some Google Workspace scopes: {', '.join(missing_scopes)}")
         print("Some services may not be available.")
@@ -427,7 +497,11 @@ def revoke():
     from google.auth.transport.requests import Request
 
     try:
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        token_payload = _load_token_payload(TOKEN_PATH)
+        token_scopes = token_payload.get("scopes")
+        if not isinstance(token_scopes, list) or not token_scopes:
+            token_scopes = SCOPES
+        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), token_scopes)
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
 
@@ -459,6 +533,11 @@ def main():
     group.add_argument("--auth-code", metavar="CODE", help="Exchange auth code for token")
     group.add_argument("--revoke", action="store_true", help="Revoke and delete stored token")
     group.add_argument("--install-deps", action="store_true", help="Install Python dependencies")
+    parser.add_argument(
+        "--services",
+        default="all",
+        help="Comma-separated services for OAuth (email requests Gmail read-only)",
+    )
     args = parser.parse_args()
 
     if args.check:
@@ -468,7 +547,7 @@ def main():
     elif args.client_secret:
         store_client_secret(args.client_secret)
     elif args.auth_url:
-        get_auth_url()
+        get_auth_url(args.services)
     elif args.auth_code:
         exchange_auth_code(args.auth_code)
     elif args.revoke:

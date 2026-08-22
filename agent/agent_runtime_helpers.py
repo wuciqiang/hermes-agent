@@ -26,6 +26,7 @@ import copy
 import json
 import logging
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +52,333 @@ def _ra():
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
     {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task"}
 )
+
+# BacklinkHub is an external-side-effect workflow.  A long-lived parent
+# session must not hold the browser transcript or call the queue directly:
+# those calls belong to one bounded Luna station worker.  Keep this routing
+# list here so both sequential and concurrent tool execution share the same
+# policy through ``run_agent._execute_tool_calls``.
+BACKLINKHUB_ADVANCE_TOOL = "backlinkhub_advance_submission_round"
+BACKLINKHUB_RESULT_TOOL = "backlinkhub_record_submission_result"
+BACKLINKHUB_CONTROL_TOOLS = frozenset({BACKLINKHUB_ADVANCE_TOOL, BACKLINKHUB_RESULT_TOOL})
+_EGO_BROWSER_BIN = str(Path.home() / ".local" / "bin" / "ego-browser")
+
+# Parent-side routing state is deliberately small and process-local.  It is
+# not a second BacklinkHub ledger: it only prevents the same Hermes turn from
+# spawning a fresh browser worker after the worker has already returned.  A
+# new run_id naturally gets a new key, so a new task is never blocked by an
+# old task's browser state.
+_backlink_route_lock = threading.Lock()
+_backlink_route_states: dict[tuple[str, str, str], dict[str, Any]] = {}
+_BACKLINK_BROWSER_STOP_MARKERS = (
+    "EGO_TASK_SPACE_USER_IN_CONTROL",
+    "task space user in control",
+    "任务空间已被用户接管",
+    "用户接管任务空间",
+)
+
+
+def is_backlink_worker(agent: Any) -> bool:
+    """Return True for the dedicated station worker, not the parent session."""
+    return bool(
+        getattr(agent, "_subagent_id", None)
+        or str(getattr(agent, "platform", "") or "").strip().casefold() == "subagent"
+    )
+
+
+def _latest_user_marker(messages: Optional[list]) -> tuple[str, int | str | None]:
+    """Extract only the latest user instruction for the worker handoff."""
+    if not isinstance(messages, list):
+        return "", None
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content[-4000:], id(message)
+        if isinstance(content, list):
+            parts = [
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            ]
+            return "\n".join(parts)[-4000:], id(message)
+    return "", None
+
+
+def _backlink_route_key(
+    agent: Any, run_id: str, site_id: str, user_marker: int | str | None
+) -> tuple[str, str, str] | None:
+    session_id = str(getattr(agent, "session_id", "") or "").strip()
+    if not session_id or (not run_id and user_marker is None):
+        return None
+    # A first advance normally omits run_id.  The stable user-message object
+    # still gives that turn one execution identity and prevents the common
+    # "worker returned, parent called advance again" duplication.
+    route_run = run_id or f"turn:{user_marker}"
+    return session_id, site_id.casefold() or "-", route_run
+
+
+def _backlink_result_is_browser_stop(value: object) -> bool:
+    text = str(value or "").casefold()
+    return any(marker.casefold() in text for marker in _BACKLINK_BROWSER_STOP_MARKERS)
+
+
+def _backlink_cached_response(call_id: str, state: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact tool response for a repeated parent call."""
+    summary = str(state.get("result") or "").strip()
+    if state.get("browser_blocked"):
+        payload = {
+            "success": False,
+            "error": "backlinkhub_browser_control_blocked",
+            "message": (
+                "ego-browser 报告本轮任务空间控制权发生切换；没有创建新的 worker。"
+            ),
+            "retryable": False,
+            "next_action": "明确告诉 Hermes 继续同一轮次；恢复执行者会接管原任务空间。",
+        }
+    else:
+        payload = {
+            "success": True,
+            "status": "worker_already_ran",
+            "message": "同一用户指令已经运行过站点 worker，未重复创建浏览器执行器。",
+            "summary": summary[-1400:],
+        }
+    return {call_id: json.dumps(payload, ensure_ascii=False)}
+
+
+def _backlink_complete_route_results(
+    calls: list, primary: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep the OpenAI tool protocol valid for an unusual mixed control batch."""
+    for call in calls:
+        call_id = getattr(call, "id", "")
+        if call_id not in primary:
+            primary[call_id] = json.dumps(
+                {
+                    "success": False,
+                    "error": "backlinkhub_parent_write_forbidden",
+                    "message": "结果由站点 worker 统一回写，主会话不重复写入。",
+                    "retryable": False,
+                },
+                ensure_ascii=False,
+            )
+    return primary
+
+
+def route_backlink_submission_to_worker(
+    agent: Any,
+    tool_calls: list,
+    messages: Optional[list],
+) -> Optional[dict[str, Any]]:
+    """Route a parent BacklinkHub call to one Luna station worker.
+
+    Returns a small result map keyed by tool-call id, or ``None`` when the
+    batch contains no BacklinkHub control calls / is already a worker.  The
+    worker owns the complete loop (advance -> ego-browser -> close -> record),
+    so the parent receives only its compact final summary.
+    """
+    if is_backlink_worker(agent) or not isinstance(tool_calls, list):
+        return None
+
+    backlink_calls = [
+        call for call in tool_calls
+        if getattr(getattr(call, "function", None), "name", "") in BACKLINKHUB_CONTROL_TOOLS
+    ]
+    # Do not swallow unrelated calls emitted in the same assistant message;
+    # the normal executor must handle mixed batches in their original order.
+    if not backlink_calls or len(backlink_calls) != len(tool_calls):
+        return None
+
+    # A model occasionally emits advance and record in one assistant turn.
+    # The parent must never write a result itself; the worker handles every
+    # result after the browser action.  We still return one tool result per
+    # original call so the protocol remains well-formed.
+    advance_call = next(
+        (
+            call for call in backlink_calls
+            if getattr(getattr(call, "function", None), "name", "") == BACKLINKHUB_ADVANCE_TOOL
+        ),
+        None,
+    )
+    result_by_id: dict[str, Any] = {}
+    if advance_call is None:
+        message = json.dumps(
+            {
+                "success": False,
+                "error": "backlinkhub_parent_write_forbidden",
+                "message": (
+                    "主会话不能直接回写 BacklinkHub；请让站点级 Luna worker 完成浏览器操作后统一回写。"
+                ),
+                "retryable": False,
+            },
+            ensure_ascii=False,
+        )
+        for call in backlink_calls:
+            result_by_id[getattr(call, "id", "")] = message
+        return result_by_id
+
+    try:
+        args = json.loads(getattr(advance_call.function, "arguments", "{}") or "{}")
+    except (TypeError, ValueError):
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+
+    run_id = str(args.get("run_id") or "").strip()
+    site_id = str(args.get("site_id") or "").strip()
+    user_text, user_marker = _latest_user_marker(messages)
+    current_turn_id = str(getattr(agent, "_current_turn_id", "") or "").strip()
+    if current_turn_id:
+        user_marker = current_turn_id
+    worker_turn_id = str(
+        current_turn_id
+        or (user_marker if user_marker is not None else "")
+        or getattr(advance_call, "id", "")
+        or id(advance_call)
+    ).strip()
+    route_key = _backlink_route_key(agent, run_id, site_id, user_marker)
+
+    # The parent model can emit the same advance call again after receiving a
+    # worker summary.  Reuse that summary instead of creating another Luna
+    # worker.  This is keyed by the actual user-message object, so a genuinely
+    # new user turn can explicitly resume the same run when appropriate.
+    if route_key is not None:
+        with _backlink_route_lock:
+            state = _backlink_route_states.get(route_key)
+            if state is None and user_marker is not None:
+                # The first advance may omit run_id/site_id, while the worker
+                # returns them and uses them on the next advance.  Reattach
+                # that call to the same user-turn state instead of spawning a
+                # second worker under a newly discovered key.
+                session_id = route_key[0]
+                for existing_key, existing_state in _backlink_route_states.items():
+                    if (
+                        existing_key[0] == session_id
+                        and existing_state.get("user_marker") == user_marker
+                    ):
+                        route_key = existing_key
+                        state = existing_state
+                        break
+            if state is None:
+                state = _backlink_route_states.setdefault(route_key, {})
+            if state.get("in_flight"):
+                message = json.dumps(
+                    {
+                        "success": False,
+                        "error": "backlinkhub_worker_in_flight",
+                        "message": "同一站点轮次已有 worker 正在执行，未创建第二个 worker。",
+                        "retryable": True,
+                    },
+                    ensure_ascii=False,
+                )
+                return _backlink_complete_route_results(
+                    backlink_calls,
+                    {getattr(advance_call, "id", ""): message},
+                )
+            if (
+                state.get("result") is not None
+                and state.get("user_marker") == user_marker
+            ):
+                return _backlink_complete_route_results(
+                    backlink_calls,
+                    _backlink_cached_response(getattr(advance_call, "id", ""), state),
+                )
+            if (
+                state.get("browser_blocked")
+                and state.get("user_marker") == user_marker
+            ):
+                return _backlink_complete_route_results(
+                    backlink_calls,
+                    _backlink_cached_response(getattr(advance_call, "id", ""), state),
+                )
+            # Calling the tool from a new explicit user turn is the resume
+            # signal.  Do not make an old browser-control stop permanent.
+            if state.get("browser_blocked"):
+                state["browser_blocked"] = False
+            state["in_flight"] = True
+    handoff_goal = (
+        "执行一次完整的 BacklinkHub 外链提交任务。你是唯一的站点级执行者，必须自己循环："
+        f"领取一条候选、用 {_EGO_BROWSER_BIN} nodejs 完成真实提交、"
+        "关闭本候选标签、回写结果，然后继续领取下一条，直到目标达成、队列确实耗尽或发生不可恢复错误。"
+        "不要再调用 delegate_task，不要把候选交还给主会话。"
+    )
+    handoff_context = (
+        "这是由主 Hermes 自动委派的外链执行。只使用 terminal 和 backlinkhub 工具；"
+        f"浏览器只能使用 {_EGO_BROWSER_BIN} nodejs，禁止 OpenCLI、ego-lite、ego。"
+        "ego helpers 在 heredoc 中已预加载，不要 require/import 模块；ego 没有 select() helper，"
+        "下拉框使用 click+键盘或一次 js()。"
+        # These machine-readable reservation fields are deliberately site
+        # references, not guessed site IDs.  BacklinkHub resolves a registered
+        # ID, canonical domain, alias, URL, or product name on the first
+        # advance and returns the authoritative site_id/run_id to the worker.
+        f"\nbacklink_site_reference={site_id or '*'}"
+        f"\nbacklink_run_reference={run_id or '*'}"
+        f"\nbacklink_worker_turn={worker_turn_id}"
+        f"\n主会话传入的 advance 参数：{json.dumps(args, ensure_ascii=False, sort_keys=True)}"
+        f"\nrun_id：{run_id or '由 BacklinkHub 创建新轮次'}"
+        f"\n站点引用：{site_id or '从用户指令和第一条候选确定'}"
+        f"\n用户原始指令：{user_text or '未提供，请以 BacklinkHub 返回的站点和目标为准'}"
+        "\n首次领取时直接把站点引用传给 advance 的 site_id 参数；不要自行拼接 site_ 前缀。"
+        "以 BacklinkHub 返回的 site.site_id 和 run_id 作为后续循环的唯一标准身份。"
+        "\n只把 published、明确待审核 pending 计入目标；结果不明写 attempted_unconfirmed。"
+        "回写时不要手工填写 run_id、site_id、platform_id、work_item_id，"
+        "BacklinkHub 会按本 worker 刚领取的候选自动补齐并校验。"
+        "整个站点轮次只使用 `bh_<site_id>_<run_id>` 一个 ego 任务空间；每个候选只开一个临时标签，"
+        "关闭标签后继续复用轮次空间，正常结束时调用 completeTaskSpace 关闭空间。"
+        "遇到 EGO_TASK_SPACE_USER_IN_CONTROL 立即停止浏览器操作，不重试或夺回控制，"
+        "也不要声称用户手动接管。最终点击前写 failed_retryable，最终点击后写 "
+        "attempted_unconfirmed，均不得写 failed_final。用户明确继续后，对同一个轮次空间调用 "
+        "takeOverTaskSpace 再恢复。关闭后不要再 listTabs 或截图；每条只回写一次。"
+    )
+    try:
+        worker_result = agent._dispatch_delegate_task(
+            {
+                "goal": handoff_goal,
+                "context": handoff_context,
+                "toolsets": ["terminal", "backlinkhub"],
+                "role": "leaf",
+            }
+        )
+    except Exception as exc:
+        worker_result = json.dumps(
+            {
+                "success": False,
+                "error": "backlinkhub_worker_start_failed",
+                "message": str(exc)[:512],
+                "retryable": True,
+            },
+            ensure_ascii=False,
+        )
+
+    if not isinstance(worker_result, str):
+        worker_result = json.dumps(worker_result, ensure_ascii=False)
+    if route_key is not None:
+        with _backlink_route_lock:
+            state = _backlink_route_states.setdefault(route_key, {})
+            state.update(
+                {
+                    "in_flight": False,
+                    "user_marker": user_marker,
+                    "result": worker_result[-1400:],
+                    "browser_blocked": _backlink_result_is_browser_stop(worker_result),
+                }
+            )
+
+    result_by_id[getattr(advance_call, "id", "")] = worker_result
+    for call in backlink_calls:
+        call_id = getattr(call, "id", "")
+        if call_id not in result_by_id:
+            result_by_id[call_id] = json.dumps(
+                {
+                    "success": False,
+                    "error": "backlinkhub_parent_write_forbidden",
+                    "message": "结果由站点级 worker 统一回写，主会话不重复写入。",
+                    "retryable": False,
+                },
+                ensure_ascii=False,
+            )
+    return result_by_id
 
 
 def agent_runtime_owns_post_tool_hook(agent: Any, function_name: str) -> bool:
@@ -1906,10 +2234,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
     else:
         def _execute(next_args: dict) -> Any:
+            _dispatch_identity = {}
+            if getattr(agent, "platform", None):
+                _dispatch_identity["platform"] = agent.platform
             return _ra().handle_function_call(
                 function_name, next_args, effective_task_id,
                 tool_call_id=tool_call_id,
                 session_id=agent.session_id or "",
+                **_dispatch_identity,
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,

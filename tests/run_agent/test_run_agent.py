@@ -819,6 +819,14 @@ class TestInit:
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                return_value=200_000,
+            ),
+            patch(
+                "agent.context_compressor.get_model_context_length",
+                return_value=200_000,
+            ),
         ):
             a = AIAgent(
                 api_key="test-key-1234567890",
@@ -5594,6 +5602,42 @@ class TestFallbackAnthropicProvider:
         assert result is True
         assert agent.api_mode == "chat_completions"
         assert agent.client is mock_client
+
+    def test_fallback_honors_runtime_api_mode_for_named_custom_provider(self, agent):
+        agent._fallback_activated = False
+        agent._fallback_model = {"provider": "kimi", "model": "kimi 2.7"}
+        agent._fallback_chain = [agent._fallback_model]
+        agent._fallback_index = 0
+
+        mock_client = MagicMock()
+        mock_client.base_url = "https://api.kimi.com/coding"
+        mock_client.api_key = "kimi-key"
+
+        with (
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "provider": "custom",
+                    "api_mode": "anthropic_messages",
+                    "base_url": "https://api.kimi.com/coding",
+                    "api_key": "kimi-key",
+                },
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_client, None),
+            ) as mock_resolve_client,
+            patch("agent.anthropic_adapter.build_anthropic_client",
+                  return_value=MagicMock()) as mock_build,
+        ):
+            result = agent._try_activate_fallback()
+
+        assert result is True
+        assert agent.api_mode == "anthropic_messages"
+        assert agent._anthropic_base_url == "https://api.kimi.com/coding"
+        assert agent.client is None
+        mock_build.assert_called_once()
+        assert mock_resolve_client.call_args.kwargs["api_mode"] == "anthropic_messages"
 
 
 def test_aiagent_uses_copilot_acp_client():

@@ -11,6 +11,7 @@ from tools.env_passthrough import (
     get_all_passthrough,
     is_env_passthrough,
     register_env_passthrough,
+    resolve_all_passthrough_values,
     resolve_passthrough_value,
 )
 
@@ -67,6 +68,35 @@ class TestConfigPassthrough:
 
 
 class TestProfileScopedResolution:
+    def test_resolve_all_loads_persisted_value_missing_from_process(
+        self, monkeypatch
+    ):
+        register_env_passthrough(["SERVICE_TOKEN"])
+        monkeypatch.delenv("SERVICE_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_env",
+            lambda: {"SERVICE_TOKEN": "persisted-profile-value"},
+        )
+
+        assert resolve_all_passthrough_values({}) == {
+            "SERVICE_TOKEN": "persisted-profile-value"
+        }
+
+    def test_resolve_all_does_not_leak_persisted_value_across_profiles(
+        self, monkeypatch
+    ):
+        register_env_passthrough(["SERVICE_TOKEN"])
+        monkeypatch.setattr(
+            "hermes_cli.config.load_env",
+            lambda: {"SERVICE_TOKEN": "default-profile-value"},
+        )
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            assert resolve_all_passthrough_values({}) == {}
+        finally:
+            ss.reset_secret_scope(token)
+
     def test_active_scope_overrides_process_fallback(self):
         ss.set_multiplex_active(True)
         token = ss.set_secret_scope({"SERVICE_TOKEN": "profile-b"})
@@ -231,6 +261,8 @@ class TestTerminalIntegration:
 
         register_env_passthrough(["SERVICE_TOKEN"])
         monkeypatch.setenv("SERVICE_TOKEN", "token-for-default")
+        monkeypatch.setenv("LANG", "C")
+        monkeypatch.setenv("LC_ALL", "C")
         ss.set_multiplex_active(True)
         env = None
         token_b = None

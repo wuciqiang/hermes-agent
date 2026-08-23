@@ -1,6 +1,7 @@
 """Test that skill_view registers required env vars in the passthrough registry."""
 
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -78,3 +79,44 @@ class TestSkillViewRegistersPassthrough:
         assert result["success"] is True
         from tools.env_passthrough import get_all_passthrough
         assert len(get_all_passthrough()) == 0
+
+    def test_persisted_skill_env_reaches_all_local_child_paths(
+        self, tmp_path, monkeypatch
+    ):
+        """A profile-only skill credential must reach terminal and execute_code."""
+        env_name = "BACKLINKHUB_SITE_TEST_CONTACT_EMAIL"
+        env_value = "profile-only@example.test"
+        _create_skill(
+            tmp_path,
+            "profile-env-skill",
+            frontmatter_extra=(
+                "required_environment_variables:\n"
+                f"  - name: {env_name}\n"
+                "    prompt: Enter contact email\n"
+            ),
+        )
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", tmp_path)
+        monkeypatch.delenv(env_name, raising=False)
+
+        with (
+            patch("tools.skills_tool._secret_capture_callback", None),
+            patch("tools.skills_tool.load_env", return_value={env_name: env_value}),
+        ):
+            from tools.skills_tool import skill_view
+
+            result = json.loads(skill_view(name="profile-env-skill"))
+
+        assert result["success"] is True
+        assert is_env_passthrough(env_name)
+
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from tools.code_execution_tool import _scrub_child_env
+        from tools.environments.local import _make_run_env, _sanitize_subprocess_env
+
+        token = set_secret_scope({env_name: env_value})
+        try:
+            assert _make_run_env({})[env_name] == env_value
+            assert _sanitize_subprocess_env(os.environ)[env_name] == env_value
+            assert _scrub_child_env(os.environ)[env_name] == env_value
+        finally:
+            reset_secret_scope(token)

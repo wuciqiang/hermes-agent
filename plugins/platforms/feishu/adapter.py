@@ -436,6 +436,7 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    reply_in_thread: bool = True
 
 
 @dataclass
@@ -1661,6 +1662,9 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            reply_in_thread=_to_boolean(
+                extra.get("reply_in_thread", os.getenv("FEISHU_REPLY_IN_THREAD", "true"))
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1693,6 +1697,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._reply_in_thread = settings.reply_in_thread
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -4822,9 +4827,15 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         effective_reply_to = reply_to
-        if not effective_reply_to and metadata and metadata.get("thread_id"):
+        if not effective_reply_to and metadata:
             effective_reply_to = metadata.get("reply_to_message_id")
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
+        # Top-level messages follow the operator setting and create a Feishu
+        # reply thread by default. Messages already inside a thread must stay
+        # there even when top-level auto-threading is disabled.
+        reply_in_thread = bool(
+            getattr(self, "_reply_in_thread", True)
+            or (metadata or {}).get("thread_id")
+        )
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,

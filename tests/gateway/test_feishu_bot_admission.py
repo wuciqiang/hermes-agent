@@ -41,6 +41,29 @@ def test_feishu_load_settings_require_mention(monkeypatch, env_value, extra, exp
     assert settings.require_mention is expected
 
 
+@pytest.mark.parametrize(
+    "env_value, extra, expected",
+    [
+        (None, {}, True),
+        ("false", {}, False),
+        ("true", {}, True),
+        ("true", {"reply_in_thread": False}, False),
+    ],
+)
+def test_feishu_load_settings_reply_in_thread(monkeypatch, env_value, extra, expected):
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test")
+    if env_value is None:
+        monkeypatch.delenv("FEISHU_REPLY_IN_THREAD", raising=False)
+    else:
+        monkeypatch.setenv("FEISHU_REPLY_IN_THREAD", env_value)
+
+    settings = FeishuAdapter._load_settings(extra=extra)
+    assert settings.reply_in_thread is expected
+
+
 # --- Module-level helpers --------------------------------------------------
 
 

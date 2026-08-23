@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from contextvars import ContextVar
-from typing import Iterable
+from typing import Iterable, Mapping
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
@@ -177,6 +177,44 @@ def is_env_passthrough(var_name: str) -> bool:
 def get_all_passthrough() -> frozenset[str]:
     """Return the union of skill-registered and config-based passthrough vars."""
     return frozenset(_get_allowed()) | _load_config_passthrough()
+
+
+def resolve_all_passthrough_values(
+    source_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve every allowlisted value for a sandbox child process.
+
+    An allowlisted variable may exist only in the active profile's ``.env``.
+    In that case it is absent from ``os.environ`` and would never be visited by
+    child-environment builders that merely filter their input mapping.  Load
+    the current profile's persisted values as fallbacks, then route every
+    lookup through :func:`resolve_passthrough_value` so multiplexed profiles
+    remain isolated and fail closed.
+    """
+    names = get_all_passthrough()
+    if not names:
+        return {}
+
+    fallback_values = dict(source_env or {})
+    missing_names = names.difference(fallback_values)
+    if missing_names:
+        try:
+            from hermes_cli.config import load_env
+
+            persisted = load_env()
+            for name in missing_names:
+                value = persisted.get(name)
+                if value is not None:
+                    fallback_values[name] = value
+        except Exception as e:
+            logger.debug("Could not load persisted env passthrough values: %s", e)
+
+    resolved: dict[str, str] = {}
+    for name in sorted(names):
+        value = resolve_passthrough_value(name, fallback_values.get(name))
+        if value is not None:
+            resolved[name] = value
+    return resolved
 
 
 def resolve_passthrough_value(

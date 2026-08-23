@@ -472,13 +472,18 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     try:
         from tools.env_passthrough import (
             is_env_passthrough as _is_passthrough,
+            resolve_all_passthrough_values as _resolve_all_passthrough_values,
             resolve_passthrough_value as _resolve_passthrough_value,
         )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _resolve_all_passthrough_values = lambda _env: {}  # noqa: E731
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     sanitized: dict[str, str] = {}
+    source_env = dict(base_env or {})
+    source_env.update(extra_env or {})
+    resolved_passthrough = _resolve_all_passthrough_values(source_env)
 
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -507,6 +512,11 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
                 sanitized[key] = resolved
+
+    # A skill credential can live only in the active profile's .env and thus
+    # be absent from both input mappings. Add those explicitly resolved values
+    # after the normal filtering pass.
+    sanitized.update(resolved_passthrough)
 
     _inject_context_hermes_home(sanitized)
 
@@ -1285,13 +1295,16 @@ def _make_run_env(env: dict) -> dict:
     try:
         from tools.env_passthrough import (
             is_env_passthrough as _is_passthrough,
+            resolve_all_passthrough_values as _resolve_all_passthrough_values,
             resolve_passthrough_value as _resolve_passthrough_value,
         )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _resolve_all_passthrough_values = lambda _env: {}  # noqa: E731
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     merged = dict(os.environ | env)
+    resolved_passthrough = _resolve_all_passthrough_values(merged)
     run_env = {}
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -1308,6 +1321,8 @@ def _make_run_env(env: dict) -> dict:
             value = _resolve_passthrough_value(k, v) if passthrough else v
             if value is not None:
                 run_env[k] = value
+    # Include allowlisted values that exist only in the active profile's .env.
+    run_env.update(resolved_passthrough)
     path_key = _path_env_key(run_env)
     if path_key is not None:
         new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))

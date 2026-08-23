@@ -1163,6 +1163,7 @@ class TestAdapterBehavior(unittest.TestCase):
                 "all_proxy",
             )
         }
+        proxy_vars.update({"NO_PROXY": "*", "no_proxy": "*"})
         with (
             patch.dict(os.environ, proxy_vars, clear=False),
             patch("socket.getaddrinfo", side_effect=fake_getaddrinfo),
@@ -1244,6 +1245,75 @@ class TestAdapterBehavior(unittest.TestCase):
             os.unlink(file_path)
 
         self.assertTrue(result.success)
+        self.assertTrue(captured["request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_top_level_reply_respects_thread_setting(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        for configured, expected in ((True, True), (False, False)):
+            adapter = FeishuAdapter(PlatformConfig(extra={"reply_in_thread": configured}))
+            captured = {}
+
+            class _MessageAPI:
+                def reply(self, request):
+                    captured["request"] = request
+                    return SimpleNamespace(success=lambda: True)
+
+            adapter._client = SimpleNamespace(
+                im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+            )
+            with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+                asyncio.run(
+                    adapter._send_raw_message(
+                        chat_id="oc_chat",
+                        msg_type="text",
+                        payload='{"text":"done"}',
+                        reply_to="om_parent",
+                        metadata=None,
+                    )
+                )
+
+            self.assertIs(
+                captured["request"].request_body.reply_in_thread,
+                expected,
+            )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_existing_thread_stays_threaded_when_auto_threading_is_disabled(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"reply_in_thread": False}))
+        captured = {}
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            asyncio.run(
+                adapter._send_raw_message(
+                    chat_id="oc_chat",
+                    msg_type="text",
+                    payload='{"text":"done"}',
+                    reply_to="om_parent",
+                    metadata={"thread_id": "omt_thread"},
+                )
+            )
+
         self.assertTrue(captured["request"].request_body.reply_in_thread)
 
 
@@ -2465,5 +2535,3 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
-

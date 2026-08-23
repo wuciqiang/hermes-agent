@@ -223,14 +223,18 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     spawning a subprocess.
     """
     resolve_passthrough_value = None
+    resolve_all_passthrough_values = None
+    use_registry_passthrough = is_passthrough is None
     if is_passthrough is None:
         try:
             from tools.env_passthrough import (
                 is_env_passthrough as _ep,
+                resolve_all_passthrough_values,
                 resolve_passthrough_value,
             )
         except Exception:
             _ep = lambda _: False  # noqa: E731
+            resolve_all_passthrough_values = lambda _env: {}  # noqa: E731
             resolve_passthrough_value = lambda _name, _fallback: None  # noqa: E731
         is_passthrough = _ep
     else:
@@ -242,6 +246,11 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
         is_windows = _IS_WINDOWS
 
     scrubbed = {}
+    resolved_passthrough = (
+        resolve_all_passthrough_values(source_env)
+        if use_registry_passthrough and resolve_all_passthrough_values is not None
+        else {}
+    )
     # Non-secret HERMES_* vars dropped by the tightened allowlist (#27303). The
     # broad "HERMES_" prefix used to pass these through; now only the
     # operational set does. The drop is intentional (those vars can carry
@@ -271,6 +280,9 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             # Non-secret (secrets were already dropped above) and not in any
             # allowlist — a deliberately-dropped HERMES_* var.
             _dropped_hermes.append(k)
+    # Skill credentials may be persisted only in the active profile's .env,
+    # so they can be absent from source_env even though they are allowlisted.
+    scrubbed.update(resolved_passthrough)
     if _dropped_hermes:
         logger.debug(
             "execute_code: dropped %d non-allowlisted HERMES_* var(s) from the "

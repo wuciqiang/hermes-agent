@@ -22,7 +22,13 @@ def _reset_async_delegation():
     ad._reset_for_tests()
 
 
-def _seed_record(delegation_id, session_key="", parent_session_id="", status="running"):
+def _seed_record(
+    delegation_id,
+    session_key="",
+    parent_session_id="",
+    status="running",
+    **routing,
+):
     fn = MagicMock()
     with ad._records_lock:
         ad._records[delegation_id] = {
@@ -31,6 +37,7 @@ def _seed_record(delegation_id, session_key="", parent_session_id="", status="ru
             "session_key": session_key,
             "parent_session_id": parent_session_id,
             "interrupt_fn": fn,
+            **routing,
         }
     return fn
 
@@ -42,6 +49,45 @@ class TestInterruptForSessionByParentId:
         n = ad.interrupt_for_session(parent_session_id="sess_old")
         assert n == 1
         mine.assert_called_once()
+        other.assert_not_called()
+
+    def test_feishu_child_thread_stop_matches_parent_chat_route(self):
+        mine = _seed_record(
+            "d-parent",
+            session_key="agent:main:feishu:dm:oc_chat",
+            platform="feishu",
+            chat_id="oc_chat",
+            user_id="ou_bobo",
+        )
+
+        n = ad.interrupt_for_session(
+            session_key="agent:main:feishu:dm:oc_chat:thread_reply",
+            platform="feishu",
+            chat_id="oc_chat",
+            reason="user_stop",
+        )
+
+        assert n == 1
+        mine.assert_called_once()
+        with ad._records_lock:
+            assert ad._records["d-parent"]["_interrupt_reason"] == "user_stop"
+
+    def test_shared_chat_route_does_not_stop_another_user(self):
+        other = _seed_record(
+            "d-other",
+            platform="feishu",
+            chat_id="oc_group",
+            user_id="ou_other",
+        )
+
+        n = ad.interrupt_for_session(
+            platform="feishu",
+            chat_id="oc_group",
+            user_id="ou_bobo",
+            reason="user_stop",
+        )
+
+        assert n == 0
         other.assert_not_called()
 
 

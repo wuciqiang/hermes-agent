@@ -16317,6 +16317,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             interrupt_reason=_INTERRUPT_REASON_STOP,
             invalidation_reason="stop_command",
         )
+        self._interrupt_async_delegations_for_stop(
+            source,
+            session_key=quick_key,
+        )
         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
         return EphemeralReply(t("gateway.stop.stopped"))
 

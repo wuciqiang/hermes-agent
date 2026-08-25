@@ -1423,6 +1423,38 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _interrupt_async_delegations_for_stop(
+        source,
+        *,
+        session_key: str = "",
+        parent_session_id: str = "",
+    ) -> int:
+        """Stop background work from the same chat, including parent threads."""
+
+        try:
+            from tools.async_delegation import interrupt_for_session
+
+            platform = getattr(getattr(source, "platform", None), "value", "")
+            chat_type = str(getattr(source, "chat_type", "") or "")
+            # A DM chat identifies one user already.  Shared chats additionally
+            # require the same user id to avoid cross-user cancellation.
+            user_id = (
+                ""
+                if chat_type == "dm"
+                else str(getattr(source, "user_id", "") or "")
+            )
+            return interrupt_for_session(
+                session_key=session_key,
+                parent_session_id=parent_session_id,
+                platform=str(platform or ""),
+                chat_id=str(getattr(source, "chat_id", "") or ""),
+                user_id=user_id,
+                reason="user_stop",
+            )
+        except Exception:
+            return 0
+
     async def _handle_stop_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /stop command - interrupt a running agent.
 
@@ -1438,6 +1470,11 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        interrupted_delegations = self._interrupt_async_delegations_for_stop(
+            source,
+            session_key=session_key,
+            parent_session_id=str(getattr(session_entry, "session_id", "") or ""),
+        )
 
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
@@ -1481,6 +1518,14 @@ class GatewaySlashCommandsMixin:
                 session_key,
                 len(sibling_keys),
                 ", ".join(sibling_keys),
+            )
+            return EphemeralReply(t("gateway.stop.stopped"))
+
+        if interrupted_delegations:
+            logger.info(
+                "STOP for session %s — interrupted %d background delegation(s)",
+                session_key,
+                interrupted_delegations,
             )
             return EphemeralReply(t("gateway.stop.stopped"))
 

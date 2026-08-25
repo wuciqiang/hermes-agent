@@ -846,6 +846,20 @@ def test_gateway_formatter_renders_async_block():
     assert "Investigate flaky test" in txt
 
 
+def test_user_stopped_delegation_forbids_automatic_redispatch():
+    evt = _make_async_evt(
+        status="interrupted",
+        interrupt_reason="user_stop",
+        summary="Partial result only",
+    )
+
+    txt = format_process_notification(evt)
+
+    assert txt is not None
+    assert "explicitly stopped by the user" in txt
+    assert "Do not dispatch replacement work automatically" in txt
+
+
 def test_gateway_cli_origin_event_left_unrouted():
     """An empty session_key (CLI origin) is left without routing fields."""
     from gateway.run import GatewayRunner

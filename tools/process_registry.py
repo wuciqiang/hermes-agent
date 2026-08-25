@@ -2744,6 +2744,8 @@ def _format_async_delegation(evt: dict) -> str:
     truncated = evt.get("truncated") or evt.get("exit_reason") == "max_iterations"
     dispatched_at = evt.get("dispatched_at")
     completed_at = evt.get("completed_at") or _time.time()
+    interrupt_reason = str(evt.get("interrupt_reason") or "")
+    explicitly_stopped = interrupt_reason in {"user_stop", "session_reset"}
 
     # ----- Batch (fan-out) completion: consolidated multi-task block -----
     # A whole delegate_task fan-out dispatched as one background unit finishes
@@ -2757,10 +2759,16 @@ def _format_async_delegation(evt: dict) -> str:
         total_dur = evt.get("total_duration_seconds", duration)
         lines = [
             f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
-            f"A background fan-out of {n} subagent(s) you dispatched earlier "
-            "has finished. All ran in parallel and waited on each other; their "
-            "consolidated results are below. You may have moved on since "
-            "dispatching — act on these or re-dispatch if things have changed.",
+            (
+                f"A background fan-out of {n} subagent(s) was explicitly "
+                "stopped by the user. Report the partial result only. Do not "
+                "dispatch replacement work automatically."
+                if explicitly_stopped
+                else f"A background fan-out of {n} subagent(s) you dispatched earlier "
+                "has finished. All ran in parallel and waited on each other; their "
+                "consolidated results are below. You may have moved on since "
+                "dispatching — act on these or re-dispatch if things have changed."
+            ),
             "",
         ]
         if isinstance(dispatched_at, (int, float)):
@@ -2829,9 +2837,15 @@ def _format_async_delegation(evt: dict) -> str:
 
     lines = [
         f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
-        "A background subagent you dispatched earlier has finished. You may "
-        "have moved on since dispatching it; the full task source is below so "
-        "you can act on the result or re-dispatch if things have changed.",
+        (
+            "This background subagent was explicitly stopped by the user. "
+            "Report the partial result only. Do not dispatch replacement work "
+            "automatically."
+            if explicitly_stopped
+            else "A background subagent you dispatched earlier has finished. You may "
+            "have moved on since dispatching it; the full task source is below so "
+            "you can act on the result or re-dispatch if things have changed."
+        ),
         "",
     ]
     if isinstance(dispatched_at, (int, float)):

@@ -681,12 +681,32 @@ def _matches_session_selectors(
     session_key: str = "",
     origin_ui_session_id: str = "",
     parent_session_id: str = "",
+    platform: str = "",
+    chat_id: str = "",
+    user_id: str = "",
 ) -> bool:
-    return (
+    session_match = (
         (origin_ui_session_id and str(record.get("origin_ui_session_id") or "") == origin_ui_session_id)
         or (session_key and str(record.get("session_key") or "") == session_key)
         or (parent_session_id and str(record.get("parent_session_id") or "") == parent_session_id)
     )
+    if session_match:
+        return True
+
+    # A Feishu reply can create a new thread-scoped session even though the
+    # background delegation was started from the parent DM/channel.  Match the
+    # durable platform + chat route so /stop still reaches the original work.
+    # For shared chats callers also pass user_id, which keeps one participant
+    # from stopping another participant's delegation.
+    if not platform or not chat_id:
+        return False
+    if str(record.get("platform") or "") != platform:
+        return False
+    if str(record.get("chat_id") or "") != chat_id:
+        return False
+    if user_id and str(record.get("user_id") or "") != user_id:
+        return False
+    return True
 
 
 def has_live_for_session(
@@ -999,6 +1019,8 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    if record.get("_interrupt_reason"):
+        evt["interrupt_reason"] = record["_interrupt_reason"]
     # Routing origin captured at dispatch (see _capture_routing_origin).
     for _k in _ROUTING_ORIGIN_FIELDS:
         if record.get(_k):
@@ -1213,6 +1235,8 @@ def _push_batch_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    if event_record.get("_interrupt_reason"):
+        evt["interrupt_reason"] = event_record["_interrupt_reason"]
     # Routing origin captured at dispatch (see _capture_routing_origin).
     for _k in _ROUTING_ORIGIN_FIELDS:
         if event_record.get(_k):
@@ -1544,6 +1568,9 @@ def interrupt_for_session(
     session_key: str = "",
     origin_ui_session_id: str = "",
     parent_session_id: str = "",
+    platform: str = "",
+    chat_id: str = "",
+    user_id: str = "",
     reason: str = "session_end",
 ) -> int:
     """Signal running async delegations owned by ONE session to stop.
@@ -1564,7 +1591,12 @@ def interrupt_for_session(
 
     Returns how many were interrupted.
     """
-    if not session_key and not origin_ui_session_id and not parent_session_id:
+    if (
+        not session_key
+        and not origin_ui_session_id
+        and not parent_session_id
+        and not (platform and chat_id)
+    ):
         return 0
     count = 0
     with _records_lock:
@@ -1576,9 +1608,16 @@ def interrupt_for_session(
                 session_key=session_key,
                 origin_ui_session_id=origin_ui_session_id,
                 parent_session_id=parent_session_id,
+                platform=platform,
+                chat_id=chat_id,
+                user_id=user_id,
             )
         ]
     for r in targets:
+        # The completion event needs to distinguish an explicit user stop
+        # from an ordinary child failure.  Otherwise its generic reinjection
+        # text invites the parent model to dispatch another child immediately.
+        r["_interrupt_reason"] = reason
         fn = r.get("interrupt_fn")
         if callable(fn):
             try:

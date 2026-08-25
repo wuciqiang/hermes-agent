@@ -18976,7 +18976,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(
+            context,
+            message_id=getattr(event, "message_id", None),
+        )
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -24408,7 +24411,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc,
                 )
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(
+        self,
+        context: SessionContext,
+        *,
+        message_id: Optional[str] = None,
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -24428,6 +24436,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        effective_message_id = (
+            message_id
+            if message_id is not None
+            else context.source.message_id
+        )
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -24441,7 +24454,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
-            message_id=str(context.source.message_id) if context.source.message_id else "",
+            message_id=str(effective_message_id) if effective_message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
@@ -28449,6 +28462,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reply_to_message_id=event_message_id,
             )
         ) if _progress_thread_id else None
+        if (
+            _progress_metadata is None
+            and source.platform == Platform.FEISHU
+            and event_message_id
+        ):
+            # A top-level Feishu message has no thread_id until the first
+            # reply creates the topic. Replying to its message id with the
+            # adapter's reply_in_thread policy keeps progress and the final
+            # response in that same topic.
+            _progress_metadata = {"reply_to_message_id": event_message_id}
         if _progress_metadata is None and _relay_prospective_thread_id:
             # No real thread yet, but the connector will auto-thread on the
             # reply anchor; carry it so progress joins that thread.
@@ -28466,7 +28489,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _progress_reply_to = (
             event_message_id
             if (
-                source.platform in (Platform.FEISHU, Platform.MATTERMOST)
+                source.platform == Platform.FEISHU
+                and event_message_id
+            )
+            or (
+                source.platform == Platform.MATTERMOST
                 and source.thread_id
                 and event_message_id
             )
@@ -28570,15 +28597,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self._adapter_for_source(source)
         _status_chat_id = source.chat_id
-        if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
+        if source.platform == Platform.FEISHU and event_message_id:
             # Feishu topics only keep messages inside the topic when they are
             # sent via the reply API with reply_in_thread=true. Status/interim,
             # approval, and stream-consumer paths usually only receive metadata,
             # so carry the triggering message id as a Feishu-specific fallback.
             _status_thread_metadata: Optional[Dict[str, Any]] = {
-                "thread_id": _progress_thread_id,
                 "reply_to_message_id": event_message_id,
             }
+            if _progress_thread_id:
+                _status_thread_metadata["thread_id"] = _progress_thread_id
         else:
             _status_thread_metadata = (
                 self._thread_metadata_for_source(source, event_message_id)

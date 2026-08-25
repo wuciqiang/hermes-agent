@@ -535,6 +535,66 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_run_agent_progress_replies_to_top_level_feishu_message(
+    monkeypatch, tmp_path,
+):
+    """A top-level Feishu task must create its progress topic from the trigger."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"feishu": {"tool_progress": "all"}}}}),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.FEISHU)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_parent_chat",
+        chat_type="group",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="submit backlinks",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-feishu-top-level",
+        session_key="agent:main:feishu:group:oc_parent_chat",
+        event_message_id="om_trigger",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert all(call["reply_to"] == "om_trigger" for call in adapter.sent)
+    assert all(
+        (call["metadata"] or {}).get("reply_to_message_id") == "om_trigger"
+        for call in adapter.sent
+    )
+    assert all(
+        (call["metadata"] or {}).get("reply_to_message_id") == "om_trigger"
+        for call in adapter.typing
+        if (call["metadata"] or {}).get("stopped") is not True
+    )
+
+
+@pytest.mark.asyncio
 async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch, tmp_path):
     """Relay Discord channel-initiate: the thread doesn't exist at ingest, so
     the connector auto-threads on the reply anchor and stamps

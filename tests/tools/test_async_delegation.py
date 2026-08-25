@@ -175,6 +175,100 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+def test_completion_event_preserves_feishu_reply_anchor():
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionContext, SessionSource
+
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="dm",
+        thread_id="omt_topic",
+        user_id="ou_user",
+    )
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_key="agent:main:feishu:dm:oc_chat",
+    )
+    # Feishu stores the live inbound id on MessageEvent, not SessionSource.
+    tokens = runner._set_session_env(context, message_id="om_trigger")
+    try:
+        result = ad.dispatch_async_delegation(
+            goal="submit backlinks",
+            context=None,
+            toolsets=["terminal"],
+            role="leaf",
+            model="m",
+            session_key="agent:main:feishu:dm:oc_chat",
+            runner=lambda: {"status": "completed", "summary": "done"},
+            max_async_children=1,
+        )
+        event = _drain_for(result["delegation_id"])
+    finally:
+        runner._clear_session_env(tokens)
+
+    assert event is not None
+    assert event["platform"] == "feishu"
+    assert event["chat_id"] == "oc_chat"
+    assert event["chat_type"] == "dm"
+    assert event["thread_id"] == "omt_topic"
+    assert event["message_id"] == "om_trigger"
+
+
+def test_abandoned_delegation_restores_feishu_reply_anchor(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(
+        platform="feishu",
+        chat_id="oc_chat",
+        chat_type="dm",
+        message_id="om_trigger",
+        user_id="ou_user",
+    )
+    try:
+        result = ad.dispatch_async_delegation(
+            goal="submit backlinks",
+            context=None,
+            toolsets=["terminal"],
+            role="leaf",
+            model="m",
+            session_key="agent:main:feishu:dm:oc_chat",
+            runner=lambda: {"status": "completed", "summary": "done"},
+            max_async_children=1,
+        )
+        event = _drain_for(result["delegation_id"])
+    finally:
+        clear_session_vars(tokens)
+
+    assert event is not None
+    with ad._DB_LOCK, ad._transaction() as connection:
+        connection.execute(
+            "UPDATE async_delegations SET state='running', owner_pid=? WHERE delegation_id=?",
+            (99999999, result["delegation_id"]),
+        )
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+
+    assert ad.recover_abandoned_delegations() == 1
+    restored = ad.get_durable_delegation(result["delegation_id"])
+    assert restored is not None
+    stored_event = restored["result"]
+    assert stored_event is not None
+
+    with ad._DB_LOCK, ad._transaction() as connection:
+        row = connection.execute(
+            "SELECT event_json FROM async_delegations WHERE delegation_id=?",
+            (result["delegation_id"],),
+        ).fetchone()
+    recovered_event = json.loads(row[0])
+    assert recovered_event["platform"] == "feishu"
+    assert recovered_event["chat_id"] == "oc_chat"
+    assert recovered_event["message_id"] == "om_trigger"
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",
@@ -824,4 +918,3 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     banner_pos = text.index("TRUNCATED")
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
-

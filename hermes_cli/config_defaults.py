@@ -1907,6 +1907,10 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
+        # Named child capability profiles are operator-controlled. The model
+        # may select a configured name but never supplies raw toolsets; each
+        # profile is still intersected with the parent's effective toolsets.
+        "tool_profiles": {},
         "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch

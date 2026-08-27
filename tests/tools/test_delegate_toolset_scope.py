@@ -1,9 +1,8 @@
 """Tests for delegate_tool toolset scoping.
 
 Verifies that subagents cannot gain tools that the parent does not have.
-The LLM controls the `toolsets` parameter — without intersection with the
-parent's enabled_toolsets, it can escalate privileges by requesting
-arbitrary toolsets.
+Raw ``toolsets`` are internal-only; trusted callers and operator-defined named
+profiles still pass through the parent intersection before child construction.
 """
 
 from types import SimpleNamespace

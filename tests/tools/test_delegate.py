@@ -23,6 +23,7 @@ from tools.delegate_tool import (
     DelegateEvent,
     _get_max_concurrent_children,
     _load_config,
+    _resolve_tool_profile,
     delegate_task,
     _build_child_agent,
     _build_child_progress_callback,
@@ -65,11 +66,14 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertIn("tool_profile", props)
         # toolsets is intentionally NOT exposed to the model — subagents always
-        # inherit the parent's toolsets. Letting the model name toolsets was a
-        # capability-selection surface the model should not control.
+        # inherit them or select an operator-defined named profile. Letting the
+        # model name raw toolsets is a capability-selection surface it should
+        # not control.
         self.assertNotIn("toolsets", props)
         self.assertNotIn("toolsets", props["tasks"]["items"]["properties"])
+        self.assertNotIn("tool_profile", props["tasks"]["items"]["properties"])
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -81,6 +85,74 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+
+    def test_named_tool_profile_resolves_operator_config(self):
+        cfg = {
+            "tool_profiles": {
+                "focused": ["terminal", "skills", "terminal"],
+            }
+        }
+
+        self.assertEqual(
+            _resolve_tool_profile("focused", cfg),
+            ["terminal", "skills"],
+        )
+
+    def test_unknown_tool_profile_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown delegation tool_profile"):
+            _resolve_tool_profile(
+                "missing",
+                {"tool_profiles": {"focused": ["terminal"]}},
+            )
+
+    def test_named_tool_profile_reaches_child_as_a_narrowing_request(self):
+        cfg = {
+            "max_iterations": 10,
+            "max_spawn_depth": 1,
+            "tool_profiles": {"focused": ["terminal", "skills"]},
+        }
+        creds = {
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": None,
+            "request_overrides": {},
+            "max_output_tokens": None,
+            "command": None,
+            "args": [],
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "skills", "code_execution"]
+        parent.disabled_toolsets = []
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), \
+             patch("tools.delegate_tool._resolve_delegation_credentials", return_value=creds), \
+             patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.model = "test-model"
+            child.session_prompt_tokens = 0
+            child.session_completion_tokens = 0
+            child._credential_pool = None
+            child._delegate_saved_tool_names = []
+            child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = child
+
+            delegate_task(
+                goal="Use the focused profile",
+                tool_profile="focused",
+                parent_agent=parent,
+            )
+
+        child_kwargs = MockAgent.call_args[1]
+        self.assertEqual(child_kwargs["enabled_toolsets"], ["terminal", "skills"])
+        self.assertNotIn("code_execution", child_kwargs["enabled_toolsets"])
 
     def test_top_level_description_compact_and_complete(self):
         """The top-level description must stay compact while keeping every
@@ -1366,6 +1438,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 parent,
                 {
                     "goal": "test",
+                    "tool_profile": "focused",
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
@@ -1381,6 +1454,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured)
         self.assertNotIn("acp_args", captured)
         self.assertEqual(captured["goal"], "test")
+        self.assertEqual(captured["tool_profile"], "focused")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 

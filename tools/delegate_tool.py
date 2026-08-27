@@ -10,7 +10,8 @@ wait for their own workers so they can synthesize the results.
 Each child gets:
   - A fresh conversation (no parent history)
   - Its own task_id (own terminal session, file ops cache)
-  - The parent's toolsets, with child-only blocked tools stripped
+  - The parent's toolsets, optionally narrowed by an operator-defined profile,
+    with child-only blocked tools stripped
   - A focused system prompt built from the delegated goal + context
 
 The parent's context only sees the delegation call and the summary result,
@@ -34,7 +35,7 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
-from toolsets import TOOLSETS
+from toolsets import TOOLSETS, validate_toolset
 from agent.interrupt_compat import request_hard_interrupt
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -116,8 +117,9 @@ def _get_subagent_approval_callback():
     return _subagent_auto_deny
 
 # NOTE: nested delegation is granted by role='orchestrator' (which re-adds the
-# "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
-# — the model has no toolsets argument. Subagents inherit the parent's toolsets.
+# "delegation" toolset in _build_child_agent), NOT by the model naming raw
+# toolsets. Subagents inherit the parent's tools unless the model selects an
+# operator-defined named profile, which can only narrow that inherited set.
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 10
 # One-shot guard: the high-concurrency cost advisory is emitted at most once
@@ -1030,6 +1032,69 @@ def _get_inherit_mcp_toolsets() -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
     cfg = _load_config()
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
+
+
+def _configured_tool_profile_names(cfg: Optional[dict] = None) -> List[str]:
+    """Return operator-defined delegation tool profile names."""
+    config = cfg if isinstance(cfg, dict) else _load_config()
+    profiles = config.get("tool_profiles")
+    if not isinstance(profiles, dict):
+        return []
+    return sorted(
+        {
+            str(name).strip()
+            for name in profiles
+            if str(name).strip()
+        }
+    )
+
+
+def _resolve_tool_profile(
+    profile_name: Optional[str], cfg: Optional[dict] = None
+) -> Optional[List[str]]:
+    """Resolve a named, operator-controlled child toolset profile.
+
+    The model may select only a configured profile name. It never supplies raw
+    toolsets, and ``_build_child_agent`` still intersects this list with the
+    parent's effective toolsets before constructing the child.
+    """
+    if profile_name is None or not str(profile_name).strip():
+        return None
+
+    name = str(profile_name).strip()
+    config = cfg if isinstance(cfg, dict) else _load_config()
+    profiles = config.get("tool_profiles")
+    available = _configured_tool_profile_names(config)
+    if not isinstance(profiles, dict) or name not in profiles:
+        available_text = ", ".join(available) if available else "none"
+        raise ValueError(
+            f"Unknown delegation tool_profile '{name}'. "
+            f"Configured profiles: {available_text}."
+        )
+
+    raw_toolsets = profiles[name]
+    if not isinstance(raw_toolsets, (list, tuple)):
+        raise ValueError(
+            f"delegation.tool_profiles.{name} must be a YAML list of toolset names."
+        )
+    toolsets = list(
+        dict.fromkeys(
+            str(toolset).strip()
+            for toolset in raw_toolsets
+            if str(toolset).strip()
+        )
+    )
+    if not toolsets:
+        raise ValueError(
+            f"delegation.tool_profiles.{name} must contain at least one toolset."
+        )
+    unknown = [toolset for toolset in toolsets if not validate_toolset(toolset)]
+    if unknown:
+        raise ValueError(
+            f"delegation.tool_profiles.{name} contains unknown toolsets: "
+            + ", ".join(unknown)
+        )
+    return toolsets
 
 
 def _is_mcp_toolset_name(name: str) -> bool:
@@ -3600,6 +3665,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    tool_profile: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
@@ -3625,6 +3691,8 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+    ``tool_profile`` may select an operator-defined narrowing profile from
+    delegation.tool_profiles; raw toolsets are never accepted from the model.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3680,6 +3748,10 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    try:
+        profile_toolsets = _resolve_tool_profile(tool_profile, cfg)
+    except ValueError as exc:
+        return tool_error(str(exc))
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -3842,9 +3914,10 @@ def delegate_task(
                 task_index=i,
                 goal=t["goal"],
                 context=_child_context,
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
+                # Raw toolsets are never model-facing. A named profile is
+                # operator-defined in config and is still intersected with the
+                # parent's effective toolsets inside _build_child_agent.
+                toolsets=profile_toolsets,
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
@@ -4245,8 +4318,7 @@ def delegate_task(
             goals=_goals,
             context=context,
             # Metadata for the completion block only; subagents inherit the
-            # parent's toolsets (no model-facing toolsets arg).
-            toolsets=None,
+            toolsets=profile_toolsets,
             role=top_role,
             model=creds["model"],
             session_key=_session_key,
@@ -4720,6 +4792,22 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    profile_names = _configured_tool_profile_names()
+    profile_schema = dict(overrides_params["properties"]["tool_profile"])
+    if profile_names:
+        profile_schema["enum"] = profile_names
+        profile_schema["description"] = (
+            "Optional operator-defined child capability profile. Available: "
+            + ", ".join(profile_names)
+            + ". Profiles can only narrow the parent's tools; raw toolsets "
+            "are never model-controlled."
+        )
+    else:
+        profile_schema["description"] = (
+            "Optional operator-defined child capability profile. No profiles "
+            "are currently configured in delegation.tool_profiles."
+        )
+    overrides_params["properties"]["tool_profile"] = profile_schema
 
     return {
         "description": _build_top_level_description(),
@@ -4801,6 +4889,13 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "tool_profile": {
+                "type": "string",
+                "description": (
+                    "Operator-defined child capability profile. The available "
+                    "names are rebuilt from delegation.tool_profiles."
+                ),
             },
             "output_schema": {
                 "type": "object",
@@ -4913,6 +5008,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        tool_profile=args.get("tool_profile"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         action=args.get("action"),

@@ -7055,8 +7055,53 @@ def run_conversation(
                         if tc.function.name in {n for n, _ in invalid_json_args}
                     )
                     if _truncated:
+                        # Some Responses-compatible routers mark a cut-off
+                        # function_call as completed/tool_calls instead of
+                        # reporting status=incomplete.  The call has not been
+                        # executed yet, so retrying the same model turn is
+                        # safe and mirrors the explicit finish_reason=length
+                        # recovery above.  Previously this path returned a
+                        # truncation error after one API call even though a
+                        # retry could safely recover the turn.
+                        if truncated_tool_call_retries < 4:
+                            truncated_tool_call_retries += 1
+                            _tc_boost_base = (
+                                agent.max_tokens if agent.max_tokens else 4096
+                            )
+                            _tc_boost = _tc_boost_base * (
+                                2 ** truncated_tool_call_retries
+                            )
+                            _tc_requested_cap = (
+                                agent._requested_output_cap_from_api_kwargs(
+                                    api_kwargs
+                                )
+                            )
+                            if _tc_requested_cap is not None:
+                                _tc_boost = max(_tc_boost, _tc_requested_cap)
+                            _tc_boost_cap = max(
+                                32768, _tc_requested_cap or 0
+                            )
+                            agent._ephemeral_max_output_tokens = min(
+                                _tc_boost, _tc_boost_cap
+                            )
+                            logger.warning(
+                                "Provider returned truncated tool arguments "
+                                "with finish_reason=%r; retrying without "
+                                "executing the tool (%d/4).",
+                                finish_reason,
+                                truncated_tool_call_retries,
+                            )
+                            agent._buffer_vprint(
+                                "⚠️  Truncated tool call arguments detected — "
+                                f"retrying API call "
+                                f"({truncated_tool_call_retries}/4)..."
+                            )
+                            continue
+
+                        agent._flush_status_buffer()
                         agent._vprint(
-                            f"{agent.log_prefix}⚠️  Truncated tool call arguments detected "
+                            f"{agent.log_prefix}⚠️  Tool call arguments remained "
+                            f"truncated after 4 retries "
                             f"(finish_reason={finish_reason!r}) — refusing to execute.",
                             force=True,
                         )

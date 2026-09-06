@@ -6800,12 +6800,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # No-op fast path: skip the transaction when there is nothing to
         # clear. Read-only, no write lock.
         try:
-            row = self._conn.execute(
-                "SELECT last_activity_description, last_activity_provenance "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-        except sqlite3.Error:
+            # Read through the same lifecycle-aware path used by other
+            # observation queries.  A SessionDB can be closed by a sibling
+            # teardown while a turn's finally block is clearing labels; using
+            # the raw writer connection here races that close (and, on the
+            # tracked SQLite build, can crash in the C layer).
+            with self._read_ctx() as conn:
+                row = (
+                    conn.execute(
+                        "SELECT last_activity_description, last_activity_provenance "
+                        "FROM sessions WHERE id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    if conn is not None
+                    else None
+                )
+        except (sqlite3.Error, AttributeError):
             row = None
         if row is not None:
             desc = row[0] if not isinstance(row, sqlite3.Row) else row["last_activity_description"]
@@ -6824,7 +6834,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ("", ActivityProvenance.UNKNOWN.value, session_id),
             )
 
-        self._execute_write(_do, patience_s=self._ACTIVITY_WRITE_PATIENCE_S)
+        try:
+            self._execute_write(_do, patience_s=self._ACTIVITY_WRITE_PATIENCE_S)
+        except (sqlite3.Error, AttributeError):
+            # Label clearing is best-effort observation state. If teardown won
+            # the lifecycle race, the connection is already gone and there is
+            # nothing left to clear; do not let that turn-finalizer path bring
+            # down the worker or gateway.
+            if self._conn is None:
+                return
+            raise
 
     def get_session_activity(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Return the durable activity snapshot for *session_id*, or None."""

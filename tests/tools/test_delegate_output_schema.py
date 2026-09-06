@@ -24,7 +24,11 @@ from tools.delegate_tool import (
 from tools.delegation_output_schema import (
     append_output_contract,
     build_retry_message,
+    completion_can_continue,
     coerce_output_schema,
+    continuation_progress_fingerprint,
+    normalize_completion_exit_reason,
+    normalize_completion_payload,
     validate_output,
 )
 
@@ -36,6 +40,81 @@ ADDRESS_SCHEMA = {
     },
     "required": ["city"],
 }
+
+ROUND_SCHEMA = {
+    "type": "object",
+    "required": [
+        "site_id",
+        "run_id",
+        "target",
+        "published",
+        "pending",
+        "attempted_unconfirmed",
+        "failed_retryable",
+        "failed_final",
+        "remaining",
+        "queue_exhausted",
+        "target_reached",
+        "stop_reason",
+        "ego_task_space_id",
+        "ego_cleanup",
+        "segment_iteration_boundary",
+        "candidate_bound",
+        "candidate_external_side_effect",
+    ],
+    "properties": {
+        "site_id": {"type": "string"},
+        "run_id": {"type": "string"},
+        "target": {"type": "integer", "minimum": 1},
+        "published": {"type": "integer", "minimum": 0},
+        "pending": {"type": "integer", "minimum": 0},
+        "attempted_unconfirmed": {"type": "integer", "minimum": 0},
+        "failed_retryable": {"type": "integer", "minimum": 0},
+        "failed_final": {"type": "integer", "minimum": 0},
+        "remaining": {"type": "integer", "minimum": 0},
+        "queue_exhausted": {"type": "boolean"},
+        "target_reached": {"type": "boolean"},
+        "stop_reason": {"type": "string"},
+        "ego_task_space_id": {
+            "anyOf": [
+                {"type": "integer", "minimum": 1},
+                {"type": "null"},
+            ]
+        },
+        "ego_cleanup": {"type": "string"},
+        "segment_iteration_boundary": {"type": "boolean"},
+        "candidate_bound": {"type": "boolean"},
+        "candidate_external_side_effect": {
+            "type": "string",
+            "enum": ["none", "confirmed", "unknown"],
+        },
+    },
+    "additionalProperties": True,
+}
+
+
+def _round_payload(**overrides):
+    payload = {
+        "site_id": "site_thesitemath",
+        "run_id": "round_test",
+        "target": 6,
+        "published": 0,
+        "pending": 1,
+        "attempted_unconfirmed": 0,
+        "failed_retryable": 2,
+        "failed_final": 3,
+        "remaining": 5,
+        "queue_exhausted": False,
+        "target_reached": False,
+        "stop_reason": "segment_iteration_boundary",
+        "ego_task_space_id": 7,
+        "ego_cleanup": "preserved_for_continuation",
+        "segment_iteration_boundary": True,
+        "candidate_bound": False,
+        "candidate_external_side_effect": "none",
+    }
+    payload.update(overrides)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +195,244 @@ class TestPromptPlumbing:
         assert "JSON" in msg
 
 
+class TestContinuationBoundary:
+    @staticmethod
+    def _unfinished(**overrides):
+        payload = {
+            "schema_valid": True,
+            "site_id": "site_one",
+            "run_id": "round_one",
+            "target": 3,
+            "published": 1,
+            "pending": 0,
+            "attempted_unconfirmed": 0,
+            "failed_retryable": 2,
+            "failed_final": 0,
+            "remaining": 2,
+            "queue_exhausted": False,
+            "target_reached": False,
+            "stop_reason": "max_iterations",
+            "ego_task_space_id": 7,
+            "ego_cleanup": "preserved_for_continuation",
+            "segment_iteration_boundary": False,
+            "candidate_bound": False,
+            "candidate_external_side_effect": "none",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_native_max_iterations_result_can_continue(self):
+        payload = self._unfinished()
+
+        assert completion_can_continue(payload) is True
+        assert normalize_completion_exit_reason(
+            payload,
+            schema_valid=True,
+            exit_reason="max_iterations",
+        ) == "max_iterations"
+
+    def test_plain_completed_result_does_not_continue(self):
+        payload = self._unfinished(
+            stop_reason="completed",
+            ego_cleanup="closed",
+        )
+
+        assert completion_can_continue(payload, exit_reason="completed") is False
+        assert normalize_completion_exit_reason(
+            payload,
+            schema_valid=True,
+            exit_reason="completed",
+        ) == "completed"
+
+    def test_explicit_segment_boundary_can_continue(self):
+        payload = self._unfinished(
+            stop_reason="segment_iteration_boundary",
+            segment_iteration_boundary=True,
+        )
+
+        assert completion_can_continue(payload, exit_reason="completed") is True
+        assert normalize_completion_exit_reason(
+            payload,
+            schema_valid=True,
+            exit_reason="completed",
+        ) == "max_iterations"
+        assert completion_can_continue(payload, exit_reason="max_iterations") is True
+
+    def test_observed_iteration_cleanup_alias_is_safe_to_continue(self):
+        payload = self._unfinished(
+            stop_reason="segment_iteration_boundary",
+            ego_cleanup="not_cleaned_iteration_boundary",
+            segment_iteration_boundary=True,
+        )
+
+        normalized = normalize_completion_payload(payload)
+        assert normalized["ego_cleanup"] == "preserved_for_continuation"
+        assert completion_can_continue(payload, exit_reason="completed") is True
+        assert normalize_completion_exit_reason(
+            payload,
+            schema_valid=True,
+            exit_reason="completed",
+        ) == "max_iterations"
+
+    def test_known_defensive_early_return_can_continue_with_closed_space(self):
+        payload = self._unfinished(
+            stop_reason=(
+                "stopped_without_native_termination_after_current_execution_segment"
+            ),
+            ego_cleanup="closed",
+        )
+
+        assert completion_can_continue(payload, exit_reason="completed") is True
+        assert normalize_completion_exit_reason(
+            payload,
+            schema_valid=True,
+            exit_reason="completed",
+        ) == "max_iterations"
+
+    def test_serial_continuation_preserves_reusable_space(self):
+        payload = self._unfinished(
+            stop_reason="serial_continuation_boundary",
+            ego_cleanup="preserved_for_serial_continuation",
+        )
+
+        assert completion_can_continue(payload) is True
+
+    def test_reported_known_boundary_can_continue(self):
+        payload = self._unfinished(
+            stop_reason="worker_returned_early",
+            reported_stop_reason="worker_execution_boundary_before_target",
+            ego_cleanup="preserved_for_continuation",
+        )
+
+        assert completion_can_continue(payload, exit_reason="completed") is True
+
+    def test_network_timeout_does_not_cancel_native_boundary(self):
+        """A candidate network failure must not mask a native segment boundary."""
+        payload = self._unfinished(
+            stop_reason="network_timeout",
+            ego_cleanup="preserved_for_continuation",
+        )
+
+        assert completion_can_continue(payload, exit_reason="max_iterations") is True
+
+    def test_true_user_control_does_not_continue(self):
+        payload = self._unfinished(
+            stop_reason="task_space_user_controlled",
+            ego_cleanup="closed",
+        )
+
+        assert completion_can_continue(payload) is False
+        assert normalize_completion_exit_reason(
+            payload,
+            schema_valid=True,
+            exit_reason="completed",
+        ) == "completed"
+
+    def test_all_known_user_control_variants_do_not_continue(self):
+        for reason in (
+            "user_is_controlling",
+            "ego_user_control",
+            "user_takeover",
+            "real_user_takeover_after_navigation",
+            "manual_handoff",
+            "ownership=user",
+            "ownership=agentDelegatedToUser",
+        ):
+            payload = self._unfinished(stop_reason=reason, ego_cleanup="closed")
+            assert completion_can_continue(payload, exit_reason="completed") is False
+
+    def test_unknown_external_side_effect_does_not_continue(self):
+        for side_effect in ("confirmed", "unknown"):
+            payload = self._unfinished(
+                candidate_bound=True,
+                candidate_external_side_effect=side_effect,
+            )
+
+            assert completion_can_continue(payload) is False
+
+    def test_latest_real_boundary_ignores_historical_effect_after_record(self):
+        payload = self._unfinished(
+            site_id="site_thesitemath",
+            run_id="round_20260903_142813_c7c79100",
+            target=6,
+            published=0,
+            pending=0,
+            failed_retryable=8,
+            failed_final=1,
+            remaining=6,
+            stop_reason="segment_iteration_boundary",
+            ego_task_space_id=8,
+            ego_cleanup="closed",
+            segment_iteration_boundary=True,
+            candidate_bound=False,
+            candidate_external_side_effect="confirmed",
+        )
+
+        normalized = normalize_completion_payload(payload)
+
+        assert normalized["candidate_external_side_effect"] == "none"
+        assert completion_can_continue(payload, exit_reason="completed") is True
+        assert normalize_completion_exit_reason(
+            payload,
+            schema_valid=True,
+            exit_reason="completed",
+        ) == "max_iterations"
+
+    def test_already_terminal_result_does_not_continue(self):
+        payload = self._unfinished(target_reached=True, remaining=0)
+
+        assert completion_can_continue(payload) is False
+
+    def test_missing_schema_or_space_id_does_not_continue(self):
+        payload = self._unfinished()
+        payload.pop("schema_valid")
+        assert completion_can_continue(payload) is False
+        payload["schema_valid"] = True
+        payload["ego_task_space_id"] = None
+        assert completion_can_continue(payload) is False
+
+    def test_invalid_progress_types_do_not_continue(self):
+        for field, value in (
+            ("remaining", "2"),
+            ("remaining", True),
+            ("target", 0),
+            ("published", 1.5),
+        ):
+            payload = self._unfinished(**{field: value})
+            assert completion_can_continue(payload) is False
+
+    def test_native_boundary_with_closed_space_recreates_when_safe(self):
+        payload = self._unfinished(
+            stop_reason="max_iterations",
+            ego_cleanup="closed",
+        )
+
+        assert completion_can_continue(payload, exit_reason="max_iterations") is True
+
+    def test_boundary_before_ego_space_creation_can_continue(self):
+        payload = self._unfinished(
+            stop_reason="segment_iteration_boundary",
+            ego_task_space_id=None,
+            ego_cleanup="not_created",
+            segment_iteration_boundary=True,
+        )
+
+        assert completion_can_continue(payload, exit_reason="completed") is True
+
+    def test_ego_space_id_must_be_positive_integer(self):
+        for space_id in (0, -1, True, "7"):
+            payload = self._unfinished(ego_task_space_id=space_id)
+            assert completion_can_continue(payload) is False
+
+    def test_progress_fingerprint_ignores_boundary_labels(self):
+        first = self._unfinished()
+        second = self._unfinished(stop_reason="segment_iteration_boundary")
+        second["segment_iteration_boundary"] = True
+        assert continuation_progress_fingerprint(first) == continuation_progress_fingerprint(
+            second
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tool-schema surface (one-time static field)
 # ---------------------------------------------------------------------------
@@ -169,7 +486,10 @@ class _StubChild:
 
     def run_conversation(self, user_message, task_id=None, **_kwargs):
         self.calls.append(user_message)
-        text = self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, dict):
+            return response
+        text = response
         return {
             "final_response": text,
             "completed": True,
@@ -215,6 +535,143 @@ class TestRunSingleChildSchemaValidation:
         # final summary is the retried (valid) answer
         assert json.loads(entry["summary"])["city"] == "Oslo"
 
+    def test_valid_result_captures_continuation_metadata_before_finalization(self):
+        schema = {
+            "type": "object",
+            "required": ["site_id", "run_id", "remaining"],
+            "properties": {
+                "site_id": {"type": "string"},
+                "run_id": {"type": "string"},
+                "remaining": {"type": "integer"},
+                "ego_task_space_id": {"type": "integer"},
+                "candidate_external_side_effect": {"type": "string"},
+            },
+        }
+        child = _StubChild(
+            [
+                json.dumps(
+                    {
+                        "site_id": "site_thesitemath",
+                        "run_id": "round_1",
+                        "remaining": 2,
+                        "ego_task_space_id": 7,
+                        "candidate_external_side_effect": "none",
+                    }
+                )
+            ]
+        )
+        child._delegate_output_schema = schema
+
+        entry = _run(child)
+
+        metadata = entry["_completion_metadata"]
+        assert metadata["schema_valid"] is True
+        assert metadata["run_id"] == "round_1"
+        assert metadata["remaining"] == 2
+        assert metadata["ego_task_space_id"] == 7
+        assert metadata["candidate_external_side_effect"] == "none"
+
+    def test_early_completed_backlink_result_is_marked_native_boundary(self):
+        schema = {
+            "type": "object",
+            "required": [
+                "site_id",
+                "run_id",
+                "target",
+                "published",
+                "pending",
+                "attempted_unconfirmed",
+                "failed_retryable",
+                "failed_final",
+                "remaining",
+                "queue_exhausted",
+                "target_reached",
+                "stop_reason",
+                "ego_task_space_id",
+                "ego_cleanup",
+                "segment_iteration_boundary",
+                "candidate_bound",
+                "candidate_external_side_effect",
+            ],
+        }
+        payload = TestContinuationBoundary._unfinished(
+            stop_reason=(
+                "stopped_without_native_termination_after_current_execution_segment"
+            ),
+            ego_cleanup="closed",
+        )
+        child = _StubChild([json.dumps(payload)])
+        child._delegate_output_schema = schema
+
+        entry = _run(child)
+
+        assert entry["status"] == "completed"
+        assert entry["exit_reason"] == "max_iterations"
+        assert entry["truncated"] is True
+        assert entry["_completion_metadata"]["exit_reason"] == "max_iterations"
+
+    def test_legacy_progress_result_is_normalized_for_hot_reload(self):
+        """An old session schema still produces resumable completion metadata."""
+        schema = {
+            "type": "object",
+            "required": [
+                "site_id",
+                "run_id",
+                "target",
+                "progress",
+                "queue_exhausted",
+                "target_reached",
+                "stop_reason",
+                "segment_boundary",
+                "candidate_bound",
+            ],
+            "properties": {
+                "site_id": {"type": "string"},
+                "run_id": {"type": "string"},
+                "target": {"type": "integer"},
+                "progress": {"type": "object"},
+                "queue_exhausted": {"type": "boolean"},
+                "target_reached": {"type": "boolean"},
+                "stop_reason": {"type": "string"},
+                "segment_boundary": {"type": "boolean"},
+                "candidate_bound": {"type": "boolean"},
+            },
+        }
+        child = _StubChild(
+            [
+                json.dumps(
+                    {
+                        "site_id": "site_thesitemath",
+                        "run_id": "round_legacy",
+                        "target": 6,
+                        "progress": {
+                            "published": 0,
+                            "pending": 0,
+                            "attempted_unconfirmed": 0,
+                            "failed_retryable": 13,
+                            "failed_final": 2,
+                            "remaining": 6,
+                        },
+                        "queue_exhausted": False,
+                        "target_reached": False,
+                        "stop_reason": "segment_iteration_boundary",
+                        "segment_boundary": True,
+                        "candidate_bound": False,
+                    }
+                )
+            ]
+        )
+        child._delegate_output_schema = schema
+
+        metadata = _run(child)["_completion_metadata"]
+
+        assert metadata["remaining"] == 6
+        assert metadata["failed_retryable"] == 13
+        assert metadata["segment_iteration_boundary"] is True
+        assert metadata["stop_reason"] == "worker_returned_early"
+        assert metadata["reported_stop_reason"] == "segment_iteration_boundary"
+        assert metadata["candidate_external_side_effect"] == "none"
+
     def test_invalid_twice_surfaces_errors_and_stops(self):
         child = _StubChild(["nope", "still nope"])
         child._delegate_output_schema = ADDRESS_SCHEMA
@@ -258,6 +715,53 @@ class TestRunSingleChildSchemaValidation:
         assert entry["status"] == "failed"
         assert len(child.calls) == 1
         assert entry.get("schema_valid") is False
+
+    def test_explicit_api_failure_with_text_is_not_completed(self):
+        """A provider error must stay failed even when it has display text."""
+        child = _StubChild(
+            [
+                {
+                    "final_response": "API call failed after 3 retries: 502 Bad Gateway",
+                    "completed": False,
+                    "failed": True,
+                    "error": "502 Bad Gateway",
+                    "failure_reason": "server_error",
+                    "api_calls": 3,
+                    "messages": [],
+                }
+            ]
+        )
+        child._delegate_output_schema = ADDRESS_SCHEMA
+
+        entry = _run(child)
+
+        assert entry["status"] == "failed"
+        assert entry["exit_reason"] == "server_error"
+        assert entry["failure_reason"] == "server_error"
+        assert "schema_retries" not in entry
+        assert len(child.calls) == 1
+
+    def test_failed_schema_result_does_not_trigger_retry(self):
+        """Failed API output must not consume a schema-retry request."""
+        child = _StubChild(
+            [
+                {
+                    "final_response": "upstream unavailable",
+                    "completed": False,
+                    "failed": True,
+                    "error": "upstream unavailable",
+                    "api_calls": 1,
+                    "messages": [],
+                }
+            ]
+        )
+        child._delegate_output_schema = ADDRESS_SCHEMA
+
+        entry = _run(child)
+
+        assert entry["status"] == "failed"
+        assert "schema_retries" not in entry
+        assert len(child.calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -361,3 +865,230 @@ class TestDelegateTaskDispatch:
         assert "OUTPUT CONTRACT" in (captured.get("context") or "")
         results = payload.get("results") or []
         assert results and results[0].get("schema_valid") is True
+
+
+def _run_auto_continuation_scenario(payloads):
+    children = []
+    for index, payload in enumerate(payloads, start=1):
+        child = _StubChild(
+            [
+                {
+                    "final_response": json.dumps(payload),
+                    "completed": True,
+                    "api_calls": index,
+                    "messages": [],
+                }
+            ]
+        )
+        child.model = "gpt-5.6-luna"
+        child.session_prompt_tokens = index * 100
+        child.session_completion_tokens = index * 10
+        child.session_reasoning_tokens = index
+        child.session_estimated_cost_usd = index / 1000
+        child.session_cost_status = "estimated"
+        child._delegate_role = "leaf"
+        children.append(child)
+
+    built_goals = []
+    dispatched = []
+    captured = {}
+
+    def fake_build(**kwargs):
+        built_goals.append(kwargs["goal"])
+        return children[len(built_goals) - 1]
+
+    def fake_dispatch(**kwargs):
+        dispatched.append(kwargs)
+        captured["combined"] = kwargs["runner"]()
+        return {"status": "dispatched", "delegation_id": "deleg_auto_test"}
+
+    parent = _make_mock_parent()
+    parent.session_id = "parent-test"
+    parent._current_task_id = "parent-task"
+    parent._current_turn_id = "turn-test"
+    parent._memory_manager = None
+    parent._interrupt_requested = False
+    parent.session_estimated_cost_usd = 0.0
+    parent.session_cost_source = "none"
+    parent.session_cost_status = "unknown"
+
+    credentials = {
+        "provider": None,
+        "model": "gpt-5.6-luna",
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+        "request_overrides": None,
+        "max_output_tokens": None,
+        "command": None,
+        "args": None,
+    }
+    config = {
+        "max_iterations": 5,
+        "tool_profiles": {"backlinkhub": ["terminal"]},
+    }
+
+    with (
+        patch("tools.delegate_tool._load_config", return_value=config),
+        patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value=credentials,
+        ),
+        patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            side_effect=fake_build,
+        ),
+        patch(
+            "tools.delegation_live_log.create_live_transcripts",
+            return_value=(None, [], []),
+        ),
+        patch(
+            "tools.async_delegation.dispatch_async_delegation_batch",
+            side_effect=fake_dispatch,
+        ),
+        patch("gateway.session_context.async_delivery_supported", return_value=True),
+        patch("gateway.session_context.get_session_env", return_value=""),
+        patch("tools.approval.get_current_session_key", return_value="owner-test"),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        handle = json.loads(
+            delegate_task(
+                goal="submit six backlinks for TheSiteMath",
+                tool_profile="backlinkhub",
+                background=True,
+                output_schema=ROUND_SCHEMA,
+                _auto_continue=True,
+                parent_agent=parent,
+            )
+        )
+
+    return handle, captured["combined"], dispatched, built_goals
+
+
+class TestBacklinkAutoContinuation:
+    def test_safe_boundary_continues_inside_one_async_delegation(self):
+        terminal = _round_payload(
+            published=1,
+            pending=5,
+            remaining=0,
+            target_reached=True,
+            stop_reason="target_reached",
+            ego_cleanup="closed",
+            segment_iteration_boundary=False,
+        )
+
+        handle, combined, dispatched, built_goals = _run_auto_continuation_scenario(
+            [_round_payload(), terminal]
+        )
+
+        assert handle["status"] == "dispatched"
+        assert handle["delegation_id"] == "deleg_auto_test"
+        assert len(dispatched) == 1
+        assert len(built_goals) == 2
+        assert "site_id=site_thesitemath" in built_goals[1]
+        assert "run_id=round_test" in built_goals[1]
+        assert "ego_task_space_id=7" in built_goals[1]
+        assert 'skill_view(name="backlink-round-execution"' in built_goals[1]
+        assert 'skill_view(name="ego-browser")' in built_goals[1]
+        assert "在本执行段重复 skill_view" in built_goals[1]
+        assert "省略 target_count" in built_goals[1]
+        assert "run_id、site_id 和 target_count" not in built_goals[1]
+        entry = combined["results"][0]
+        assert entry["continuation_segments"] == 2
+        assert entry["cumulative_api_calls"] == 3
+        assert entry["cumulative_tokens"] == {"input": 300, "output": 30}
+        assert [item["remaining"] for item in combined["continuation_history"]] == [
+            5,
+            0,
+        ]
+
+    def test_true_user_control_does_not_create_a_continuation_child(self):
+        user_controlled = _round_payload(
+            stop_reason="task_space_user_controlled",
+            ego_cleanup="control_confirmation_required",
+            segment_iteration_boundary=False,
+        )
+
+        _handle, combined, dispatched, built_goals = _run_auto_continuation_scenario(
+            [user_controlled]
+        )
+
+        assert len(dispatched) == 1
+        assert len(built_goals) == 1
+        assert combined["results"][0]["continuation_segments"] == 1
+
+    def test_closed_boundary_recreates_space_and_continues_same_round(self):
+        observed_boundary = _round_payload(
+            site_id="site_thesitemath",
+            run_id="round_20260903_142813_c7c79100",
+            target=6,
+            published=0,
+            pending=0,
+            failed_retryable=8,
+            failed_final=1,
+            remaining=6,
+            stop_reason="segment_iteration_boundary",
+            ego_task_space_id=8,
+            ego_cleanup="closed",
+            segment_iteration_boundary=True,
+            candidate_bound=False,
+            candidate_external_side_effect="confirmed",
+        )
+        terminal = _round_payload(
+            site_id="site_thesitemath",
+            run_id="round_20260903_142813_c7c79100",
+            target=6,
+            published=0,
+            pending=6,
+            remaining=0,
+            target_reached=True,
+            stop_reason="target_reached",
+            ego_task_space_id=9,
+            ego_cleanup="closed",
+            segment_iteration_boundary=False,
+        )
+
+        _handle, combined, dispatched, built_goals = _run_auto_continuation_scenario(
+            [observed_boundary, terminal]
+        )
+
+        assert len(dispatched) == 1
+        assert len(built_goals) == 2
+        assert "ego_task_space_id=8" in built_goals[1]
+        assert "创建一个替代空间" in built_goals[1]
+        assert combined["results"][0]["continuation_segments"] == 2
+        assert "continuation_error" not in combined
+
+    def test_preserved_space_cannot_change_id_between_segments(self):
+        changed_space = _round_payload(
+            failed_retryable=3,
+            ego_task_space_id=8,
+        )
+        terminal = _round_payload(
+            pending=3,
+            remaining=0,
+            target_reached=True,
+            stop_reason="target_reached",
+            ego_task_space_id=8,
+            ego_cleanup="closed",
+            segment_iteration_boundary=False,
+        )
+
+        _handle, combined, _dispatched, built_goals = _run_auto_continuation_scenario(
+            [_round_payload(), changed_space, terminal]
+        )
+
+        assert len(built_goals) == 2
+        assert "changed a preserved Ego task space" in combined["continuation_error"]
+
+    def test_repeated_progress_stops_after_one_recovery_segment(self):
+        unchanged = _round_payload()
+
+        _handle, combined, dispatched, built_goals = _run_auto_continuation_scenario(
+            [unchanged, dict(unchanged)]
+        )
+
+        assert len(dispatched) == 1
+        assert len(built_goals) == 2
+        assert combined["continuation_stop_reason"] == "no_progress"
+        assert combined["results"][0]["continuation_segments"] == 2

@@ -4546,6 +4546,51 @@ class AIAgent:
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
         """
+        # A delegated child runs its real conversation on a nested worker.
+        # Gateway eviction or /new can call close() on the child wrapper while
+        # that worker is still unwinding its turn-finalizer.  Defer the hard
+        # teardown until the worker Future is complete; closing earlier can
+        # race SessionDB/Relay cleanup and crash the process.
+        _delegate_future = getattr(self, "_delegate_worker_future", None)
+        if _delegate_future is not None:
+            try:
+                if not _delegate_future.done():
+                    _delegate_lock = getattr(self, "_delegate_close_lock", None)
+                    if _delegate_lock is None:
+                        _delegate_lock = threading.Lock()
+                        self._delegate_close_lock = _delegate_lock
+                    with _delegate_lock:
+                        if not getattr(self, "_delegate_close_scheduled", False):
+                            self._delegate_close_scheduled = True
+                            _delegate_future.add_done_callback(
+                                lambda _future: self.close()
+                            )
+                    return
+            except Exception:
+                # A live worker must never be closed as a fallback.  Leave the
+                # callback/worker to finish and report the scheduling failure.
+                logger.error(
+                    "Unable to defer delegated child close; keeping resources "
+                    "open until worker exit",
+                    exc_info=True,
+                )
+                return
+
+        # Multiple owners may race to close the same child (the delegation
+        # finalizer and a parent eviction callback).  Serialize that boundary
+        # and let only the first caller perform the expensive teardown.
+        _delegate_lock = getattr(self, "_delegate_close_lock", None)
+        if _delegate_lock is not None:
+            try:
+                with _delegate_lock:
+                    if getattr(self, "_delegate_close_started", False):
+                        return
+                    self._delegate_close_started = True
+                    self._delegate_close_scheduled = False
+                    self._delegate_worker_future = None
+            except Exception:
+                pass
+
         # AIAgent.close() is the hard owner boundary. Gateway cleanup may
         # call shutdown_memory_provider() first; its idempotence prevents
         # duplicate extraction while direct callers cannot skip provider close.
@@ -8383,6 +8428,8 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             tool_profile=function_args.get("tool_profile"),
+            output_schema=function_args.get("output_schema"),
+            _auto_continue=function_args.get("_auto_continue"),
             background=(not _is_subagent),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),

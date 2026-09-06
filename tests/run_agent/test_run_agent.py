@@ -4396,7 +4396,7 @@ class TestRunConversation:
 
 
     def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
-        """finish_reason=tool_calls + truncated args after a real tool must close tool→user."""
+        """Repeated truncated args after a real tool eventually close tool→user."""
         self._setup_agent(agent)
         agent.valid_tool_names.add("write_file")
         good_tc = _mock_tool_call(
@@ -4415,7 +4415,14 @@ class TestRunConversation:
         bad_resp = _mock_response(
             content="", finish_reason="tool_calls", tool_calls=[bad_tc],
         )
-        agent.client.chat.completions.create.side_effect = [good_resp, bad_resp]
+        agent.client.chat.completions.create.side_effect = [
+            good_resp,
+            bad_resp,
+            bad_resp,
+            bad_resp,
+            bad_resp,
+            bad_resp,
+        ]
 
         with (
             patch("run_agent.handle_function_call", return_value='{"success":true}'),
@@ -4430,6 +4437,87 @@ class TestRunConversation:
         assert msgs[-1].get("role") == "assistant"
         assert "truncated" in (msgs[-1].get("content") or "").lower()
         assert any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)
+
+    def test_codex_completed_truncated_tool_json_recovers_without_new_session(self, agent):
+        """A proxy-mislabelled truncated Responses tool call is retried in-place."""
+        self._setup_agent(agent)
+        agent.api_mode = "codex_responses"
+        agent.provider = "custom"
+        agent.model = "gpt-test"
+        agent.base_url = "https://example.test/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "example.test"
+
+        def _tool_response(arguments, call_id):
+            return SimpleNamespace(
+                status="completed",
+                incomplete_details=None,
+                output=[
+                    SimpleNamespace(
+                        type="function_call",
+                        status="completed",
+                        name="web_search",
+                        arguments=arguments,
+                        call_id=call_id,
+                        id=f"fc_{call_id}",
+                    )
+                ],
+                output_text="",
+                model=agent.model,
+                usage=None,
+            )
+
+        truncated = _tool_response('{"query":"unfinished', "call_bad")
+        recovered = _tool_response('{"query":"backlinks"}', "call_good")
+        final = SimpleNamespace(
+            status="completed",
+            incomplete_details=None,
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[
+                        SimpleNamespace(type="output_text", text="Task started")
+                    ],
+                )
+            ],
+            output_text="Task started",
+            model=agent.model,
+            usage=None,
+        )
+        prior_history = [
+            {"role": "user", "content": "Earlier request"},
+            {"role": "assistant", "content": "Earlier result"},
+        ]
+
+        with (
+            patch.object(
+                agent, "_create_request_openai_client", return_value=MagicMock()
+            ),
+            patch.object(agent, "_close_request_openai_client"),
+            patch.object(
+                agent,
+                "_run_codex_stream",
+                side_effect=[truncated, recovered, final],
+            ) as mock_run_codex_stream,
+            patch(
+                "run_agent.handle_function_call", return_value='{"success":true}'
+            ) as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "Start another task in this existing session",
+                conversation_history=prior_history,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Task started"
+        assert result["api_calls"] == 3
+        assert mock_run_codex_stream.call_count == 3
+        mock_hfc.assert_called_once()
 
 
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):

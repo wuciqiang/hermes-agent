@@ -63,6 +63,172 @@ _ROUTING_ORIGIN_FIELDS = (
     "user_name",
 )
 
+# Fields used by task skills to decide whether a detached child can be
+# resumed.  They are copied from an already schema-validated child result;
+# this module never asks another model to interpret the summary text.
+_STRUCTURED_RESULT_FIELDS = (
+    "site_id",
+    "run_id",
+    "target",
+    "published",
+    "pending",
+    "attempted_unconfirmed",
+    "failed_retryable",
+    "failed_final",
+    "remaining",
+    "queue_exhausted",
+    "target_reached",
+    "stop_reason",
+    "reported_stop_reason",
+    "ego_task_space_id",
+    "ego_cleanup",
+    "segment_iteration_boundary",
+    "candidate_bound",
+    "candidate_external_side_effect",
+)
+
+
+def _parse_structured_summary(summary: Any) -> Dict[str, Any]:
+    """Best-effort parse of a schema-constrained child summary.
+
+    Luna normally returns a JSON object exactly.  The small fenced/embedded
+    fallbacks keep completion routing tolerant of harmless presentation
+    wrappers while refusing to infer fields from prose.
+    """
+    if not isinstance(summary, str) or not summary.strip():
+        return {}
+    text = summary.strip()
+    candidates = [text]
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3:
+            candidates.append("\n".join(lines[1:-1]).strip())
+    first = text.find("{")
+    last = text.rfind("}")
+    if first >= 0 and last > first:
+        candidates.append(text[first : last + 1])
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _completion_metadata(result: Any) -> Dict[str, Any]:
+    """Return compact machine-readable completion metadata for one child."""
+    if not isinstance(result, dict):
+        return {}
+
+    def _normalize_boundary(metadata: Dict[str, Any], payload: Any) -> None:
+        """Apply the shared fact-only continuation rule to restored results."""
+
+        if metadata.get("schema_valid") is not True:
+            return
+        try:
+            from tools.delegation_output_schema import normalize_completion_exit_reason
+
+            effective = normalize_completion_exit_reason(
+                payload,
+                schema_valid=metadata.get("schema_valid"),
+                exit_reason=metadata.get("exit_reason"),
+            )
+        except Exception:
+            return
+        metadata["exit_reason"] = effective
+        metadata["truncated"] = effective == "max_iterations"
+
+    # ``delegate_tool`` captures this before host-side summary budgeting.  A
+    # detached child may therefore still be resumable even when its visible
+    # summary has been replaced by a head/tail excerpt.
+    private_metadata = result.get("_completion_metadata")
+    if isinstance(private_metadata, dict):
+        allowed = (
+            "schema_valid",
+            "exit_reason",
+            "truncated",
+        ) + _STRUCTURED_RESULT_FIELDS
+        metadata = {
+            key: private_metadata[key]
+            for key in allowed
+            if key in private_metadata
+        }
+        _normalize_boundary(metadata, metadata)
+        return metadata
+
+    metadata: Dict[str, Any] = {}
+    for key in ("schema_valid", "exit_reason", "truncated"):
+        if key in result:
+            metadata[key] = result[key]
+
+    # Only a result that explicitly passed the output contract may contribute
+    # parsed business fields.  This prevents ordinary prose containing JSON
+    # snippets from becoming a false continuation signal.
+    if result.get("schema_valid") is True:
+        payload = _parse_structured_summary(result.get("summary"))
+        if payload:
+            from tools.delegation_output_schema import normalize_completion_payload
+
+            payload = normalize_completion_payload(payload)
+        for key in _STRUCTURED_RESULT_FIELDS:
+            if key in payload:
+                metadata[key] = payload[key]
+        _normalize_boundary(metadata, payload)
+    return metadata
+
+
+def _strip_internal_completion_metadata(payload: Any) -> Any:
+    """Return a persistence/event copy without host-only metadata."""
+    if not isinstance(payload, dict):
+        return payload
+    cleaned = dict(payload)
+    cleaned.pop("_completion_metadata", None)
+    results = cleaned.get("results")
+    if isinstance(results, list):
+        cleaned["results"] = [
+            _strip_internal_completion_metadata(item) for item in results
+        ]
+    return cleaned
+
+
+def _attach_completion_metadata(event: Dict[str, Any], result: Any) -> None:
+    """Promote validated child metadata to an async event's top level."""
+    metadata = _completion_metadata(result)
+    if not metadata:
+        return
+    event.update(metadata)
+    # A concise marker makes the continuation contract obvious to gateway
+    # formatters and to the parent model without duplicating the full result.
+    event["continuation_signal"] = {
+        key: metadata[key]
+        for key in (
+            "schema_valid",
+            "exit_reason",
+            "truncated",
+            "site_id",
+            "run_id",
+            "target",
+            "published",
+            "pending",
+            "attempted_unconfirmed",
+            "failed_retryable",
+            "failed_final",
+            "remaining",
+            "queue_exhausted",
+            "target_reached",
+            "stop_reason",
+            "reported_stop_reason",
+            "ego_task_space_id",
+            "ego_cleanup",
+            "segment_iteration_boundary",
+            "candidate_bound",
+            "candidate_external_side_effect",
+        )
+        if key in metadata
+    }
+
 # Back-compat alias — the daemon executor now lives in tools.daemon_pool so
 # other subsystems (tool_executor, memory_manager, delegate_tool, skills_hub)
 # can share it. Existing imports of ``_DaemonThreadPoolExecutor`` keep working.
@@ -1035,7 +1201,8 @@ def _push_completion_event(
     ):
         if _k in result:
             evt[_k] = result[_k]
-    _persist_completion(evt, result)
+    _attach_completion_metadata(evt, result)
+    _persist_completion(evt, _strip_internal_completion_metadata(result))
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -1225,7 +1392,10 @@ def _push_batch_completion_event(
         "is_batch": True,
         # The full per-task results list — the formatter renders a
         # consolidated multi-task block from this.
-        "results": combined.get("results") or [],
+        "results": [
+            _strip_internal_completion_metadata(item)
+            for item in (combined.get("results") or [])
+        ],
         # Per-task live transcript log paths (cache/delegation/live/...).
         # They persist after completion and double as the full-fidelity
         # operational record of each child's run.
@@ -1251,7 +1421,43 @@ def _push_batch_completion_event(
     ):
         if _k in combined:
             evt[_k] = combined[_k]
-    _persist_completion(evt, combined)
+    # A single-task background delegation uses the batch transport as an
+    # implementation detail.  Promote its validated metadata exactly as the
+    # single-task transport does; multi-task callers receive a compact list so
+    # no child can be mistaken for the continuation owner.
+    _batch_results = combined.get("results") or []
+    _batch_metadata = combined.get("_completion_metadata")
+    if isinstance(_batch_metadata, list) and len(_batch_metadata) == len(
+        _batch_results
+    ):
+        metadata_results = [
+            item if isinstance(item, dict) else {}
+            for item in _batch_metadata
+        ]
+    else:
+        metadata_results = [_completion_metadata(item) for item in _batch_results]
+    if len(_batch_results) == 1:
+        metadata_result = (
+            dict(_batch_results[0])
+            if isinstance(_batch_results[0], dict)
+            else {}
+        )
+        for key in (
+            "continuation_segments",
+            "cumulative_api_calls",
+            "cumulative_tokens",
+            "cumulative_reasoning_tokens",
+            "cumulative_duration_seconds",
+            "cumulative_cost_usd",
+        ):
+            if key in metadata_result:
+                evt[key] = metadata_result[key]
+        if metadata_results and metadata_results[0]:
+            metadata_result["_completion_metadata"] = metadata_results[0]
+        _attach_completion_metadata(evt, metadata_result)
+    elif _batch_results:
+        evt["result_metadata"] = metadata_results
+    _persist_completion(evt, _strip_internal_completion_metadata(combined))
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover

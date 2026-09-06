@@ -717,6 +717,322 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
+def test_batch_completion_promotes_validated_continuation_metadata():
+    """A one-child batch event exposes machine-readable resume signals."""
+    event_record = {
+        "delegation_id": "deleg_metadata",
+        "session_key": "owner-session",
+        "origin_ui_session_id": "ui-session",
+        "origin_session_id": "origin-session",
+        "parent_session_id": "parent-session",
+        "goal": "run backlink round",
+        "goals": ["run backlink round"],
+        "context": None,
+        "toolsets": ["terminal"],
+        "role": "leaf",
+        "model": "gpt-5.6-luna",
+        "dispatched_at": 1000.0,
+        "completed_at": 1010.0,
+    }
+    child_result = {
+        "task_index": 0,
+        "status": "completed",
+        "schema_valid": True,
+        "exit_reason": "max_iterations",
+        "truncated": True,
+        "summary": json.dumps(
+            {
+                "site_id": "site_thesitemath",
+                "run_id": "round_1",
+                "target": 6,
+                "published": 0,
+                "pending": 1,
+                "attempted_unconfirmed": 0,
+                "failed_retryable": 2,
+                "failed_final": 3,
+                "remaining": 5,
+                "queue_exhausted": False,
+                "target_reached": False,
+                "stop_reason": "max_iterations",
+                "ego_task_space_id": 7,
+                "ego_cleanup": "preserved_for_continuation",
+                "segment_iteration_boundary": False,
+                "candidate_bound": False,
+                "candidate_external_side_effect": "none",
+            }
+        ),
+    }
+
+    ad._push_batch_completion_event(
+        event_record,
+        {"results": [child_result], "total_duration_seconds": 10.0},
+        "completed",
+    )
+    event = _drain_one()
+
+    assert event is not None
+    assert event["schema_valid"] is True
+    assert event["exit_reason"] == "max_iterations"
+    assert event["site_id"] == "site_thesitemath"
+    assert event["run_id"] == "round_1"
+    assert event["remaining"] == 5
+    assert event["ego_task_space_id"] == 7
+    assert event["continuation_signal"]["queue_exhausted"] is False
+    assert event["continuation_signal"]["target_reached"] is False
+    assert event["continuation_signal"]["remaining"] == 5
+    assert event["continuation_signal"]["candidate_external_side_effect"] == "none"
+
+
+def test_single_task_batch_completion_exposes_cumulative_continuation_usage():
+    event_record = {
+        "delegation_id": "deleg_usage",
+        "session_key": "owner-session",
+        "goal": "run backlink round",
+        "goals": ["run backlink round"],
+        "role": "leaf",
+        "model": "gpt-5.6-luna",
+        "dispatched_at": 1000.0,
+        "completed_at": 1010.0,
+    }
+    child_result = {
+        "task_index": 0,
+        "status": "completed",
+        "summary": "done",
+        "api_calls": 2,
+        "continuation_segments": 3,
+        "cumulative_api_calls": 17,
+        "cumulative_tokens": {"input": 123_000, "output": 4_500},
+        "cumulative_reasoning_tokens": 800,
+        "cumulative_duration_seconds": 321.5,
+        "cumulative_cost_usd": 0.123456,
+    }
+
+    ad._push_batch_completion_event(
+        event_record,
+        {"results": [child_result], "total_duration_seconds": 10.0},
+        "completed",
+    )
+    event = _drain_one()
+
+    assert event is not None
+    assert event["continuation_segments"] == 3
+    assert event["cumulative_api_calls"] == 17
+    assert event["cumulative_tokens"] == {"input": 123_000, "output": 4_500}
+    assert event["cumulative_reasoning_tokens"] == 800
+    assert event["cumulative_duration_seconds"] == 321.5
+    assert event["cumulative_cost_usd"] == 0.123456
+    rendered = format_process_notification(event)
+    assert "segments=3" in rendered
+    assert "api_calls=17" in rendered
+    assert "input_tokens=123000" in rendered
+    assert "output_tokens=4500" in rendered
+    assert "reasoning_tokens=800" in rendered
+
+
+def test_batch_completion_promotes_safe_early_completed_result_to_boundary():
+    """A valid unfinished no-side-effect result remains resumable after transport."""
+    event_record = {
+        "delegation_id": "deleg_early_completed",
+        "session_key": "owner-session",
+        "origin_ui_session_id": "ui-session",
+        "origin_session_id": "origin-session",
+        "parent_session_id": "parent-session",
+        "goal": "run backlink round",
+        "goals": ["run backlink round"],
+        "toolsets": ["terminal"],
+        "role": "leaf",
+        "model": "gpt-5.6-luna",
+        "dispatched_at": 1000.0,
+        "completed_at": 1010.0,
+    }
+    payload = {
+        "site_id": "site_thesitemath",
+        "run_id": "round_early",
+        "target": 3,
+        "published": 0,
+        "pending": 0,
+        "attempted_unconfirmed": 0,
+        "failed_retryable": 1,
+        "failed_final": 0,
+        "remaining": 3,
+        "queue_exhausted": False,
+        "target_reached": False,
+        "stop_reason": "stopped_without_native_termination_after_current_execution_segment",
+        "ego_task_space_id": 7,
+        "ego_cleanup": "closed",
+        "segment_iteration_boundary": False,
+        "candidate_bound": False,
+        "candidate_external_side_effect": "none",
+    }
+    child_result = {
+        "task_index": 0,
+        "status": "completed",
+        "schema_valid": True,
+        "exit_reason": "completed",
+        "truncated": False,
+        "summary": json.dumps(payload),
+    }
+
+    ad._push_batch_completion_event(
+        event_record,
+        {"results": [child_result], "total_duration_seconds": 10.0},
+        "completed",
+    )
+    event = _drain_one()
+
+    assert event is not None
+    assert event["exit_reason"] == "max_iterations"
+    assert event["truncated"] is True
+    assert event["continuation_signal"]["remaining"] == 3
+
+
+def test_batch_completion_keeps_resume_fields_when_visible_summary_is_truncated(
+    monkeypatch,
+):
+    """Summary budgeting must not erase the fields needed to resume a run."""
+    event_record = {
+        "delegation_id": "deleg_truncated_metadata",
+        "session_key": "owner-session",
+        "origin_ui_session_id": "ui-session",
+        "origin_session_id": "origin-session",
+        "parent_session_id": "parent-session",
+        "goal": "run backlink round",
+        "goals": ["run backlink round"],
+        "context": None,
+        "toolsets": ["terminal"],
+        "role": "leaf",
+        "model": "gpt-5.6-luna",
+        "dispatched_at": 1000.0,
+        "completed_at": 1010.0,
+    }
+    child_result = {
+        "task_index": 0,
+        "status": "completed",
+        "schema_valid": True,
+        "exit_reason": "max_iterations",
+        "truncated": True,
+        "summary": "{\n  \"site_id\": \"site_the...[middle omitted]...\n}",
+        "summary_truncated": True,
+    }
+    private_metadata = {
+        "schema_valid": True,
+        "exit_reason": "max_iterations",
+        "truncated": True,
+        "site_id": "site_thesitemath",
+        "run_id": "round_1",
+        "target": 6,
+        "published": 0,
+        "pending": 1,
+        "attempted_unconfirmed": 0,
+        "failed_retryable": 2,
+        "failed_final": 3,
+        "remaining": 2,
+        "queue_exhausted": False,
+        "target_reached": False,
+        "stop_reason": "max_iterations",
+        "ego_task_space_id": 7,
+        "ego_cleanup": "preserved_for_continuation",
+        "segment_iteration_boundary": False,
+        "candidate_bound": False,
+        "candidate_external_side_effect": "none",
+    }
+    persisted = {}
+
+    def capture_persist(event, result):
+        persisted["event"] = event
+        persisted["result"] = result
+
+    monkeypatch.setattr(ad, "_persist_completion", capture_persist)
+    ad._push_batch_completion_event(
+        event_record,
+        {
+            "results": [child_result],
+            "_completion_metadata": [private_metadata],
+            "total_duration_seconds": 10.0,
+        },
+        "completed",
+    )
+    event = _drain_one()
+
+    assert event is not None
+    assert event["run_id"] == "round_1"
+    assert event["remaining"] == 2
+    assert event["ego_task_space_id"] == 7
+    assert event["continuation_signal"]["stop_reason"] == "max_iterations"
+    assert event["continuation_signal"]["candidate_external_side_effect"] == "none"
+    assert event["results"][0]["summary"] == child_result["summary"]
+    assert "_completion_metadata" not in event["results"][0]
+    assert "_completion_metadata" not in persisted["result"]
+    assert "_completion_metadata" not in persisted["result"]["results"][0]
+
+
+def test_batch_completion_normalizes_legacy_progress_contract():
+    """A hot-reloaded worker remains resumable from an older parent schema."""
+    event_record = {
+        "delegation_id": "deleg_legacy_progress",
+        "session_key": "owner-session",
+        "origin_ui_session_id": "ui-session",
+        "origin_session_id": "origin-session",
+        "parent_session_id": "parent-session",
+        "goal": "run backlink round",
+        "goals": ["run backlink round"],
+        "context": None,
+        "toolsets": ["terminal"],
+        "role": "leaf",
+        "model": "gpt-5.6-luna",
+        "dispatched_at": 1000.0,
+        "completed_at": 1010.0,
+    }
+    summary = json.dumps(
+        {
+            "site_id": "site_thesitemath",
+            "run_id": "round_legacy",
+            "target": 6,
+            "progress": {
+                "published": 0,
+                "pending": 0,
+                "attempted_unconfirmed": 0,
+                "failed_retryable": 13,
+                "failed_final": 2,
+                "remaining": 6,
+            },
+            "queue_exhausted": False,
+            "target_reached": False,
+            "stop_reason": "segment_iteration_boundary",
+            "ego_task_space_id": 2,
+            "ego_cleanup": "closed",
+            "segment_boundary": True,
+            "segment_elapsed_seconds": 0,
+            "candidate_bound": False,
+        }
+    )
+    child_result = {
+        "task_index": 0,
+        "status": "completed",
+        "schema_valid": True,
+        "exit_reason": "completed",
+        "truncated": False,
+        "summary": summary,
+    }
+
+    ad._push_batch_completion_event(
+        event_record,
+        {"results": [child_result], "total_duration_seconds": 10.0},
+        "completed",
+    )
+    event = _drain_one()
+
+    assert event is not None
+    signal = event["continuation_signal"]
+    assert signal["remaining"] == 6
+    assert signal["failed_retryable"] == 13
+    assert signal["segment_iteration_boundary"] is True
+    assert signal["stop_reason"] == "worker_returned_early"
+    assert signal["reported_stop_reason"] == "segment_iteration_boundary"
+    assert signal["candidate_external_side_effect"] == "none"
+    assert event["results"][0]["summary"] == summary
+
+
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     """TUI async delegation must route to the live/compressed agent id.
 

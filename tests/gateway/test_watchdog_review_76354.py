@@ -81,6 +81,20 @@ def test_s1_clear_labels_noop_skips_transaction(tmp_path, monkeypatch):
     assert activity["last_activity_description"] == ""
 
 
+def test_s1_clear_labels_after_db_close_is_a_noop(tmp_path):
+    """Turn-finalizer cleanup must tolerate a concurrent DB teardown."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "S1_CLOSED"
+    db.create_session(sid, source="cli")
+    db.touch_session_activity(sid, time.time(), description="working")
+    db.close()
+
+    # The child/parent timeout cleanup can close the dedicated handle before
+    # this best-effort label clear runs. It must not dereference a closed
+    # sqlite connection or surface an exception to the gateway.
+    db.clear_session_activity_labels(sid)
+
+
 def test_s1_contended_clear_gives_up_within_short_budget(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "S1_CLEAR_CONTENDED"

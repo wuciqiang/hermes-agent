@@ -2780,6 +2780,46 @@ def _format_async_delegation(evt: dict) -> str:
         if toolsets:
             lines.append(f"Toolsets: {', '.join(toolsets)}")
         lines.append(f"Role: {role}   Model: {model}   Total duration: {total_dur}s")
+        cumulative_tokens = evt.get("cumulative_tokens")
+        if isinstance(cumulative_tokens, dict):
+            usage_parts = []
+            for label, key in (
+                ("segments", "continuation_segments"),
+                ("api_calls", "cumulative_api_calls"),
+            ):
+                if evt.get(key) is not None:
+                    usage_parts.append(f"{label}={evt[key]}")
+            usage_parts.extend(
+                [
+                    f"input_tokens={cumulative_tokens.get('input', 0)}",
+                    f"output_tokens={cumulative_tokens.get('output', 0)}",
+                ]
+            )
+            if evt.get("cumulative_reasoning_tokens") is not None:
+                usage_parts.append(
+                    f"reasoning_tokens={evt['cumulative_reasoning_tokens']}"
+                )
+            if evt.get("cumulative_duration_seconds") is not None:
+                usage_parts.append(
+                    f"worker_duration={evt['cumulative_duration_seconds']}s"
+                )
+            lines.append("Cumulative worker usage: " + ", ".join(usage_parts))
+        if evt.get("continuation_signal"):
+            signal = evt["continuation_signal"]
+            lines.append(
+                "Structured continuation signal: "
+                + json.dumps(signal, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            )
+        elif evt.get("result_metadata"):
+            lines.append(
+                "Structured child metadata: "
+                + json.dumps(
+                    evt["result_metadata"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
         if error and not results:
             lines.append("--- ERROR ---")
             lines.append(f"The batch did not complete successfully: {error}")
@@ -2859,6 +2899,16 @@ def _format_async_delegation(evt: dict) -> str:
     lines.append(f"Role: {role}   Model: {model}")
     _trunc = " [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""
     lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s{_trunc}")
+    if evt.get("continuation_signal"):
+        lines.append(
+            "Structured continuation signal: "
+            + json.dumps(
+                evt["continuation_signal"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     lines.append("--- RESULT ---")
     if status in ("completed", "success") and summary:
         if truncated:

@@ -59,6 +59,89 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 )
 
 
+# A schema-constrained child may return a long JSON summary.  The host can
+# shorten that summary before an asynchronous completion event is built, so
+# keep only the small fields needed to resume a detached task at the result
+# boundary.  This is deliberately private metadata; it is removed before a
+# result is returned to a model or written to the durable completion record.
+_CONTINUATION_RESULT_FIELDS = (
+    "site_id",
+    "run_id",
+    "target",
+    "published",
+    "pending",
+    "attempted_unconfirmed",
+    "failed_retryable",
+    "failed_final",
+    "remaining",
+    "queue_exhausted",
+    "target_reached",
+    "stop_reason",
+    "reported_stop_reason",
+    "ego_task_space_id",
+    "ego_cleanup",
+    "segment_iteration_boundary",
+    "candidate_bound",
+    "candidate_external_side_effect",
+)
+
+
+def _validated_completion_metadata(
+    summary: Any, *, schema_valid: Any, exit_reason: str
+) -> Dict[str, Any]:
+    """Extract compact continuation fields before summary processing.
+
+    ``schema_valid`` is checked by the caller, but keeping the guard here
+    makes this helper safe to reuse from tests and future result paths.  The
+    output contract validator already accepted the text; this second parse is
+    intentionally bounded to the known continuation fields only.
+    """
+    if schema_valid is not True:
+        return {}
+    metadata: Dict[str, Any] = {
+        "schema_valid": True,
+        "exit_reason": exit_reason,
+        "truncated": exit_reason == "max_iterations",
+    }
+    try:
+        from tools.delegation_output_schema import (
+            extract_json_candidate,
+            normalize_completion_exit_reason,
+            normalize_completion_payload,
+        )
+
+        payload = json.loads(extract_json_candidate(summary or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return metadata
+    if not isinstance(payload, dict):
+        return metadata
+    payload = normalize_completion_payload(payload)
+    metadata["exit_reason"] = normalize_completion_exit_reason(
+        payload,
+        schema_valid=schema_valid,
+        exit_reason=exit_reason,
+    )
+    metadata["truncated"] = metadata["exit_reason"] == "max_iterations"
+    for key in _CONTINUATION_RESULT_FIELDS:
+        if key in payload:
+            metadata[key] = payload[key]
+    return metadata
+
+
+def _strip_internal_completion_metadata(payload: Any) -> Any:
+    """Return a wire-safe copy without host-only continuation metadata."""
+    if not isinstance(payload, dict):
+        return payload
+    cleaned = dict(payload)
+    cleaned.pop("_completion_metadata", None)
+    results = cleaned.get("results")
+    if isinstance(results, list):
+        cleaned["results"] = [
+            _strip_internal_completion_metadata(item) for item in results
+        ]
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Subagent approval callbacks
 # ---------------------------------------------------------------------------
@@ -2504,6 +2587,12 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    _child_future = None
+    # A timed-out wrapper may return while the real child worker is still
+    # unwinding its turn-finalizer.  All child-owned teardown must therefore
+    # be serialized and held until that worker future is done.
+    _child_cleanup_lock = threading.Lock()
+    _child_cleanup_done = False
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2864,6 +2953,15 @@ def _run_single_child(
             _child_context.run,
             _run_with_thread_capture,
         )
+        # A parent session can be evicted or closed while this wrapper is
+        # waiting.  AIAgent.close() uses this future as an ownership barrier
+        # and defers its own teardown until the worker has returned.
+        try:
+            if getattr(child, "_delegate_close_lock", None) is None:
+                child._delegate_close_lock = threading.Lock()
+            child._delegate_worker_future = _child_future
+        except Exception:
+            pass
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -3011,6 +3109,11 @@ def _run_single_child(
                 not _schema_valid
                 and _first_text.strip()
                 and not result.get("interrupted", False)
+                # A provider/API failure often has a non-empty human-readable
+                # error in ``final_response``.  It is already terminal; asking
+                # the failed child for a JSON-only retry just spends another
+                # request and can hide the real failure from the parent.
+                and result.get("failed") is not True
             ):
                 # Exactly one retry turn, carrying the validation errors
                 # verbatim (no schema re-paste — the child already holds
@@ -3044,6 +3147,19 @@ def _run_single_child(
                         result.get("messages"), list
                     ):
                         result["messages"] = result["messages"] + _retry_messages
+                    # The retry is a new turn and may itself be interrupted or
+                    # fail.  Carry its terminal flags forward so a failed
+                    # schema retry cannot be reported as a successful child.
+                    for _retry_key in (
+                        "completed",
+                        "failed",
+                        "interrupted",
+                        "partial",
+                        "error",
+                        "failure_reason",
+                    ):
+                        if _retry_key in _retry_result:
+                            result[_retry_key] = _retry_result[_retry_key]
                     _schema_valid, _schema_errors = validate_output(
                         _retry_text, _output_schema
                     )
@@ -3075,6 +3191,7 @@ def _run_single_child(
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
+        child_failed = result.get("failed") is True
         api_calls = result.get("api_calls", 0)
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
@@ -3086,6 +3203,11 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif child_failed:
+            # ``final_response`` can contain a useful provider error (for
+            # example, an upstream 502), but that text must never turn a
+            # failed model call into a completed delegation.
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -3135,14 +3257,35 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif child_failed:
+            # Preserve the machine-readable classifier reason when the child
+            # supplied one; otherwise use a stable generic failure marker.
+            _failure_reason = result.get("failure_reason")
+            if hasattr(_failure_reason, "value"):
+                _failure_reason = _failure_reason.value
+            exit_reason = str(_failure_reason).strip() or "failed"
         elif completed:
             exit_reason = "completed"
         else:
             exit_reason = "max_iterations"
 
+        # A valid BacklinkHub account can expose an unfinished round even
+        # when a Luna worker returns its normal ``completed`` flag early.  Map
+        # only the no-side-effect shape to Hermes' native iteration boundary;
+        # explicit handoffs, errors, and uncertain effects remain terminal.
+        if isinstance(_output_schema, dict) and _schema_valid is True:
+            from tools.delegation_output_schema import normalize_completion_exit_reason
+
+            exit_reason = normalize_completion_exit_reason(
+                summary,
+                schema_valid=_schema_valid,
+                exit_reason=exit_reason,
+            )
+
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
+        _reasoning_tokens_total = getattr(child, "session_reasoning_tokens", 0)
         _model = getattr(child, "model", None)
 
         entry: Dict[str, Any] = {
@@ -3168,6 +3311,14 @@ def _run_single_child(
                     _output_tokens if isinstance(_output_tokens, (int, float)) else 0
                 ),
             },
+            # Kept as a separate optional field so existing input/output token
+            # consumers remain wire-compatible while continuation rollups can
+            # account for reasoning usage when a provider reports it.
+            "reasoning_tokens": (
+                int(_reasoning_tokens_total)
+                if isinstance(_reasoning_tokens_total, (int, float))
+                else 0
+            ),
             "tool_trace": tool_trace,
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
@@ -3200,6 +3351,11 @@ def _run_single_child(
         )
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+            _failure_reason = result.get("failure_reason")
+            if hasattr(_failure_reason, "value"):
+                _failure_reason = _failure_reason.value
+            if _failure_reason:
+                entry["failure_reason"] = str(_failure_reason)
 
         # T1-24: schema-validation outcome — emitted ONLY when a schema was
         # requested, so legacy (schema-less) payloads keep their exact shape.
@@ -3209,6 +3365,20 @@ def _run_single_child(
                 entry["schema_retries"] = _schema_retries
             if not _schema_valid and _schema_errors:
                 entry["schema_errors"] = _schema_errors
+            # Capture continuation data while ``summary`` still contains the
+            # complete validated response.  Host-side summary budgeting runs
+            # later and may replace it with a head/tail excerpt.
+            _completion_metadata = (
+                _validated_completion_metadata(
+                    summary,
+                    schema_valid=_schema_valid,
+                    exit_reason=exit_reason,
+                )
+                if not child_failed
+                else {}
+            )
+            if _completion_metadata:
+                entry["_completion_metadata"] = _completion_metadata
 
         # A steer that queued after the child's final assistant turn had no
         # tool batch left to drain into.  The finalizer hands the undelivered
@@ -3368,64 +3538,122 @@ def _run_single_child(
         if _heartbeat_thread.ident is not None:
             _heartbeat_thread.join(timeout=5)
 
-        # Drop the TUI-facing registry entry.  Safe to call even if the
-        # child was never registered (e.g. ID missing on test doubles).
-        if _subagent_id:
-            _unregister_subagent(_subagent_id, agent=child)
+        def _cleanup_child_resources(_future=None):
+            """Release child-owned state exactly once at the worker boundary."""
+            nonlocal _child_cleanup_done
+            if _future is not None:
+                try:
+                    if not _future.done():
+                        return
+                except Exception:
+                    pass
+            with _child_cleanup_lock:
+                if _child_cleanup_done:
+                    return
+                _child_cleanup_done = True
 
-        if child_pool is not None and leased_cred_id is not None:
+            # Drop the TUI-facing registry entry only after the worker has
+            # stopped accepting/using the child.  Safe for test doubles and
+            # recycled IDs because identity is checked by the helper.
+            if _subagent_id:
+                try:
+                    _unregister_subagent(_subagent_id, agent=child)
+                except Exception:
+                    logger.debug("Failed to unregister subagent", exc_info=True)
+
+            if child_pool is not None and leased_cred_id is not None:
+                try:
+                    child_pool.release_lease(leased_cred_id)
+                except Exception as exc:
+                    logger.debug("Failed to release credential lease: %s", exc)
+
+            # Restore the parent's tool names so the process-global is correct
+            # for subsequent execute_code calls.  Doing this after the child
+            # worker returns also prevents it from observing a half-restored
+            # global while its final tool result is being handled.
             try:
-                child_pool.release_lease(leased_cred_id)
-            except Exception as exc:
-                logger.debug("Failed to release credential lease: %s", exc)
+                import model_tools
 
-        # Restore the parent's tool names so the process-global is correct
-        # for any subsequent execute_code calls or other consumers.
-        import model_tools
+                saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
+                if isinstance(saved_tool_names, list):
+                    model_tools._last_resolved_tool_names = list(saved_tool_names)
+            except Exception:
+                logger.debug("Failed to restore parent tool names", exc_info=True)
 
-        saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
-        if isinstance(saved_tool_names, list):
-            model_tools._last_resolved_tool_names = list(saved_tool_names)
-
-        # Remove child from active tracking
-
-        # Unregister child from interrupt propagation
-        if hasattr(parent_agent, "_active_children"):
-            try:
-                lock = getattr(parent_agent, "_active_children_lock", None)
-                if lock:
-                    with lock:
+            # Remove child from interrupt propagation only after the worker is
+            # done.  Keeping it registered while a timeout worker unwinds lets
+            # an explicit parent stop still reach the live child.
+            if hasattr(parent_agent, "_active_children"):
+                try:
+                    lock = getattr(parent_agent, "_active_children_lock", None)
+                    if lock:
+                        with lock:
+                            parent_agent._active_children.remove(child)
+                    else:
                         parent_agent._active_children.remove(child)
-                else:
-                    parent_agent._active_children.remove(child)
-            except (ValueError, UnboundLocalError) as e:
-                logger.debug("Could not remove child from active_children: %s", e)
+                except (ValueError, UnboundLocalError) as e:
+                    logger.debug("Could not remove child from active_children: %s", e)
 
-        # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
+            # AIAgent.close() is idempotent and has its own future barrier for
+            # parent-initiated teardown.  At this point the future is done, so
+            # it is safe to release SQLite, browser, terminal and process
+            # resources.
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug("Failed to close child agent after delegation")
 
-        # The AIAgent turn boundary normally closes the child scope itself. This
-        # fallback covers failures before that boundary starts, but must not pop
-        # a scope while a timed-out child worker is still unwinding.
-        try:
-            from agent import relay_runtime
+            # The AIAgent turn boundary normally closes the child Relay scope
+            # itself. This fallback covers failures before that boundary starts.
+            try:
+                from agent import relay_runtime
 
-            runtime = relay_runtime.get_runtime(create=False)
-            child_session_id = str(getattr(child, "session_id", "") or "")
-            child_turn_is_active = relay_runtime.SESSION_COORDINATOR.has_active_turn(
-                profile_key=relay_runtime.current_profile_key(),
-                session_id=child_session_id,
-            )
-            if runtime is not None and child_session_id and not child_turn_is_active:
-                runtime.unregister_subagent({"child_session_id": child_session_id})
-        except Exception:
-            logger.debug("Failed to close child Relay session after delegation")
+                runtime = relay_runtime.get_runtime(create=False)
+                child_session_id = str(getattr(child, "session_id", "") or "")
+                child_turn_is_active = relay_runtime.SESSION_COORDINATOR.has_active_turn(
+                    profile_key=relay_runtime.current_profile_key(),
+                    session_id=child_session_id,
+                )
+                if runtime is not None and child_session_id and not child_turn_is_active:
+                    runtime.unregister_subagent({"child_session_id": child_session_id})
+            except Exception:
+                logger.debug("Failed to close child Relay session after delegation")
+
+            try:
+                if getattr(child, "_delegate_worker_future", None) is _child_future:
+                    child._delegate_worker_future = None
+            except Exception:
+                pass
+
+        # A Future invokes callbacks after its callable has fully returned.
+        # Registering unconditionally also closes the small race where the
+        # worker finishes between ``done()`` and callback registration.
+        if _child_future is not None:
+            try:
+                if not _child_future.done():
+                    logger.debug(
+                        "Deferring child cleanup until worker exits: %s",
+                        getattr(child, "session_id", ""),
+                    )
+                _child_future.add_done_callback(_cleanup_child_resources)
+            except Exception:
+                # If callback registration itself fails, only clean up when
+                # the worker is already known to be done; closing a live child
+                # here would recreate the original race.
+                try:
+                    if _child_future.done():
+                        _cleanup_child_resources()
+                    else:
+                        logger.error(
+                            "Unable to schedule deferred child cleanup; worker "
+                            "is still running (session=%s)",
+                            getattr(child, "session_id", ""),
+                        )
+                except Exception:
+                    logger.debug("Deferred child cleanup registration failed", exc_info=True)
+        else:
+            _cleanup_child_resources()
 
 
 _PARENT_FINALIZATION_LOCK_GUARD = threading.Lock()
@@ -3470,9 +3698,20 @@ def _finalize_child_results(
     task_list: List[Dict[str, Any]],
     children: List[tuple[int, Dict[str, Any], Any]],
     parent_agent,
-) -> None:
-    """Apply host-owned summary, memory, hook, and cost contracts once."""
+) -> List[Dict[str, Any]]:
+    """Apply host-owned summary, memory, hook, and cost contracts once.
+
+    Return the private continuation metadata captured before summary
+    truncation.  Callers carry it only until the async event is built, then
+    remove it from all model- and persistence-facing payloads.
+    """
     with _parent_finalization_lock(parent_agent):
+        completion_metadata: List[Dict[str, Any]] = []
+        for entry in results:
+            raw_metadata = entry.pop("_completion_metadata", None)
+            completion_metadata.append(
+                dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            )
         _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
 
@@ -3551,6 +3790,8 @@ def _finalize_child_results(
                     parent_agent.session_cost_status = "estimated"
             except Exception:
                 logger.debug("Subagent cost rollup failed", exc_info=True)
+
+        return completion_metadata
 
 
 def _run_child_lifecycle(
@@ -3668,6 +3909,7 @@ def delegate_task(
     tool_profile: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    _auto_continue: Optional[bool] = False,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
@@ -3870,6 +4112,30 @@ def delegate_task(
         task_list, context, model=creds.get("model"), provider=creds.get("provider")
     )
 
+    # Only the BacklinkHub single-site worker gets host-owned continuation.
+    # Keeping this decision here (after schema coercion, before construction)
+    # means a stale model argument can never enable the loop accidentally.
+    _auto_continue_enabled = bool(
+        _auto_continue
+        and background
+        and tool_profile == "backlinkhub"
+        and n_tasks == 1
+        and task_schemas
+        and task_schemas[0] is not None
+    )
+
+    logger.info(
+        "delegate_task continuation config: tool_profile=%s "
+        "_auto_continue=%s _auto_continue_enabled=%s background=%s "
+        "task_count=%d schema_attached=%s",
+        tool_profile or "",
+        bool(_auto_continue),
+        _auto_continue_enabled,
+        background,
+        n_tasks,
+        bool(task_schemas and task_schemas[0] is not None),
+    )
+
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
     # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
     # set_current_session_id(child.session_id), which clobbers the
@@ -3891,74 +4157,85 @@ def delegate_task(
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
 
-    # Build all child agents on the main thread (thread-safe construction).
-    # _build_child_preserving_parent_tools saves/restores the parent's
-    # resolved tool names around each construction under a lock, so child
-    # toolset resolution never leaks into the parent (shared with the plugin
-    # subagent-lifecycle API).
-    children = []
-    for i, t in enumerate(task_list):
-        # Per-task role beats top-level; normalise again so unknown
-        # per-task values warn and degrade to leaf uniformly.
-        effective_role = _normalize_role(t.get("role") or top_role)
-        # T1-24: schema'd tasks get the contract appended to their context
-        # so the child knows the expected output shape before it starts.
-        _task_schema = task_schemas[i] if i < len(task_schemas) else None
-        _child_context = t.get("context")
-        if _task_schema is not None:
+    def _prepare_child_for_task(
+        task_index: int,
+        task: Dict[str, Any],
+        *,
+        goal_override: Optional[str] = None,
+    ):
+        """Construct one child with the same contract as the first segment.
+
+        Continuation segments are built lazily after the previous child has
+        been fully finalized.  Keeping construction in one helper prevents a
+        resumed Luna from losing the tool profile, output schema, live log, or
+        delegation identity.
+        """
+        effective_role = _normalize_role(task.get("role") or top_role)
+        child_goal = goal_override or task["goal"]
+        task_schema = task_schemas[task_index] if task_index < len(task_schemas) else None
+        child_context = task.get("context")
+        if task_schema is not None:
             from tools.delegation_output_schema import append_output_contract
 
-            _child_context = append_output_contract(_child_context, _task_schema)
-        try:
-            child = _build_child_preserving_parent_tools(
-                task_index=i,
-                goal=t["goal"],
-                context=_child_context,
-                # Raw toolsets are never model-facing. A named profile is
-                # operator-defined in config and is still intersected with the
-                # parent's effective toolsets inside _build_child_agent.
-                toolsets=profile_toolsets,
-                model=creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
-                role=effective_role,
+            child_context = append_output_contract(child_context, task_schema)
+        child = _build_child_preserving_parent_tools(
+            task_index=task_index,
+            goal=child_goal,
+            context=child_context,
+            # Raw toolsets are never model-facing. A named profile is
+            # operator-defined in config and is still intersected with the
+            # parent's effective toolsets inside _build_child_agent.
+            toolsets=profile_toolsets,
+            model=creds["model"],
+            max_iterations=effective_max_iter,
+            task_count=n_tasks,
+            parent_agent=parent_agent,
+            override_provider=creds["provider"],
+            override_base_url=creds["base_url"],
+            override_api_key=creds["api_key"],
+            override_api_mode=creds["api_mode"],
+            override_request_overrides=creds.get("request_overrides"),
+            override_max_tokens=creds.get("max_output_tokens"),
+            override_acp_command=creds.get("command"),
+            override_acp_args=creds.get("args"),
+            role=effective_role,
+        )
+        if task_schema is not None:
+            try:
+                child._delegate_output_schema = task_schema
+            except Exception:
+                logger.debug("Could not attach output schema to child %d", task_index)
+        # Tee progress into the one task log.  A continuation appends to the
+        # same log, so the operator gets one complete audit trail per task.
+        writer = live_writers[task_index] if task_index < len(live_writers) else None
+        if writer is not None:
+            child.tool_progress_callback = wrap_progress_callback(
+                getattr(child, "tool_progress_callback", None), writer
             )
+            child._live_transcript_path = str(writer.path)
+        if live_deleg_id:
+            setattr(child, "_delegation_id", live_deleg_id)
+        return child
+
+    # Build all initial child agents on the calling thread.  The preserving
+    # wrapper serializes global tool-name resolution while keeping the parent
+    # tool list intact.
+    children = []
+    for i, t in enumerate(task_list):
+        try:
+            child = _prepare_child_for_task(i, t)
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
             # missing from PATH) refuse the spawn loudly (#80450).
             return tool_error(str(exc))
-        # Attach the validated schema for the completion-side validation
-        # hook in _run_single_child. Absent (None) on schema-less tasks.
-        if _task_schema is not None:
-            try:
-                child._delegate_output_schema = _task_schema
-            except Exception:
-                logger.debug("Could not attach output schema to child %d", i)
-        # Tee the child's progress events into its live transcript log.
-        # wrap_progress_callback preserves the inner callback contract
-        # (including the _flush attribute) and never lets writer failures
-        # reach the agent loop. When no parent display exists the inner
-        # callback is None and the wrapper still records events.
-        _writer = live_writers[i] if i < len(live_writers) else None
-        if _writer is not None:
-            child.tool_progress_callback = wrap_progress_callback(
-                getattr(child, "tool_progress_callback", None), _writer
-            )
-            child._live_transcript_path = str(_writer.path)
-        # Delegation identity for the live registry + process-notification
-        # attribution (child-started background processes report under it).
-        if live_deleg_id:
-            setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
+
+    # The async unit may replace its single child after a native iteration
+    # boundary.  Keep the interrupt/progress closures pointed at this mutable
+    # reference instead of the child that happened to exist at dispatch time.
+    _active_child_refs = [c for _, _, c in children]
+    _active_child_refs_lock = threading.RLock()
+    _continuation_abort = threading.Event()
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -4118,7 +4395,9 @@ def delegate_task(
         # headroom (split across the batch) before they enter the parent's
         # conversation. Full text is spilled to disk so nothing is lost.
         # Covers both the single-task and batch paths. See PR #9126.
-        _finalize_child_results(results, task_list, children, parent_agent)
+        completion_metadata = _finalize_child_results(
+            results, task_list, children, parent_agent
+        )
 
         total_duration = round(time.monotonic() - overall_start, 2)
 
@@ -4140,14 +4419,427 @@ def delegate_task(
                     logger.debug("Live transcript finalize failed", exc_info=True)
                 if _idx < len(live_paths):
                     entry["live_transcript"] = live_paths[_idx]
-        update_manifest_statuses(live_deleg_id, results)
+        # A BacklinkHub single-task run may continue with another child inside
+        # this same async delegation.  Do not mark its live manifest terminal
+        # until the continuation loop has finished.
+        if not _auto_continue_enabled:
+            update_manifest_statuses(live_deleg_id, results)
 
         combined: Dict[str, Any] = {
             "results": results,
             "total_duration_seconds": total_duration,
         }
+        if any(completion_metadata):
+            # Keep this only inside the host-side handoff.  The async transport
+            # consumes it to build a continuation signal even when a summary
+            # was shortened; synchronous callers strip it before serialization.
+            combined["_completion_metadata"] = completion_metadata
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
+        return combined
+
+    def _run_single_continuation_segment(
+        child: Any,
+        task: Dict[str, Any],
+        goal: str,
+    ) -> Dict[str, Any]:
+        """Run and host-finalize one lazily-created single-task segment.
+
+        This intentionally mirrors the single-task branch above instead of
+        re-entering ``delegate_task``.  The latter would create a second async
+        record and hand the decision back to the parent model, which is the
+        failure mode this continuation path removes.
+        """
+        segment_start = time.monotonic()
+        segment_results: List[Dict[str, Any]] = []
+        result = _run_single_child(
+            0,
+            goal,
+            child,
+            parent_agent,
+            owner_session_id=_origin_ui_session_id or None,
+            owner_transport=_origin_owner_transport,
+            owner_session_record=_origin_owner_session_record,
+        )
+        segment_results.append(result)
+        segment_metadata = _finalize_child_results(
+            segment_results,
+            [task],
+            [(0, task, child)],
+            parent_agent,
+        )
+
+        writer = live_writers[0] if live_writers else None
+        if writer is not None:
+            try:
+                writer.finalize(result)
+            except Exception:
+                logger.debug("Continuation live transcript finalize failed", exc_info=True)
+            if live_paths:
+                result["live_transcript"] = live_paths[0]
+
+        combined: Dict[str, Any] = {
+            "results": segment_results,
+            "total_duration_seconds": round(time.monotonic() - segment_start, 2),
+        }
+        if any(segment_metadata):
+            combined["_completion_metadata"] = segment_metadata
+        if live_paths:
+            combined["live_transcripts"] = list(live_paths)
+        return combined
+
+    def _single_completion_metadata(combined: Any) -> Dict[str, Any]:
+        """Extract the private, schema-validated metadata for one segment."""
+        if not isinstance(combined, dict):
+            return {}
+        metadata = combined.get("_completion_metadata")
+        if isinstance(metadata, list) and metadata and isinstance(metadata[0], dict):
+            return dict(metadata[0])
+        return {}
+
+    def _continuation_goal(metadata: Dict[str, Any]) -> str:
+        """Build a compact next-segment prompt without replaying history."""
+        site_id = str(metadata.get("site_id") or "")
+        run_id = str(metadata.get("run_id") or "")
+        target = metadata.get("target")
+        space_id = metadata.get("ego_task_space_id")
+        cleanup = str(metadata.get("ego_cleanup") or "").strip().lower()
+        if cleanup == "closed":
+            space_note = (
+                f"先调用 useOrCreateTaskSpace({space_id})；若该数字空间确实不存在，"
+                "再用 listTaskSpaces 核验一次，并仅在当前候选没有外部副作用时为同一轮次"
+                "创建一个替代空间。"
+            )
+        elif cleanup == "not_created" or not isinstance(space_id, int):
+            space_note = (
+                "本轮尚无可复用的 Ego 空间；为同一轮次创建一个规范任务空间并保存数字 ID。"
+            )
+        else:
+            space_note = (
+                f"先调用 useOrCreateTaskSpace({space_id}) 复用该数字 Ego 空间，"
+                "不要调用 completeTaskSpace。"
+            )
+        return (
+            "继续：复用 BacklinkHub 同一外链轮次，不创建新轮次。"
+            f"site_id={site_id}；run_id={run_id}；target={target}；"
+            f"ego_task_space_id={space_id}。{space_note}若 Ego 报告控制权异常，先单独"
+            "调用 listTaskSpaces 核验：只有 ownership=agentDelegatedToUser、错误紧邻"
+            "本执行器自己的导航且本执行器未调用 handOffTaskSpace 时，才调用"
+            f" takeOverTaskSpace({space_id}) 并核验恢复为 ownership=agent；"
+            "ownership=user 或本执行器主动 handoff 时必须停止，绝不能无条件接管。"
+            "先用 skill_view(name=\"backlink-round-execution\", "
+            "file_path=\"references/luna-worker.md\") 加载叶子参考一次，再用 "
+            "skill_view(name=\"ego-browser\") 加载官方技能一次；不得加载主技能、"
+            "使用 general/ego-browser 或在本执行段重复 skill_view。随后用同一 "
+            "run_id、site_id 调用 backlinkhub_advance_submission_round，省略 "
+            "target_count，由 BacklinkHub 恢复本轮目标和当前未回写候选，"
+            "再按叶子参考和官方 ego-browser 继续逐条提交；"
+            "不要重复任何已完成的最终提交，候选结束立即回写并继续 advance。"
+        )
+
+    def _detach_child_from_parent(child: Any) -> None:
+        """Remove a detached async child from foreground interrupt ownership."""
+        if not hasattr(parent_agent, "_active_children"):
+            return
+        try:
+            lock = getattr(parent_agent, "_active_children_lock", None)
+            if lock:
+                with lock:
+                    parent_agent._active_children.remove(child)
+            else:
+                parent_agent._active_children.remove(child)
+        except (ValueError, AttributeError):
+            pass
+
+    def _run_auto_continuation(
+        *, honor_parent_interrupt: bool = False,
+    ) -> Dict[str, Any]:
+        """Keep one BacklinkHub site task alive across native child boundaries."""
+        from tools.delegation_output_schema import (
+            completion_can_continue,
+            continuation_progress_fingerprint,
+        )
+
+        segment_history: List[Dict[str, Any]] = []
+        cumulative_api_calls = 0
+        cumulative_input = 0
+        cumulative_output = 0
+        cumulative_cost = 0.0
+        cumulative_duration = 0.0
+        cumulative_reasoning = 0
+        last_safe_metadata: Dict[str, Any] = {}
+        combined: Dict[str, Any] = {}
+
+        def _continuation_decision(metadata: Dict[str, Any]) -> bool:
+            can_continue = completion_can_continue(
+                metadata,
+                exit_reason=metadata.get("exit_reason"),
+                schema_valid=metadata.get("schema_valid"),
+            )
+            logger.info(
+                "delegate_task continuation decision: tool_profile=%s "
+                "_auto_continue=%s _auto_continue_enabled=%s segment=%d "
+                "schema_valid=%s exit_reason=%s stop_reason=%s "
+                "segment_iteration_boundary=%s ego_cleanup=%s "
+                "candidate_external_side_effect=%s remaining=%s "
+                "can_continue=%s",
+                tool_profile or "",
+                bool(_auto_continue),
+                _auto_continue_enabled,
+                len(segment_history),
+                metadata.get("schema_valid"),
+                metadata.get("exit_reason"),
+                metadata.get("stop_reason"),
+                metadata.get("segment_iteration_boundary"),
+                metadata.get("ego_cleanup"),
+                metadata.get("candidate_external_side_effect"),
+                metadata.get("remaining"),
+                can_continue,
+            )
+            return can_continue
+
+        def _clear_active_child_refs() -> None:
+            with _active_child_refs_lock:
+                _active_child_refs.clear()
+
+        def _record_segment(segment: Dict[str, Any]) -> None:
+            nonlocal cumulative_api_calls, cumulative_input
+            nonlocal cumulative_output, cumulative_cost
+            nonlocal cumulative_duration, cumulative_reasoning
+            entries = segment.get("results") if isinstance(segment, dict) else None
+            entry = entries[0] if isinstance(entries, list) and entries else {}
+            if not isinstance(entry, dict):
+                entry = {}
+            try:
+                cumulative_api_calls += int(entry.get("api_calls", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            tokens = entry.get("tokens") if isinstance(entry.get("tokens"), dict) else {}
+            try:
+                cumulative_input += int(tokens.get("input", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                cumulative_output += int(tokens.get("output", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                cumulative_cost += float(entry.get("cost_usd", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                cumulative_duration += float(entry.get("duration_seconds", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                cumulative_reasoning += int(
+                    entry.get("reasoning_tokens", 0)
+                    or (tokens.get("reasoning", 0) if isinstance(tokens, dict) else 0)
+                    or 0
+                )
+            except (TypeError, ValueError):
+                pass
+            metadata = _single_completion_metadata(segment)
+            history_entry: Dict[str, Any] = {
+                "segment": len(segment_history) + 1,
+                "status": entry.get("status"),
+                "exit_reason": entry.get("exit_reason"),
+                "api_calls": entry.get("api_calls", 0),
+                "duration_seconds": entry.get("duration_seconds", 0),
+                "reasoning_tokens": entry.get("reasoning_tokens", 0),
+            }
+            for key in (
+                "published",
+                "pending",
+                "attempted_unconfirmed",
+                "failed_retryable",
+                "failed_final",
+                "remaining",
+                "queue_exhausted",
+                "target_reached",
+                "candidate_external_side_effect",
+            ):
+                if key in metadata:
+                    history_entry[key] = metadata[key]
+            segment_history.append(history_entry)
+
+        # Keep the first segment and every continuation in one guarded block.
+        # If construction or execution raises, the finally block below still
+        # drops the mutable interrupt reference and closes a child that was
+        # constructed but never started.
+        _unstarted_child = None
+        try:
+            # The first segment uses the normal aggregator, preserving all
+            # existing lifecycle hooks and result formatting.
+            combined = _execute_and_aggregate(
+                honor_parent_interrupt=honor_parent_interrupt,
+            )
+            _record_segment(combined)
+            metadata = _single_completion_metadata(combined)
+            if metadata:
+                last_safe_metadata = dict(metadata)
+
+            expected_site_id = str(metadata.get("site_id") or "")
+            expected_run_id = str(metadata.get("run_id") or "")
+            expected_target = metadata.get("target")
+            previous_fingerprint = continuation_progress_fingerprint(metadata)
+
+            while _continuation_decision(metadata):
+                if _continuation_abort.is_set() or (
+                    honor_parent_interrupt
+                    and getattr(parent_agent, "_interrupt_requested", False) is True
+                ):
+                    break
+                # Never let a malformed worker switch the task to another site,
+                # round, or target while carrying an existing async record. A
+                # closed/missing Ego space may legitimately be replaced; space
+                # continuity is checked after the next segment returns.
+                if (
+                    not expected_site_id
+                    or not expected_run_id
+                    or str(metadata.get("site_id") or "") != expected_site_id
+                    or str(metadata.get("run_id") or "") != expected_run_id
+                    or str(metadata.get("target")) != str(expected_target)
+                ):
+                    combined["continuation_error"] = (
+                        "worker returned a different BacklinkHub site, run_id, or target"
+                    )
+                    break
+
+                previous_metadata = dict(metadata)
+                continuation_task = dict(task_list[0])
+                next_goal = _continuation_goal(metadata)
+                continuation_task["goal"] = next_goal
+                next_child = None
+                segment_started = False
+                try:
+                    next_child = _prepare_child_for_task(
+                        0,
+                        continuation_task,
+                        goal_override=next_goal,
+                    )
+                    _unstarted_child = next_child
+                    if _continuation_abort.is_set() or (
+                        honor_parent_interrupt
+                        and getattr(parent_agent, "_interrupt_requested", False) is True
+                    ):
+                        # A stop can race with child construction. Do not start
+                        # a freshly built segment after the owner cancelled it.
+                        break
+                    _detach_child_from_parent(next_child)
+                    with _active_child_refs_lock:
+                        _active_child_refs[:] = [next_child]
+                    segment_started = True
+                    _unstarted_child = None
+                    next_combined = _run_single_continuation_segment(
+                        next_child,
+                        continuation_task,
+                        next_goal,
+                    )
+                except Exception as exc:
+                    logger.exception("BacklinkHub continuation segment failed")
+                    combined["continuation_error"] = str(exc)
+                    break
+                finally:
+                    # _run_single_child owns cleanup after a started segment;
+                    # only close a child that never reached that boundary.
+                    if (
+                        next_child is not None
+                        and not segment_started
+                        and _unstarted_child is next_child
+                    ):
+                        try:
+                            next_child.close()
+                        except Exception:
+                            logger.debug(
+                                "Failed to close unstarted continuation child",
+                                exc_info=True,
+                            )
+                        _unstarted_child = None
+
+                combined = next_combined
+                _record_segment(combined)
+                metadata = _single_completion_metadata(combined)
+                if metadata:
+                    last_safe_metadata = dict(metadata)
+
+                    if (
+                        str(metadata.get("site_id") or "") != expected_site_id
+                        or str(metadata.get("run_id") or "") != expected_run_id
+                        or str(metadata.get("target")) != str(expected_target)
+                    ):
+                        combined["continuation_error"] = (
+                            "worker returned a different BacklinkHub site, run_id, or target"
+                        )
+                        break
+
+                    previous_cleanup = str(
+                        previous_metadata.get("ego_cleanup") or ""
+                    ).strip().lower()
+                    if previous_cleanup in {
+                        "preserved_for_continuation",
+                        "preserved",
+                        "open",
+                        "active",
+                        "kept",
+                        "not_closed",
+                        "reused",
+                        "preserved_for_serial_continuation",
+                    } and metadata.get("ego_task_space_id") != previous_metadata.get(
+                        "ego_task_space_id"
+                    ):
+                        combined["continuation_error"] = (
+                            "worker changed a preserved Ego task space between segments"
+                        )
+                        break
+
+                # A repeated account fingerprint means the child neither
+                # recorded a candidate outcome nor advanced the queue. Stop
+                # here instead of spinning up identical Luna/Ego segments.
+                fingerprint = continuation_progress_fingerprint(metadata)
+                if (
+                    previous_fingerprint is not None
+                    and fingerprint is not None
+                    and fingerprint == previous_fingerprint
+                ):
+                    combined["continuation_stop_reason"] = "no_progress"
+                    logger.info(
+                        "delegate_task continuation stopped: no progress after "
+                        "segment=%d",
+                        len(segment_history),
+                    )
+                    break
+                if fingerprint is not None:
+                    previous_fingerprint = fingerprint
+        finally:
+            if _unstarted_child is not None:
+                try:
+                    _unstarted_child.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close pending continuation child", exc_info=True
+                    )
+            _clear_active_child_refs()
+
+        entries = combined.get("results") if isinstance(combined, dict) else None
+        if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+            final_entry = entries[0]
+            final_entry["continuation_segments"] = len(segment_history)
+            final_entry["cumulative_api_calls"] = cumulative_api_calls
+            final_entry["cumulative_tokens"] = {
+                "input": cumulative_input,
+                "output": cumulative_output,
+            }
+            final_entry["cumulative_cost_usd"] = round(cumulative_cost, 6)
+            final_entry["cumulative_duration_seconds"] = round(
+                cumulative_duration, 2
+            )
+            final_entry["cumulative_reasoning_tokens"] = cumulative_reasoning
+            combined["continuation_history"] = segment_history
+        if last_safe_metadata and not _single_completion_metadata(combined):
+            combined["continuation_last_progress"] = last_safe_metadata
+        if live_deleg_id:
+            update_manifest_statuses(live_deleg_id, entries or [])
         return combined
 
     # ----- Background dispatch: run the WHOLE batch as one async unit -----
@@ -4201,7 +4893,12 @@ def delegate_task(
                 "delegate_task: async delivery unsupported on this session "
                 "runtime; running the batch synchronously instead."
             )
-            _sync_result = _execute_and_aggregate()
+            _sync_runner = (
+                _run_auto_continuation(honor_parent_interrupt=True)
+                if _auto_continue_enabled
+                else _execute_and_aggregate()
+            )
+            _sync_result = _strip_internal_completion_metadata(_sync_runner)
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
                     "background=true is not available in this session — it cannot "
@@ -4270,10 +4967,17 @@ def delegate_task(
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
+            if _auto_continue_enabled:
+                return _run_auto_continuation(honor_parent_interrupt=False)
             return _execute_and_aggregate(honor_parent_interrupt=False)
 
         def _batch_interrupt():
-            for _c in _child_agents:
+            # Interrupt the segment that is actually running.  A continuation
+            # can replace the child after the first segment has finalized.
+            _continuation_abort.set()
+            with _active_child_refs_lock:
+                current_children = list(_active_child_refs)
+            for _c in current_children:
                 try:
                     interrupted = request_hard_interrupt(_c, "Async delegation cancelled")
                     if not interrupted and hasattr(_c, "_interrupt_requested"):
@@ -4297,7 +5001,9 @@ def delegate_task(
             # sync-path heartbeat monitor.
             parts = []
             in_tool = False
-            for _c in _child_agents:
+            with _active_child_refs_lock:
+                current_children = list(_active_child_refs)
+            for _c in current_children:
                 try:
                     _summary = _c.get_activity_summary()
                     _tool = _summary.get("current_tool")
@@ -4386,7 +5092,12 @@ def delegate_task(
             "batch synchronously instead.",
             dispatch.get("error", "rejected"),
         )
-        _cap_result = _execute_and_aggregate()
+        _cap_runner = (
+            _run_auto_continuation(honor_parent_interrupt=True)
+            if _auto_continue_enabled
+            else _execute_and_aggregate()
+        )
+        _cap_result = _strip_internal_completion_metadata(_cap_runner)
         if isinstance(_cap_result, dict):
             _cap_result["note"] = (
                 "The background delegation pool was at capacity "
@@ -4398,7 +5109,10 @@ def delegate_task(
         return json.dumps(_cap_result, ensure_ascii=False)
 
     # ----- Synchronous path -----
-    return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
+    return json.dumps(
+        _strip_internal_completion_metadata(_execute_and_aggregate()),
+        ensure_ascii=False,
+    )
 
 
 def _resolve_child_credential_pool(
@@ -5011,6 +5725,7 @@ registry.register(
         tool_profile=args.get("tool_profile"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        _auto_continue=args.get("_auto_continue"),
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),

@@ -1458,6 +1458,112 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+    def test_top_level_output_schema_is_forwarded(self):
+        """The live model dispatch path preserves its structured result contract."""
+        import run_agent
+
+        captured = {}
+        output_schema = {
+            "type": "object",
+            "properties": {"run_id": {"type": "string"}},
+            "required": ["run_id"],
+        }
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "continue the backlink round",
+                    "output_schema": output_schema,
+                },
+            )
+
+        self.assertIs(captured["output_schema"], output_schema)
+
+    def test_pre_tool_modifications_reach_delegate_dispatch_on_both_paths(self):
+        """Hook-injected continuation fields survive the full tool pipeline."""
+        import run_agent
+        from agent import tool_executor
+
+        output_schema = {
+            "type": "object",
+            "properties": {"run_id": {"type": "string"}},
+            "required": ["run_id"],
+        }
+
+        class ImmediateAuthorizationGate:
+            def run(self, callback):
+                return callback()
+
+        def fake_pre_tool_call(_tool_name, args, **_kwargs):
+            modified = dict(args)
+            modified["output_schema"] = output_schema
+            modified["_auto_continue"] = True
+            return None, modified
+
+        for gate in (None, ImmediateAuthorizationGate()):
+            with self.subTest(path="sequential" if gate is None else "concurrent"):
+                captured = {}
+                parent = _make_mock_parent(depth=0)
+                parent._tool_guardrails.before_call.return_value = types.SimpleNamespace(
+                    allows_execution=True
+                )
+
+                def fake_delegate_task(**kwargs):
+                    captured.update(kwargs)
+                    return "{}"
+
+                with (
+                    patch(
+                        "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+                        side_effect=fake_pre_tool_call,
+                    ),
+                    patch(
+                        "hermes_cli.middleware.apply_tool_request_middleware",
+                        side_effect=lambda _name, args, **_kwargs: types.SimpleNamespace(
+                            payload=dict(args), trace=[]
+                        ),
+                    ),
+                    patch(
+                        "hermes_cli.middleware.run_tool_execution_middleware",
+                        side_effect=lambda _name, args, next_call, **_kwargs: next_call(
+                            args
+                        ),
+                    ),
+                    patch(
+                        "agent.relay_tools.execute",
+                        side_effect=lambda _name, args, next_call, **_kwargs: (
+                            next_call(args),
+                            args,
+                        ),
+                    ),
+                    patch("tools.delegate_tool.delegate_task", fake_delegate_task),
+                ):
+                    outcome = tool_executor._run_agent_tool_execution_middleware(
+                        parent,
+                        function_name="delegate_task",
+                        function_args={
+                            "goal": "continue the backlink round",
+                            "tool_profile": "backlinkhub",
+                        },
+                        effective_task_id="task-one",
+                        tool_call_id="call-one",
+                        execute=lambda args: run_agent.AIAgent._dispatch_delegate_task(
+                            parent, args
+                        ),
+                        authorization_gate=gate,
+                    )
+
+                self.assertTrue(captured["_auto_continue"])
+                self.assertIs(captured["output_schema"], output_schema)
+                self.assertTrue(outcome.args["_auto_continue"])
+                self.assertIs(outcome.args["output_schema"], output_schema)
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 

@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import threading
+from concurrent.futures import Future
 
 
 
@@ -119,6 +120,39 @@ class TestAgentCloseMethod:
                 mock_cleanup_vm.assert_called_once_with("test-close-cleanup")
                 mock_cleanup_browser.assert_called_once_with("test-close-cleanup")
                 mock_cleanup_cua.assert_called_once_with("test-close-cleanup")
+
+    def test_close_defers_delegated_child_until_worker_future_finishes(self):
+        """A parent teardown must not close a live delegated child."""
+        from unittest.mock import patch
+
+        from run_agent import AIAgent
+
+        agent = AIAgent.__new__(AIAgent)
+        agent.session_id = "deferred-child-close"
+        agent._active_children = []
+        agent._active_children_lock = threading.Lock()
+        agent._session_messages = []
+        agent._session_db = None
+        agent._end_session_on_close = False
+        agent.client = None
+        worker = Future()
+        agent._delegate_worker_future = worker
+        agent._delegate_close_lock = threading.Lock()
+
+        with patch.object(agent, "shutdown_memory_provider") as shutdown, \
+             patch("tools.process_registry.process_registry"), \
+             patch("run_agent.cleanup_vm"), \
+             patch("run_agent.cleanup_browser"), \
+             patch("tools.computer_use.release_computer_use_session"):
+            agent.close()
+            shutdown.assert_not_called()
+            assert not getattr(agent, "_delegate_close_started", False)
+
+            worker.set_result({})
+
+            shutdown.assert_called_once()
+            assert agent._delegate_close_started is True
+            assert agent._delegate_worker_future is None
 
     def test_close_is_idempotent(self):
         """close() can be called multiple times without error."""
@@ -462,6 +496,7 @@ class TestDelegationCleanup:
         child_started = threading.Event()
         release_child = threading.Event()
         child_finished = threading.Event()
+        child_closed = threading.Event()
         parent = MagicMock()
         parent._active_children = []
         parent._active_children_lock = threading.Lock()
@@ -469,10 +504,17 @@ class TestDelegationCleanup:
         child.session_id = "timed-out-child"
         child._delegate_saved_tool_names = ["tool1"]
         child.get_activity_summary.return_value = {"api_call_count": 1}
+        child.close.side_effect = child_closed.set
         parent._active_children.append(child)
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
         monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
+        # Keep the fake worker blocked after the timeout so this test observes
+        # the hand-off boundary itself; a real interrupt may make a child
+        # unwind before the parent reaches its cleanup finally block.
+        monkeypatch.setattr(
+            "tools.delegate_tool.request_hard_interrupt", lambda *_args, **_kwargs: False
+        )
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
@@ -519,9 +561,12 @@ class TestDelegationCleanup:
                 session_id=child.session_id,
             )
             relay_host.unregister_subagent.assert_not_called()
+            child.close.assert_not_called()
 
             release_child.set()
             assert child_finished.wait(timeout=5)
+            assert child_closed.wait(timeout=5)
+            child.close.assert_called_once()
             assert not relay_runtime.SESSION_COORDINATOR.has_active_turn(
                 profile_key=str(profile_home),
                 session_id=child.session_id,

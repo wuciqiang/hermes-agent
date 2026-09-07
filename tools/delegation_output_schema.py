@@ -41,6 +41,7 @@ _CONTINUATION_COUNT_FIELDS = (
 # after a genuine terminal outcome (or after losing its browser control).
 _NATIVE_RESUMABLE_EXIT_REASON = "max_iterations"
 _EXPLICIT_SEGMENT_STOP_REASON = "segment_iteration_boundary"
+_SAFE_BOUND_CANDIDATE_STOP_REASON = "candidate_available"
 _KNOWN_EARLY_STOP_REASONS = frozenset(
     {
         "stopped_without_native_termination_after_current_execution_segment",
@@ -183,6 +184,13 @@ def _continuation_boundary_kind(
         or reported_reason in _KNOWN_EARLY_STOP_REASONS
         or effective_exit in _KNOWN_EARLY_STOP_REASONS
     )
+    safe_bound_candidate = (
+        effective_exit == "completed"
+        and stop_reason == _SAFE_BOUND_CANDIDATE_STOP_REASON
+        and data.get("segment_iteration_boundary") is False
+        and data.get("candidate_bound") is True
+        and data.get("candidate_external_side_effect") == "none"
+    )
 
     if explicit_boundary:
         return "explicit"
@@ -190,6 +198,12 @@ def _continuation_boundary_kind(
         return "legacy"
     if known_early_boundary:
         return "known_early"
+    if safe_bound_candidate:
+        # ``advance`` can bind the next candidate immediately before a worker
+        # returns.  That is a safe serial handoff only while the candidate is
+        # untouched; the caller still enforces remaining/queue/cleanup facts
+        # and the outer continuation loop stops repeated no-progress states.
+        return "bound_candidate"
 
     if effective_exit == _NATIVE_RESUMABLE_EXIT_REASON or (
         not effective_exit and stop_reason == _NATIVE_RESUMABLE_EXIT_REASON

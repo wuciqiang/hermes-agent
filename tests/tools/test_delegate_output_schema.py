@@ -244,6 +244,38 @@ class TestContinuationBoundary:
             exit_reason="completed",
         ) == "completed"
 
+    def test_completed_bound_candidate_without_side_effect_can_continue(self):
+        """A claimed but untouched next candidate is a safe serial handoff."""
+
+        payload = self._unfinished(
+            stop_reason="candidate_available",
+            segment_iteration_boundary=False,
+            candidate_bound=True,
+            candidate_external_side_effect="none",
+        )
+
+        assert completion_can_continue(payload, exit_reason="completed") is True
+        assert normalize_completion_exit_reason(
+            payload,
+            schema_valid=True,
+            exit_reason="completed",
+        ) == "max_iterations"
+
+    def test_completed_candidate_handoff_requires_bound_untouched_candidate(self):
+        for candidate_bound, side_effect in (
+            (False, "none"),
+            (True, "confirmed"),
+            (True, "unknown"),
+        ):
+            payload = self._unfinished(
+                stop_reason="candidate_available",
+                segment_iteration_boundary=False,
+                candidate_bound=candidate_bound,
+                candidate_external_side_effect=side_effect,
+            )
+
+            assert completion_can_continue(payload, exit_reason="completed") is False
+
     def test_explicit_segment_boundary_can_continue(self):
         payload = self._unfinished(
             stop_reason="segment_iteration_boundary",
@@ -966,6 +998,34 @@ def _run_auto_continuation_scenario(payloads):
 
 
 class TestBacklinkAutoContinuation:
+    def test_safe_completed_candidate_handoff_continues_same_round(self):
+        candidate_handoff = _round_payload(
+            stop_reason="candidate_available",
+            segment_iteration_boundary=False,
+            candidate_bound=True,
+            candidate_external_side_effect="none",
+        )
+        terminal = _round_payload(
+            published=1,
+            pending=5,
+            remaining=0,
+            target_reached=True,
+            stop_reason="target_reached",
+            ego_cleanup="closed",
+            segment_iteration_boundary=False,
+            candidate_bound=False,
+            candidate_external_side_effect="none",
+        )
+
+        _handle, combined, dispatched, built_goals = _run_auto_continuation_scenario(
+            [candidate_handoff, terminal]
+        )
+
+        assert len(dispatched) == 1
+        assert len(built_goals) == 2
+        assert "run_id=round_test" in built_goals[1]
+        assert combined["results"][0]["continuation_segments"] == 2
+
     def test_safe_boundary_continues_inside_one_async_delegation(self):
         terminal = _round_payload(
             published=1,

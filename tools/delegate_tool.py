@@ -26,6 +26,8 @@ import re
 
 logger = logging.getLogger(__name__)
 import os
+import shutil
+import subprocess
 import threading
 import time
 import weakref
@@ -140,6 +142,65 @@ def _strip_internal_completion_metadata(payload: Any) -> Any:
             _strip_internal_completion_metadata(item) for item in results
         ]
     return cleaned
+
+
+def _cleanup_empty_agent_ego_space(space_id: Any) -> Dict[str, Any]:
+    """Close one proven-empty agent-owned Ego space after transport failure."""
+
+    if not isinstance(space_id, int) or isinstance(space_id, bool) or space_id <= 0:
+        return {"closed": False, "reason": "invalid_space_id"}
+    ego_browser = shutil.which("ego-browser")
+    if not ego_browser:
+        fallback = os.path.expanduser("~/.local/bin/ego-browser")
+        ego_browser = fallback if os.path.isfile(fallback) else None
+    if not ego_browser:
+        return {"closed": False, "reason": "ego_browser_unavailable"}
+
+    script = f"""
+const id = {space_id}
+const spaces = await listTaskSpaces()
+const space = spaces.find(item => Number(item.id) === id)
+if (!space) {{
+  cliLog(JSON.stringify({{closed: false, reason: 'space_not_found'}}))
+}} else if (space.ownership !== 'agent') {{
+  cliLog(JSON.stringify({{closed: false, reason: 'ownership_not_agent', ownership: space.ownership}}))
+}} else {{
+  await useOrCreateTaskSpace(id)
+  const tabs = await listTabs()
+  const onlyBlank = tabs.length > 0 && tabs.every(tab => String(tab.url || '') === 'about:blank')
+  if (!onlyBlank) {{
+    cliLog(JSON.stringify({{closed: false, reason: 'nonblank_or_unknown_tabs', tabCount: tabs.length}}))
+  }} else {{
+    const result = await completeTaskSpace(id, {{keep: false}})
+    cliLog(JSON.stringify({{closed: result?.done === true, reason: result?.done === true ? 'closed' : 'cleanup_not_confirmed'}}))
+  }}
+}}
+""".strip()
+    try:
+        completed = subprocess.run(
+            [ego_browser, "nodejs"],
+            input=script,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"closed": False, "reason": "cleanup_command_failed", "error": str(exc)}
+    if completed.returncode != 0:
+        return {
+            "closed": False,
+            "reason": "cleanup_command_failed",
+            "error": (completed.stderr or completed.stdout or "")[-500:],
+        }
+    for line in reversed((completed.stdout or "").splitlines()):
+        try:
+            result = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(result, dict) and isinstance(result.get("closed"), bool):
+            return result
+    return {"closed": False, "reason": "cleanup_result_unreadable"}
 
 
 # ---------------------------------------------------------------------------
@@ -4506,35 +4567,27 @@ def delegate_task(
         cleanup = str(metadata.get("ego_cleanup") or "").strip().lower()
         if cleanup == "closed":
             space_note = (
-                f"先调用 useOrCreateTaskSpace({space_id})；若该数字空间确实不存在，"
-                "再用 listTaskSpaces 核验一次，并仅在当前候选没有外部副作用时为同一轮次"
-                "创建一个替代空间。"
+                "旧空间已关闭；浏览当前候选时按参考核验并创建同一轮次的替代空间。"
             )
         elif cleanup == "not_created" or not isinstance(space_id, int):
             space_note = (
-                "本轮尚无可复用的 Ego 空间；为同一轮次创建一个规范任务空间并保存数字 ID。"
+                "本轮尚无 Ego 空间；浏览当前候选时创建一个并保存数字 ID。"
             )
         else:
             space_note = (
-                f"先调用 useOrCreateTaskSpace({space_id}) 复用该数字 Ego 空间，"
-                "不要调用 completeTaskSpace。"
+                f"首个浏览器事务复用数字 Ego 空间 {space_id}，本段继续时不要提前关闭。"
             )
         return (
             "继续：复用 BacklinkHub 同一外链轮次，不创建新轮次。"
             f"site_id={site_id}；run_id={run_id}；target={target}；"
-            f"ego_task_space_id={space_id}。{space_note}若 Ego 报告控制权异常，先单独"
-            "调用 listTaskSpaces 核验：只有 ownership=agentDelegatedToUser、错误紧邻"
-            "本执行器自己的导航且本执行器未调用 handOffTaskSpace 时，才调用"
-            f" takeOverTaskSpace({space_id}) 并核验恢复为 ownership=agent；"
-            "ownership=user 或本执行器主动 handoff 时必须停止，绝不能无条件接管。"
+            f"ego_task_space_id={space_id}；ego_cleanup={cleanup}。"
             "先用 skill_view(name=\"backlink-round-execution\", "
             "file_path=\"references/luna-worker.md\") 加载叶子参考一次，再用 "
-            "skill_view(name=\"ego-browser\") 加载官方技能一次；不得加载主技能、"
-            "使用 general/ego-browser 或在本执行段重复 skill_view。随后用同一 "
-            "run_id、site_id 调用 backlinkhub_advance_submission_round，省略 "
-            "target_count，由 BacklinkHub 恢复本轮目标和当前未回写候选，"
-            "再按叶子参考和官方 ego-browser 继续逐条提交；"
-            "不要重复任何已完成的最终提交，候选结束立即回写并继续 advance。"
+            "skill_view(name=\"ego-browser\") 加载官方技能一次，不得重复加载。"
+            "随后第一项业务调用必须是同一 run_id、site_id 的 "
+            "backlinkhub_advance_submission_round，并省略 target_count；由 BacklinkHub "
+            f"恢复目标和未回写候选。{space_note}之后严格执行参考中的 "
+            "ADVANCE -> BROWSE -> RECORD -> ADVANCE；不重复最终提交。"
         )
 
     def _detach_child_from_parent(child: Any) -> None:
@@ -4558,6 +4611,7 @@ def delegate_task(
         from tools.delegation_output_schema import (
             completion_can_continue,
             continuation_progress_fingerprint,
+            failed_segment_can_continue,
         )
 
         segment_history: List[Dict[str, Any]] = []
@@ -4568,6 +4622,8 @@ def delegate_task(
         cumulative_duration = 0.0
         cumulative_reasoning = 0
         last_safe_metadata: Dict[str, Any] = {}
+        transport_recovery_fingerprints: set = set()
+        transport_recovery_exhausted = False
         combined: Dict[str, Any] = {}
 
         def _continuation_decision(metadata: Dict[str, Any]) -> bool:
@@ -4793,6 +4849,48 @@ def delegate_task(
                         )
                         break
 
+                if not metadata:
+                    entries = (
+                        combined.get("results") if isinstance(combined, dict) else None
+                    )
+                    failed_entry = (
+                        entries[0]
+                        if isinstance(entries, list)
+                        and entries
+                        and isinstance(entries[0], dict)
+                        else {}
+                    )
+                    if failed_segment_can_continue(failed_entry, last_safe_metadata):
+                        recovery_fingerprint = continuation_progress_fingerprint(
+                            last_safe_metadata
+                        )
+                        if (
+                            recovery_fingerprint is not None
+                            and recovery_fingerprint
+                            not in transport_recovery_fingerprints
+                        ):
+                            transport_recovery_fingerprints.add(recovery_fingerprint)
+                            if segment_history:
+                                segment_history[-1]["transport_recovery"] = "scheduled"
+                            metadata = dict(last_safe_metadata)
+                            logger.info(
+                                "delegate_task scheduling one transport recovery: "
+                                "segment=%d exit_reason=%s",
+                                len(segment_history),
+                                failed_entry.get("exit_reason"),
+                            )
+                            continue
+                        transport_recovery_exhausted = True
+                        combined["continuation_stop_reason"] = (
+                            "transport_recovery_exhausted"
+                        )
+                        if segment_history:
+                            segment_history[-1]["transport_recovery"] = "exhausted"
+                        logger.info(
+                            "delegate_task transport recovery exhausted at segment=%d",
+                            len(segment_history),
+                        )
+
                 # A repeated account fingerprint means the child neither
                 # recorded a candidate outcome nor advanced the queue. Stop
                 # here instead of spinning up identical Luna/Ego segments.
@@ -4820,6 +4918,17 @@ def delegate_task(
                         "Failed to close pending continuation child", exc_info=True
                     )
             _clear_active_child_refs()
+
+        if (
+            transport_recovery_exhausted
+            and last_safe_metadata.get("candidate_external_side_effect") == "none"
+        ):
+            cleanup_result = _cleanup_empty_agent_ego_space(
+                last_safe_metadata.get("ego_task_space_id")
+            )
+            combined["ego_recovery_cleanup"] = cleanup_result
+            if cleanup_result.get("closed") is True:
+                last_safe_metadata["ego_cleanup"] = "closed"
 
         entries = combined.get("results") if isinstance(combined, dict) else None
         if isinstance(entries, list) and entries and isinstance(entries[0], dict):

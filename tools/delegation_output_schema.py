@@ -114,6 +114,20 @@ _EGO_CLEANUP_ALIASES = {
     "not_cleaned_iteration_boundary": "preserved_for_continuation",
 }
 
+_TRANSPORT_RECOVERY_EXIT_REASONS = frozenset(
+    {
+        "server_error",
+        "overloaded",
+        "provider_timeout",
+        "timeout",
+    }
+)
+
+_TRACE_SKILL_TOOL = "skill_view"
+_TRACE_ADVANCE_TOOL = "backlinkhub_advance_submission_round"
+_TRACE_RECORD_TOOL = "backlinkhub_record_submission_result"
+_TRACE_TERMINAL_TOOLS = frozenset({"terminal", "terminal_exec"})
+
 
 def _normalize_reason(value: Any) -> str:
     """Normalize a machine reason without interpreting free-form prose."""
@@ -314,6 +328,99 @@ def completion_can_continue(
         return False
 
     return True
+
+
+def failed_segment_can_continue(entry: Any, last_safe_payload: Any) -> bool:
+    """Allow one host retry after a factually safe provider failure.
+
+    A failed child cannot return a schema-valid final payload, so transport
+    recovery is based on the last validated round payload plus the failed
+    child's native tool trace.  Terminal calls are treated as possible browser
+    side effects unless a later successful BacklinkHub record made that work
+    durable.  This predicate decides only whether recovery is safe; the caller
+    owns the one-retry-per-progress bound.
+    """
+
+    if not isinstance(entry, dict) or entry.get("status") != "failed":
+        return False
+    exit_reason = _normalize_reason(
+        entry.get("exit_reason") or entry.get("failure_reason")
+    )
+    if exit_reason not in _TRANSPORT_RECOVERY_EXIT_REASONS:
+        return False
+    if not completion_can_continue(
+        last_safe_payload,
+        exit_reason=(
+            last_safe_payload.get("exit_reason")
+            if isinstance(last_safe_payload, dict)
+            else None
+        ),
+        schema_valid=(
+            last_safe_payload.get("schema_valid")
+            if isinstance(last_safe_payload, dict)
+            else None
+        ),
+    ):
+        return False
+
+    trace = entry.get("tool_trace")
+    if trace in (None, []):
+        return True
+    if not isinstance(trace, list) or any(not isinstance(item, dict) for item in trace):
+        return False
+
+    normalized_trace = [
+        {
+            "tool": _normalize_reason(item.get("tool")),
+            "status": _normalize_reason(item.get("status")),
+        }
+        for item in trace
+    ]
+    if any(
+        item["tool"] == _TRACE_RECORD_TOOL and item["status"] != "ok"
+        for item in normalized_trace
+    ):
+        # A rejected or missing result for a record call leaves the candidate's
+        # durable state uncertain even if an earlier browser action looked safe.
+        return False
+
+    terminal_indexes = [
+        index
+        for index, item in enumerate(normalized_trace)
+        if item["tool"] in _TRACE_TERMINAL_TOOLS
+    ]
+    if terminal_indexes:
+        last_terminal = terminal_indexes[-1]
+        successful_records = [
+            index
+            for index, item in enumerate(normalized_trace)
+            if index > last_terminal
+            and item["tool"] == _TRACE_RECORD_TOOL
+            and item["status"] == "ok"
+        ]
+        if not successful_records:
+            return False
+        durable_index = successful_records[-1]
+        return all(
+            item["tool"] in {
+                _TRACE_SKILL_TOOL,
+                _TRACE_ADVANCE_TOOL,
+                _TRACE_RECORD_TOOL,
+            }
+            and item["status"] == "ok"
+            for item in normalized_trace[durable_index + 1 :]
+        )
+
+    # Before any browser call, only skill loading and successful BacklinkHub
+    # advance/record operations are known to be side-effect-safe for recovery.
+    return all(
+        item["tool"] == _TRACE_SKILL_TOOL
+        or (
+            item["tool"] in {_TRACE_ADVANCE_TOOL, _TRACE_RECORD_TOOL}
+            and item["status"] == "ok"
+        )
+        for item in normalized_trace
+    )
 
 
 def continuation_progress_fingerprint(payload: Any) -> Optional[Tuple[Any, ...]]:

@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
     DELEGATE_TASK_SCHEMA,
+    _cleanup_empty_agent_ego_space,
     _run_single_child,
     delegate_task,
 )
@@ -27,6 +28,7 @@ from tools.delegation_output_schema import (
     completion_can_continue,
     coerce_output_schema,
     continuation_progress_fingerprint,
+    failed_segment_can_continue,
     normalize_completion_exit_reason,
     normalize_completion_payload,
     validate_output,
@@ -463,6 +465,104 @@ class TestContinuationBoundary:
         assert continuation_progress_fingerprint(first) == continuation_progress_fingerprint(
             second
         )
+
+
+class TestFailedSegmentRecovery:
+    @staticmethod
+    def _entry(*trace, exit_reason="server_error"):
+        return {
+            "status": "failed",
+            "exit_reason": exit_reason,
+            "tool_trace": list(trace),
+        }
+
+    @staticmethod
+    def _tool(name, status="ok"):
+        return {"tool": name, "status": status}
+
+    @staticmethod
+    def _progress():
+        payload = _round_payload()
+        payload.update(schema_valid=True, exit_reason="max_iterations")
+        return payload
+
+    def test_recovers_when_provider_fails_after_successful_advance(self):
+        entry = self._entry(
+            self._tool("skill_view"),
+            self._tool("backlinkhub_advance_submission_round"),
+        )
+
+        assert failed_segment_can_continue(entry, self._progress()) is True
+
+    def test_recovers_when_browser_work_was_durably_recorded(self):
+        entry = self._entry(
+            self._tool("terminal"),
+            self._tool("backlinkhub_record_submission_result"),
+            self._tool("backlinkhub_advance_submission_round"),
+        )
+
+        assert failed_segment_can_continue(entry, self._progress()) is True
+
+    def test_rejects_unrecorded_browser_work(self):
+        entry = self._entry(
+            self._tool("backlinkhub_advance_submission_round"),
+            self._tool("terminal"),
+        )
+
+        assert failed_segment_can_continue(entry, self._progress()) is False
+
+    def test_rejects_failed_or_unanswered_record(self):
+        failed_record = self._entry(
+            self._tool("terminal"),
+            self._tool("backlinkhub_record_submission_result", "error"),
+        )
+        unanswered_record = self._entry(
+            self._tool("terminal"),
+            self._tool("backlinkhub_record_submission_result", ""),
+        )
+
+        assert failed_segment_can_continue(failed_record, self._progress()) is False
+        assert failed_segment_can_continue(unanswered_record, self._progress()) is False
+
+    def test_rejects_nontransport_failure_and_untrusted_progress(self):
+        entry = self._entry(exit_reason="interrupted")
+        untrusted = self._progress()
+        untrusted["schema_valid"] = False
+
+        assert failed_segment_can_continue(entry, self._progress()) is False
+        assert failed_segment_can_continue(
+            self._entry(), untrusted
+        ) is False
+
+
+class TestEmptyEgoCleanup:
+    def test_uses_official_cli_and_returns_confirmed_close(self):
+        completed = MagicMock(
+            returncode=0,
+            stdout='{"closed":true,"reason":"closed"}\n',
+            stderr="",
+        )
+        with (
+            patch("tools.delegate_tool.shutil.which", return_value="/bin/ego-browser"),
+            patch("tools.delegate_tool.subprocess.run", return_value=completed) as run,
+        ):
+            result = _cleanup_empty_agent_ego_space(6)
+
+        assert result == {"closed": True, "reason": "closed"}
+        command = run.call_args.args[0]
+        script = run.call_args.kwargs["input"]
+        assert command == ["/bin/ego-browser", "nodejs"]
+        assert "space.ownership !== 'agent'" in script
+        assert "tabs.every" in script
+        assert "'about:blank'" in script
+        assert "completeTaskSpace(id, {keep: false})" in script
+
+    def test_invalid_id_never_starts_ego(self):
+        with patch("tools.delegate_tool.subprocess.run") as run:
+            result = _cleanup_empty_agent_ego_space(True)
+
+        assert result["reason"] == "invalid_space_id"
+        run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -902,15 +1002,17 @@ class TestDelegateTaskDispatch:
 def _run_auto_continuation_scenario(payloads):
     children = []
     for index, payload in enumerate(payloads, start=1):
+        if isinstance(payload, dict) and "_raw_child_response" in payload:
+            response = payload["_raw_child_response"]
+        else:
+            response = {
+                "final_response": json.dumps(payload),
+                "completed": True,
+                "api_calls": index,
+                "messages": [],
+            }
         child = _StubChild(
-            [
-                {
-                    "final_response": json.dumps(payload),
-                    "completed": True,
-                    "api_calls": index,
-                    "messages": [],
-                }
-            ]
+            [response]
         )
         child.model = "gpt-5.6-luna"
         child.session_prompt_tokens = index * 100
@@ -982,6 +1084,10 @@ def _run_auto_continuation_scenario(payloads):
         patch("gateway.session_context.get_session_env", return_value=""),
         patch("tools.approval.get_current_session_key", return_value="owner-test"),
         patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+        patch(
+            "tools.delegate_tool._cleanup_empty_agent_ego_space",
+            return_value={"closed": True, "reason": "closed"},
+        ),
     ):
         handle = json.loads(
             delegate_task(
@@ -998,6 +1104,80 @@ def _run_auto_continuation_scenario(payloads):
 
 
 class TestBacklinkAutoContinuation:
+    @staticmethod
+    def _transport_failure(*tools):
+        messages = []
+        for index, tool in enumerate(tools):
+            call_id = f"call_{index}"
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "function": {"name": tool, "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": '{"success":true}',
+                    },
+                ]
+            )
+        return {
+            "_raw_child_response": {
+                "final_response": "HTTP 500 after retries",
+                "completed": False,
+                "failed": True,
+                "failure_reason": "server_error",
+                "api_calls": 3,
+                "messages": messages,
+            }
+        }
+
+    def test_provider_failure_after_advance_recovers_same_round_once(self):
+        terminal = _round_payload(
+            published=1,
+            pending=5,
+            remaining=0,
+            target_reached=True,
+            stop_reason="target_reached",
+            ego_cleanup="closed",
+            segment_iteration_boundary=False,
+        )
+
+        _handle, combined, dispatched, built_goals = _run_auto_continuation_scenario(
+            [
+                _round_payload(),
+                self._transport_failure("backlinkhub_advance_submission_round"),
+                terminal,
+            ]
+        )
+
+        assert len(dispatched) == 1
+        assert len(built_goals) == 3
+        assert "run_id=round_test" in built_goals[2]
+        assert combined["results"][0]["continuation_segments"] == 3
+        assert combined["continuation_history"][1]["transport_recovery"] == "scheduled"
+
+    def test_same_progress_gets_only_one_transport_recovery(self):
+        failure = self._transport_failure("backlinkhub_advance_submission_round")
+
+        _handle, combined, _dispatched, built_goals = _run_auto_continuation_scenario(
+            [_round_payload(), failure, failure]
+        )
+
+        assert len(built_goals) == 3
+        assert combined["continuation_stop_reason"] == "transport_recovery_exhausted"
+        assert combined["ego_recovery_cleanup"] == {
+            "closed": True,
+            "reason": "closed",
+        }
+        assert combined["continuation_last_progress"]["ego_cleanup"] == "closed"
+
     def test_safe_completed_candidate_handoff_continues_same_round(self):
         candidate_handoff = _round_payload(
             stop_reason="candidate_available",
@@ -1050,7 +1230,8 @@ class TestBacklinkAutoContinuation:
         assert "ego_task_space_id=7" in built_goals[1]
         assert 'skill_view(name="backlink-round-execution"' in built_goals[1]
         assert 'skill_view(name="ego-browser")' in built_goals[1]
-        assert "在本执行段重复 skill_view" in built_goals[1]
+        assert "不得重复加载" in built_goals[1]
+        assert "第一项业务调用必须是" in built_goals[1]
         assert "省略 target_count" in built_goals[1]
         assert "run_id、site_id 和 target_count" not in built_goals[1]
         entry = combined["results"][0]
@@ -1115,7 +1296,7 @@ class TestBacklinkAutoContinuation:
         assert len(dispatched) == 1
         assert len(built_goals) == 2
         assert "ego_task_space_id=8" in built_goals[1]
-        assert "创建一个替代空间" in built_goals[1]
+        assert "创建同一轮次的替代空间" in built_goals[1]
         assert combined["results"][0]["continuation_segments"] == 2
         assert "continuation_error" not in combined
 

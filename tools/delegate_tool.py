@@ -1418,6 +1418,7 @@ def delegate_task(
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
     _continuation_requested = bool(_auto_continue and background and tool_profile == "backlinkhub" and len(task_list) == 1 and task_schemas and task_schemas[0] is not None)
+    from tools.delegation_live_log import update_manifest_statuses
     children, err = ([], None) if _continuation_requested else _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers,
@@ -1456,6 +1457,8 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             child_context = append_output_contract(child_context, task_schema)
+        from tools.delegation_live_log import wrap_progress_callback
+
         child = _build_child_preserving_parent_tools(
             task_index=task_index,
             goal=child_goal,
@@ -1543,6 +1546,7 @@ def delegate_task(
             # Batch -- run in parallel with per-task progress lines
             completed_count = 0
             spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
+            task_labels = [str(task.get("goal") or "") for task in task_list]
 
             # Daemon workers (tools.daemon_pool): the `with` block still joins
             # normally, but if the parent is interrupted while a child is

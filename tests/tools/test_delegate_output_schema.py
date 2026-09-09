@@ -14,6 +14,7 @@ ONLY, zero code/prompt text copied (proprietary).
 
 import json
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -1176,12 +1177,17 @@ class TestBacklinkAutoContinuation:
             child.session_estimated_cost_usd = 0.0
             child.session_cost_status = "estimated"
             child._delegate_role = "leaf"
-            child.run_conversation.return_value = {
-                "final_response": json.dumps(payload),
-                "completed": True,
-                "api_calls": 1,
-                "messages": [],
-            }
+            def run_child(*_args, _child=child, _payload=payload, **_kwargs):
+                callback = _child.tool_progress_callback
+                callback("tool.started", tool_name="terminal", preview="pwd")
+                callback("tool.completed", tool_name="terminal", result="ok", duration=0.01)
+                return {
+                    "final_response": json.dumps(_payload),
+                    "completed": True,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+            child.run_conversation.side_effect = run_child
             children.append(child)
 
         parent = _make_mock_parent()
@@ -1212,10 +1218,11 @@ class TestBacklinkAutoContinuation:
             "tool_profiles": {"backlinkhub": ["terminal"]},
         }
         built = []
+        captured = {}
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
         def fake_dispatch(**kwargs):
-            kwargs["runner"]()
+            captured["combined"] = kwargs["runner"]()
             return {"status": "dispatched", "delegation_id": "real-builder-test"}
 
         def capture_agent(**kwargs):
@@ -1229,7 +1236,6 @@ class TestBacklinkAutoContinuation:
             patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
             patch("tools.delegate_tool._resolve_child_runtime", wraps=_resolve_child_runtime) as runtime_spy,
             patch("run_agent.AIAgent", side_effect=capture_agent),
-            patch("tools.delegation_live_log.create_live_transcripts", return_value=(None, [], [])),
             patch("tools.async_delegation.dispatch_async_delegation_batch", side_effect=fake_dispatch),
             patch("gateway.session_context.async_delivery_supported", return_value=True),
             patch("gateway.session_context.get_session_env", return_value=""),
@@ -1247,6 +1253,7 @@ class TestBacklinkAutoContinuation:
             ))
 
         assert result["status"] == "dispatched"
+        assert captured["combined"]["results"][0]["status"] == "completed"
         assert len(built) == 2
         assert [item["enabled_toolsets"] for item in built] == [["terminal"], ["terminal"]]
         assert all(item["model"] == "gpt-5.6-luna" for item in built)
@@ -1255,6 +1262,19 @@ class TestBacklinkAutoContinuation:
         assert all(call.kwargs["routing_cfg"] is config for call in runtime_spy.call_args_list)
         assert children[0]._delegate_output_schema is ROUND_SCHEMA
         assert children[1]._delegate_output_schema is ROUND_SCHEMA
+        assert children[0]._live_transcript_path
+        assert children[1]._live_transcript_path
+        assert children[0]._live_transcript_path == children[1]._live_transcript_path
+        assert built[0]["tool_progress_callback"] is not None
+        assert built[1]["tool_progress_callback"] is not None
+        for child in children:
+            log_text = Path(child._live_transcript_path).read_text(encoding="utf-8")
+            assert "Hermes subagent live transcript" in log_text
+            assert "tool" in log_text
+            assert "end status=completed" in log_text
+        manifest = Path(children[0]._live_transcript_path).with_name("manifest.json")
+        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        assert manifest_data["tasks"][0]["status"] == "completed"
 
     @staticmethod
     def _transport_failure(*tools):

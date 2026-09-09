@@ -1188,6 +1188,7 @@ class TestBacklinkAutoContinuation:
         parent.session_id = "real-builder-parent"
         parent._current_task_id = "parent-task"
         parent._current_turn_id = "turn"
+        parent._session_db = None
         parent._memory_manager = None
         parent._interrupt_requested = False
         parent.max_tokens = 8192

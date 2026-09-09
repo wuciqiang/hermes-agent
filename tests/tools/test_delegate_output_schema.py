@@ -1153,6 +1153,108 @@ def _run_auto_continuation_scenario(payloads):
 
 
 class TestBacklinkAutoContinuation:
+    def test_real_continuation_builder_uses_current_child_contract(self, monkeypatch, tmp_path):
+        """Both initial and resumed segments must cross the real child builder.
+
+        The resumed path used to pass ``override_max_tokens``, a kwarg removed
+        from ``_build_child_agent`` during the delegation split.
+        """
+        children = []
+        for payload in (_round_payload(), _round_payload(
+            pending=0,
+            remaining=0,
+            target_reached=True,
+            stop_reason="target_reached",
+            ego_cleanup="closed",
+            segment_iteration_boundary=False,
+        )):
+            child = MagicMock()
+            child.model = "gpt-5.6-luna"
+            child.session_prompt_tokens = 10
+            child.session_completion_tokens = 5
+            child.session_reasoning_tokens = 1
+            child.session_estimated_cost_usd = 0.0
+            child.session_cost_status = "estimated"
+            child._delegate_role = "leaf"
+            child.run_conversation.return_value = {
+                "final_response": json.dumps(payload),
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+            children.append(child)
+
+        parent = _make_mock_parent()
+        parent.session_id = "real-builder-parent"
+        parent._current_task_id = "parent-task"
+        parent._current_turn_id = "turn"
+        parent._memory_manager = None
+        parent._interrupt_requested = False
+        parent.max_tokens = 8192
+        parent.enabled_toolsets = ["terminal"]
+        parent.disabled_toolsets = []
+        parent.session_estimated_cost_usd = 0.0
+        parent.session_cost_source = "none"
+        parent.session_cost_status = "unknown"
+        credentials = {
+            "provider": None,
+            "model": "gpt-5.6-luna",
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": None,
+            "command": None,
+            "args": None,
+        }
+        config = {
+            "max_iterations": 5,
+            "tool_profiles": {"backlinkhub": ["terminal"]},
+        }
+        built = []
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        def fake_dispatch(**kwargs):
+            kwargs["runner"]()
+            return {"status": "dispatched", "delegation_id": "real-builder-test"}
+
+        def capture_agent(**kwargs):
+            built.append(kwargs)
+            return children[len(built) - 1]
+
+        from tools.delegate_tool import _resolve_child_runtime
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=config),
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+            patch("tools.delegate_tool._resolve_child_runtime", wraps=_resolve_child_runtime) as runtime_spy,
+            patch("run_agent.AIAgent", side_effect=capture_agent),
+            patch("tools.delegation_live_log.create_live_transcripts", return_value=(None, [], [])),
+            patch("tools.async_delegation.dispatch_async_delegation_batch", side_effect=fake_dispatch),
+            patch("gateway.session_context.async_delivery_supported", return_value=True),
+            patch("gateway.session_context.get_session_env", return_value=""),
+            patch("tools.approval.get_current_session_key", return_value="owner-test"),
+            patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+            patch("tools.delegate_tool._cleanup_empty_agent_ego_space", return_value={"closed": True}),
+        ):
+            result = json.loads(delegate_task(
+                goal="submit backlinks for TheSiteMath",
+                tool_profile="backlinkhub",
+                background=True,
+                output_schema=ROUND_SCHEMA,
+                _auto_continue=True,
+                parent_agent=parent,
+            ))
+
+        assert result["status"] == "dispatched"
+        assert len(built) == 2
+        assert [item["enabled_toolsets"] for item in built] == [["terminal"], ["terminal"]]
+        assert all(item["model"] == "gpt-5.6-luna" for item in built)
+        assert all(item["max_tokens"] == 8192 for item in built)
+        assert len(runtime_spy.call_args_list) == 2
+        assert all(call.kwargs["routing_cfg"] is config for call in runtime_spy.call_args_list)
+        assert children[0]._delegate_output_schema is ROUND_SCHEMA
+        assert children[1]._delegate_output_schema is ROUND_SCHEMA
+
     @staticmethod
     def _transport_failure(*tools):
         messages = []

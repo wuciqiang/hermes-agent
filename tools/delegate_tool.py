@@ -1473,9 +1473,9 @@ def delegate_task(
             override_api_key=creds["api_key"],
             override_api_mode=creds["api_mode"],
             override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
+            routing_cfg=routing_cfg,
             role=effective_role,
         )
         if task_schema is not None:

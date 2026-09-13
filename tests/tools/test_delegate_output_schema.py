@@ -293,6 +293,41 @@ class TestContinuationBoundary:
         ) == "max_iterations"
         assert completion_can_continue(payload, exit_reason="max_iterations") is True
 
+    def test_completed_host_with_worker_max_iterations_boundary_can_continue(self):
+        """Accept the observed worker/native exit-reason compatibility pair."""
+        payload = self._unfinished(
+            stop_reason="max_iterations",
+            segment_iteration_boundary=True,
+        )
+
+        assert completion_can_continue(payload, exit_reason="completed") is True
+        assert normalize_completion_exit_reason(
+            payload,
+            schema_valid=True,
+            exit_reason="completed",
+        ) == "max_iterations"
+
+    def test_worker_max_iterations_requires_explicit_boundary_marker(self):
+        payload = self._unfinished(
+            stop_reason="max_iterations",
+            segment_iteration_boundary=False,
+        )
+
+        assert completion_can_continue(payload, exit_reason="completed") is False
+        assert normalize_completion_exit_reason(
+            payload,
+            schema_valid=True,
+            exit_reason="completed",
+        ) == "completed"
+
+    def test_natural_language_max_iterations_is_not_a_boundary(self):
+        payload = self._unfinished(
+            stop_reason="max_iterations reached; please continue",
+            segment_iteration_boundary=True,
+        )
+
+        assert completion_can_continue(payload, exit_reason="completed") is False
+
     def test_observed_iteration_cleanup_alias_is_safe_to_continue(self):
         payload = self._unfinished(
             stop_reason="segment_iteration_boundary",
@@ -1398,6 +1433,34 @@ class TestBacklinkAutoContinuation:
         assert len(dispatched) == 1
         assert len(built_goals) == 2
         assert "site_id=site_thesitemath" in built_goals[1]
+
+    def test_completed_host_with_worker_max_boundary_dispatches_next_segment(self):
+        mixed_boundary = _round_payload(
+            stop_reason="max_iterations",
+            segment_iteration_boundary=True,
+            candidate_bound=True,
+            candidate_external_side_effect="none",
+        )
+        terminal = _round_payload(
+            published=1,
+            pending=5,
+            remaining=0,
+            target_reached=True,
+            stop_reason="target_reached",
+            ego_cleanup="closed",
+            segment_iteration_boundary=False,
+            candidate_bound=False,
+            candidate_external_side_effect="none",
+        )
+
+        _handle, combined, dispatched, built_goals = _run_auto_continuation_scenario(
+            [mixed_boundary, terminal]
+        )
+
+        assert len(dispatched) == 1
+        assert len(built_goals) == 2
+        assert "run_id=round_test" in built_goals[1]
+        assert combined["results"][0]["continuation_segments"] == 2
         assert "run_id=round_test" in built_goals[1]
         assert "ego_task_space_id=7" in built_goals[1]
         assert 'skill_view(name="backlink-round-execution"' in built_goals[1]

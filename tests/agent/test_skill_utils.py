@@ -74,6 +74,52 @@ skills:
     assert parse_count == 1
 
 
+def test_external_dirs_cache_tracks_symlink_target_changes(tmp_path, monkeypatch):
+    """A cached config must follow an external skills symlink after upgrade."""
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    v1 = tmp_path / "external-v1"
+    v2 = tmp_path / "external-v2"
+    v1.mkdir()
+    v2.mkdir()
+    link = tmp_path / "external"
+    link.symlink_to(v1, target_is_directory=True)
+    (hermes_home / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {link}\n", encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+    assert get_external_skills_dirs() == [v1.resolve()]
+
+    link.unlink()
+    link.symlink_to(v2, target_is_directory=True)
+    assert get_external_skills_dirs() == [v2.resolve()]
+
+
+def test_external_dirs_cache_recovers_broken_symlink(tmp_path, monkeypatch):
+    """A cached missing entry becomes visible when its target is restored."""
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    target = tmp_path / "external"
+    link = tmp_path / "external-link"
+    link.symlink_to(target, target_is_directory=True)
+    (hermes_home / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {link}\n", encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+    assert get_external_skills_dirs() == []
+
+    target.mkdir()
+    assert get_external_skills_dirs() == [target.resolve()]
+
+
 class TestParseConfigStringList:
     """#86661: `hermes config set` and JSON-mode editor saves store lists as
     quoted strings (e.g. '["a","b"]'). Treating such a string as a single name

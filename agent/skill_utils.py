@@ -309,14 +309,8 @@ def _normalize_string_set(values) -> Set[str]:
     return {name.strip() for name in parse_config_string_list(values) if name.strip()}
 
 
-# config identity -> resolved external dirs. Called once per skill during
-# banner / tool-registry scans; re-resolving each time dominated cold-start.
-_EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], List[Path]] = {}
-
-
 def _external_dirs_cache_clear() -> None:
-    """Test hook — drop the in-process cache."""
-    _EXTERNAL_DIRS_CACHE.clear()
+    """Test hook — drop the shared raw config cache."""
     _raw_config_cache_clear()
 
 
@@ -335,14 +329,13 @@ def get_external_skills_dirs() -> List[Path]:
     config_path = get_config_path()
     if not config_path.exists():
         return []
-    full_key = _config_cache_key(config_path)
-    cache_key = full_key[:2] if full_key is not None else None
-    cached = _EXTERNAL_DIRS_CACHE.get(cache_key) if cache_key is not None else None
-    if cached is not None:
-        return list(cached)  # copy so callers can't mutate the cache
     skills_cfg = _skills_cfg()
     if skills_cfg is None:
         return []
+
+    # The raw config is cached, but configured paths are resolved on every call.
+    # This keeps the YAML parsing win while noticing symlink upgrades and broken
+    # links that become valid without a config.yaml edit.
     local_skills = get_skills_dir().resolve()
     result: List[Path] = []
     for entry in _config_str_list(skills_cfg.get("external_dirs")):
@@ -353,8 +346,6 @@ def get_external_skills_dirs() -> List[Path]:
             result.append(p)
         else:
             logger.debug("External skills dir does not exist, skipping: %s", p)
-    if cache_key is not None:
-        _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
     return result
 
 

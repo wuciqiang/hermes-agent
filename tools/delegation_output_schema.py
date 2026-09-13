@@ -215,6 +215,19 @@ def _continuation_boundary_kind(
         # and the outer continuation loop stops repeated no-progress states.
         return "bound_candidate"
 
+    # Some BacklinkHub workers report their own segment budget as
+    # ``stop_reason=max_iterations`` even when the Hermes child itself exits
+    # normally with ``exit_reason=completed``.  The explicit boundary marker
+    # makes this compatibility case safe and unambiguous; do not infer it from
+    # a free-form reason or from remaining work alone.  Once normalized, the
+    # host may call this predicate again with ``exit_reason=max_iterations``.
+    if (
+        effective_exit in {"completed", _NATIVE_RESUMABLE_EXIT_REASON}
+        and stop_reason == _NATIVE_RESUMABLE_EXIT_REASON
+        and data.get("segment_iteration_boundary") is True
+    ):
+        return "native_segment"
+
     if effective_exit == _NATIVE_RESUMABLE_EXIT_REASON or (
         not effective_exit and stop_reason == _NATIVE_RESUMABLE_EXIT_REASON
     ):

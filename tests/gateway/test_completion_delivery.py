@@ -122,6 +122,85 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     adapter.handle_message.assert_awaited_once()
 
 
+def test_backlinkhub_progress_notice_is_plain_text_and_deduplicated(monkeypatch):
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = _runner(adapter)
+    source = SimpleNamespace(platform=Platform.FEISHU, chat_id="chat-1", thread_id=None)
+    event = _async_event("backlink-site-1")
+    event["results"] = [{
+        "status": "completed",
+        "summary": json.dumps({"site_id": "site_math", "published": 2, "remaining": 3}),
+    }]
+    runner._build_process_event_source = lambda _evt: source
+    runner._resolve_injection_adapter = lambda _platform, _source: adapter
+    runner._thread_metadata_for_source = lambda _source: {"thread_id": "topic-1"}
+
+    async def exercise():
+        runner._queue_backlinkhub_progress_notice(event)
+        runner._queue_backlinkhub_progress_notice(event)
+        await asyncio.gather(*list(runner._background_tasks))
+
+    asyncio.run(exercise())
+    adapter.send.assert_awaited_once()
+    args, kwargs = adapter.send.await_args
+    assert args == ("chat-1", "BacklinkHub 站点 site_math；状态：completed；已计入：2；剩余：3")
+    assert kwargs["metadata"] == {"thread_id": "topic-1"}
+
+
+def test_non_backlink_site_id_does_not_trigger_progress_notice():
+    runner = _runner(SimpleNamespace(send=AsyncMock()))
+    event = _async_event("generic-site")
+    event["results"] = [{"status": "completed", "summary": json.dumps({"site_id": "site_generic"})}]
+
+    async def exercise():
+        runner._queue_backlinkhub_progress_notice(event)
+        await asyncio.sleep(0)
+
+    asyncio.run(exercise())
+    assert runner.adapters[Platform.TELEGRAM].send.await_count == 0
+
+
+def test_backlinkhub_progress_notice_failure_does_not_raise(caplog, monkeypatch):
+    adapter = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("offline")))
+    runner = _runner(adapter)
+    source = SimpleNamespace(platform=Platform.FEISHU, chat_id="chat-1", thread_id=None)
+    event = _async_event("backlink-site-failure")
+    event.update({"site_id": "site_math", "published": 0, "remaining": 1})
+    runner._build_process_event_source = lambda _evt: source
+    runner._resolve_injection_adapter = lambda _platform, _source: adapter
+    runner._thread_metadata_for_source = lambda _source: None
+
+    async def exercise():
+        runner._queue_backlinkhub_progress_notice(event)
+        await asyncio.gather(*list(runner._background_tasks))
+
+    asyncio.run(exercise())
+    assert "BacklinkHub progress notice failed" in caplog.text
+
+
+def test_backlinkhub_progress_notice_retries_without_thread_on_rejection(caplog):
+    adapter = SimpleNamespace(send=AsyncMock(side_effect=[
+        SimpleNamespace(success=False, error="99992402"),
+        SimpleNamespace(success=True),
+    ]))
+    runner = _runner(adapter)
+    source = SimpleNamespace(platform=Platform.FEISHU, chat_id="chat-1", thread_id=None)
+    event = _async_event("backlink-thread-fallback")
+    event.update({"site_id": "site_math", "published": 1, "remaining": 0})
+    runner._build_process_event_source = lambda _evt: source
+    runner._resolve_injection_adapter = lambda _platform, _source: adapter
+    runner._thread_metadata_for_source = lambda _source: {"thread_id": "topic-1", "scope_id": "tenant-1"}
+
+    async def exercise():
+        runner._queue_backlinkhub_progress_notice(event)
+        await asyncio.gather(*list(runner._background_tasks))
+
+    asyncio.run(exercise())
+    assert adapter.send.await_count == 2
+    assert adapter.send.await_args_list[1].kwargs["metadata"] == {"scope_id": "tenant-1"}
+    assert "retrying without thread_id" in caplog.text
+
+
 def test_unroutable_async_event_remains_retryable(
     monkeypatch, isolated_registry,
 ):

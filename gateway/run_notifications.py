@@ -1417,6 +1417,120 @@ class GatewayNotificationsMixin:
                 _pr.completion_queue.put(evt)
         return delivered
 
+    @staticmethod
+    def _backlinkhub_progress_entries(evt: dict) -> list[dict]:
+        """Extract validated BacklinkHub site results for the optional operator notice."""
+        marker_fields = {
+            "published", "pending", "attempted_unconfirmed", "failed_retryable",
+            "failed_final", "remaining", "target_reached", "candidate_bound",
+        }
+
+        def _parsed_summary(value: Any) -> dict:
+            if not isinstance(value, str):
+                return {}
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+
+        def _merge(item: dict, metadata: Optional[dict] = None) -> dict:
+            merged = {}
+            if isinstance(metadata, dict):
+                merged.update(metadata)
+            nested = item.get("_completion_metadata")
+            if isinstance(nested, dict):
+                merged.update(nested)
+            merged.update(_parsed_summary(item.get("summary")))
+            merged.update({key: value for key, value in item.items() if key != "summary"})
+            if evt.get("backlinkhub"):
+                merged["backlinkhub"] = True
+            return merged
+
+        def _is_backlink_result(item: dict) -> bool:
+            return bool(item.get("site_id") and (item.get("backlinkhub") or marker_fields.intersection(item)))
+
+        raw_results = evt.get("results")
+        entries = [item for item in raw_results if isinstance(item, dict)] if isinstance(raw_results, list) else []
+        if entries:
+            metadata = evt.get("result_metadata")
+            return [
+                merged for index, item in enumerate(entries)
+                if _is_backlink_result(merged := _merge(
+                    item, metadata[index] if isinstance(metadata, list) and index < len(metadata) else None,
+                ))
+            ]
+        merged = _merge(evt, evt.get("continuation_signal"))
+        return [merged] if _is_backlink_result(merged) else []
+
+    @classmethod
+    def _backlinkhub_progress_text(cls, evt: dict, result: dict) -> Optional[str]:
+        """Render a bounded plain-text notice; full delegation output stays in the parent turn."""
+        if not result.get("site_id"):
+            return None
+        # A site_id is emitted only by the validated BacklinkHub result contract.  An explicit
+        # marker remains available for future event producers without changing generic notices.
+        status = str(result.get("status") or evt.get("status") or "completed")
+        parts = [f"BacklinkHub 站点 {str(result['site_id']).strip()}", f"状态：{status}"]
+        if result.get("published") is not None:
+            parts.append(f"已计入：{result['published']}")
+        if result.get("remaining") is not None:
+            parts.append(f"剩余：{result['remaining']}")
+        return "；".join(parts)
+
+    async def _send_backlinkhub_progress_notice(self, evt: dict, result: dict) -> None:
+        """Best-effort Feishu side-channel notice, independent of model-turn admission."""
+        from gateway.wake import adapter_supports_push
+
+        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        if source is None or getattr(source, "platform", None) != Platform.FEISHU:
+            return
+        adapter = self._resolve_injection_adapter("feishu", source)
+        if adapter is None or not adapter_supports_push(adapter):
+            return
+        text = self._backlinkhub_progress_text(evt, result)
+        if not text:
+            return
+        try:
+            metadata = self._thread_metadata_for_source(source)
+            result_obj = await adapter.send(source.chat_id, text, metadata=metadata)
+            if getattr(result_obj, "success", True) is False:
+                logger.warning(
+                    "BacklinkHub progress notice with thread routing was rejected for site %s: %s; "
+                    "retrying without thread_id",
+                    result.get("site_id"), getattr(result_obj, "error", "unknown error"),
+                )
+                fallback_metadata = dict(metadata or {})
+                fallback_metadata.pop("thread_id", None)
+                await adapter.send(source.chat_id, text, metadata=fallback_metadata or None)
+        except Exception:
+            logger.exception("BacklinkHub progress notice failed for site %s", result.get("site_id"))
+
+    def _queue_backlinkhub_progress_notice(self, evt: dict) -> None:
+        """Schedule at most one low-frequency notice per delegation/site identity."""
+        entries = self._backlinkhub_progress_entries(evt)
+        if not entries:
+            return
+        notified = getattr(self, "_backlinkhub_progress_notified", None)
+        if notified is None:
+            notified = self._backlinkhub_progress_notified = set()
+        lock = getattr(self, "_completion_delivery_lock", None)
+        for result in entries:
+            identity = (str(evt.get("delegation_id") or ""), str(result.get("site_id") or ""))
+            if not identity[0] or not identity[1]:
+                continue
+            if lock:
+                with lock:
+                    if identity in notified:
+                        continue
+                    notified.add(identity)
+            elif identity in notified:
+                continue
+            else:
+                notified.add(identity)
+            task = asyncio.create_task(self._send_backlinkhub_progress_notice(evt, result))
+            self._retain_background_task(task)
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async completions and pattern notifications even while sessions are idle.
 
@@ -1437,6 +1551,8 @@ class GatewayNotificationsMixin:
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
+                    if evt.get("type") == "async_delegation":
+                        self._queue_backlinkhub_progress_notice(evt)
                     (async_events if evt.get("type") == "async_delegation" else requeue).append(evt)
                 for evt in requeue:
                     _pr.completion_queue.put(evt)

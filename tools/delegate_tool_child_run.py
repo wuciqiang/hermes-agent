@@ -518,7 +518,11 @@ def _build_result_entry(
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
     if status == "failed":
-        if schema.valid is False and usable_summary:
+        if result.get("failed") or result.get("error"):
+            # Provider failures are not schema candidates, even when their
+            # final_response contains human-readable error text.
+            entry["error"] = result.get("error") or summary or "Subagent did not produce a response."
+        elif schema.valid is False and usable_summary:
             # The child DID respond; name the contract violation instead of the generic "no response" error.
             entry["error"] = (
                 "Final answer does not satisfy the declared output_schema" + (" (after 1 retry)." if schema.retries else ".")

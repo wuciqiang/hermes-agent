@@ -942,6 +942,8 @@ class TestRunSingleChildSchemaValidation:
         assert entry["status"] == "failed"
         assert entry["exit_reason"] == "server_error"
         assert entry["failure_reason"] == "server_error"
+        assert entry["error"] == "502 Bad Gateway"
+        assert "output_schema" not in entry["error"]
         assert "schema_retries" not in entry
         assert len(child.calls) == 1
 

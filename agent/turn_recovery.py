@@ -9,9 +9,12 @@ mutate ``agent`` / ``messages`` / ``api_messages`` in place. Logger name stays
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -846,7 +849,11 @@ def max_retries_exhausted_result(
     result.update({
         # Classified reason so callers (kanban worker in cli.py) can tell a quota wall
         # (``rate_limit`` / ``billing``) from a task failure.
-        "failure_reason": classified.reason.value,
+        "failure_reason": (
+            "provider_json_decode_error"
+            if isinstance(api_error, json.JSONDecodeError)
+            else classified.reason.value
+        ),
         # The classifier's own retry verdict — UI surfaces use this, not the reason string.
         "failure_retryable": bool(classified.retryable),
         # True when the billing verdict rests on an ambiguous body.
@@ -871,6 +878,18 @@ def log_api_error_attempt(
         "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
         retry_count, max_retries, error_type, agent._client_log_context(), _error_summary,
     )
+    if isinstance(api_error, json.JSONDecodeError):
+        frames = traceback.extract_tb(api_error.__traceback__)
+        recent_frames = frames[-4:]
+        frame_locations = ",".join(
+            f"{os.path.basename(frame.filename)}:{frame.lineno}"
+            for frame in recent_frames
+        ) or "unknown"
+        logger.warning(
+            "Provider JSON decode diagnostic: doc_length=%s pos=%s line=%s col=%s frames=%s",
+            len(api_error.doc or ""), api_error.pos, api_error.lineno,
+            api_error.colno, frame_locations,
+        )
 
     _provider = getattr(agent, "provider", "unknown")
     _base = getattr(agent, "base_url", "unknown")

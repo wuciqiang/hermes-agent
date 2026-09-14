@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 import pytest
 
+from agent.error_classifier import classify_api_error
 from agent.error_surface import (
     LAYER_AUTH,
     LAYER_BILLING,
@@ -15,6 +19,7 @@ from agent.error_surface import (
     build_error_surface_from_exception,
     build_error_surface_from_result,
 )
+from agent.turn_recovery import log_api_error_attempt, max_retries_exhausted_result
 
 
 # ── build_error_surface_from_result ──────────────────────────────────────
@@ -214,3 +219,86 @@ def test_exception_never_raises_on_weird_input():
 
     # Must not raise, whatever it returns.
     build_error_surface_from_exception(Hostile("x"))
+
+
+def _terminal_test_agent():
+    return SimpleNamespace(
+        _flush_status_buffer=lambda: None,
+        _summarize_api_error=lambda error: str(error),
+        _emit_status=lambda message: None,
+        _vprint=lambda message, force=False: None,
+        _buffer_vprint=lambda message: None,
+        _client_log_context=lambda: "provider=custom model=test-model",
+        _is_openrouter_url=lambda: False,
+        _dump_api_request_debug=lambda *args, **kwargs: None,
+        _persist_session=lambda *args: None,
+        log_prefix="",
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_reason"),
+    [
+        (json.JSONDecodeError("Extra data", '{"ok": true}\nSECRET', 13), "provider_json_decode_error"),
+        (ValueError("ordinary provider failure"), None),
+    ],
+)
+def test_max_retries_result_classifies_json_decode_without_changing_other_errors(error, expected_reason):
+    agent = _terminal_test_agent()
+    classified = classify_api_error(error, provider="custom", model="test-model")
+
+    result = max_retries_exhausted_result(
+        agent,
+        error,
+        classified,
+        max_retries=3,
+        is_rate_limited=False,
+        error_msg=str(error).lower(),
+        api_kwargs=None,
+        api_messages=[],
+        messages=[],
+        conversation_history=[],
+        api_call_count=3,
+        approx_tokens=10,
+        provider="custom",
+        base_url="https://example.invalid",
+        model="test-model",
+    )
+
+    assert result["failure_reason"] == (expected_reason or classified.reason.value)
+    assert result["failure_retryable"] is classified.retryable
+
+
+def test_json_decode_diagnostic_is_bounded_and_does_not_leak_response(caplog):
+    agent = _terminal_test_agent()
+    sentinel = "UNIQUE_PROVIDER_RESPONSE_SENTINEL"
+
+    def decode_nested(depth):
+        if depth:
+            return decode_nested(depth - 1)
+        return json.loads('{"ok": true}\n' + sentinel)
+
+    try:
+        decode_nested(5)
+    except json.JSONDecodeError as error:
+        doc_length, position, line, column = len(error.doc), error.pos, error.lineno, error.colno
+        with caplog.at_level("WARNING", logger="agent.conversation_loop"):
+            log_api_error_attempt(
+                agent,
+                error,
+                retry_count=1,
+                max_retries=3,
+                status_code=None,
+                elapsed_time=0.1,
+                api_messages=[],
+                approx_tokens=10,
+            )
+
+    diagnostic = next(record.message for record in caplog.records if "Provider JSON decode diagnostic" in record.message)
+    frame_text = diagnostic.split("frames=", 1)[1]
+    assert len(frame_text.split(",")) <= 4
+    assert "/" not in frame_text and "\\" not in frame_text
+    assert sentinel not in caplog.text
+    assert f"doc_length={doc_length}" in diagnostic
+    assert f"pos={position}" in diagnostic
+    assert f"line={line}" in diagnostic and f"col={column}" in diagnostic

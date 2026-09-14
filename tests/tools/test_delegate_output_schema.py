@@ -570,6 +570,18 @@ class TestFailedSegmentRecovery:
             self._entry(), untrusted
         ) is False
 
+    def test_recovers_raw_provider_json_decode_error_only_when_trace_is_safe(self):
+        entry = self._entry(
+            self._tool("skill_view"),
+            self._tool("backlinkhub_advance_submission_round"),
+            exit_reason="provider_json_decode_error",
+        )
+
+        assert failed_segment_can_continue(entry, self._progress()) is True
+
+        entry["tool_trace"].append(self._tool("terminal"))
+        assert failed_segment_can_continue(entry, self._progress()) is False
+
 
 class TestEmptyEgoCleanup:
     def test_uses_official_cli_and_returns_confirmed_close(self):
@@ -1467,8 +1479,8 @@ class TestBacklinkAutoContinuation:
         assert 'skill_view(name="ego-browser")' in built_goals[1]
         assert "不得重复加载" in built_goals[1]
         assert "第一项业务调用必须是" in built_goals[1]
-        assert "省略 target_count" in built_goals[1]
-        assert "run_id、site_id 和 target_count" not in built_goals[1]
+        assert "显式 target_count=6" in built_goals[1]
+        assert "首次 advance 必须传 target_count=6" in built_goals[1]
         entry = combined["results"][0]
         assert entry["continuation_segments"] == 2
         assert entry["cumulative_api_calls"] == 3

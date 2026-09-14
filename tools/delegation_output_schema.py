@@ -116,6 +116,10 @@ _TRANSPORT_RECOVERY_EXIT_REASONS = frozenset(
         "overloaded",
         "provider_timeout",
         "timeout",
+        # Some provider SDKs expose an invalid response body as a raw
+        # JSONDecodeError instead of their typed transport exception.  It is
+        # recoverable only through the same trace-gated path below.
+        "provider_json_decode_error",
     }
 )
 

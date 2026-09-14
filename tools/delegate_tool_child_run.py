@@ -720,6 +720,12 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
+        if isinstance(exc, json.JSONDecodeError):
+            # A few provider SDK paths leak malformed response bodies as the
+            # stdlib exception. Keep the failure typed so the backlink
+            # continuation can apply its existing side-effect trace gate.
+            _error_entry["failure_reason"] = "provider_json_decode_error"
+            _error_entry["failure_retryable"] = True
         self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
         close_deferred = is_timeout and not future.done()
         if close_deferred:

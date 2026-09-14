@@ -1804,16 +1804,23 @@ def delegate_task(
             space_note = (
                 f"首个浏览器事务复用数字 Ego 空间 {space_id}，本段继续时不要提前关闭。"
             )
+        target_note = (
+            f"本轮显式 target_count={target}；首次 advance 必须传 target_count={target}，"
+            "不得回退到站点 daily_quota。"
+            if isinstance(target, int) and not isinstance(target, bool) and target > 0
+            else "本轮没有可验证的显式 target_count；仅在 BacklinkHub 已持久化目标时省略该参数。"
+        )
         return (
             "继续：复用 BacklinkHub 同一外链轮次，不创建新轮次。"
             f"site_id={site_id}；run_id={run_id}；target={target}；"
-            f"ego_task_space_id={space_id}；ego_cleanup={cleanup}。"
+            f"ego_task_space_id={space_id}；ego_cleanup={cleanup}。{target_note}"
             "先用 skill_view(name=\"backlink-round-execution\", "
             "file_path=\"references/luna-worker.md\") 加载叶子参考一次，再用 "
             "skill_view(name=\"ego-browser\") 加载官方技能一次，不得重复加载。"
             "随后第一项业务调用必须是同一 run_id、site_id 的 "
-            "backlinkhub_advance_submission_round，并省略 target_count；由 BacklinkHub "
-            f"恢复目标和未回写候选。{space_note}之后严格执行参考中的 "
+            "backlinkhub_advance_submission_round；若上面给出显式 target_count，必须原样传入，"
+            "否则由 BacklinkHub 恢复已持久化目标和未回写候选。"
+            f"{space_note}之后严格执行参考中的 "
             "ADVANCE -> BROWSE -> RECORD -> ADVANCE；不重复最终提交。"
         )
 

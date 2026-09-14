@@ -19,8 +19,10 @@ from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
     DELEGATE_TASK_SCHEMA,
+    _build_dynamic_schema_overrides,
     _cleanup_empty_agent_ego_space,
     _run_single_child,
+    _validated_completion_metadata,
     delegate_task,
 )
 from tools.delegation_output_schema import (
@@ -199,6 +201,17 @@ class TestPromptPlumbing:
 
 
 class TestContinuationBoundary:
+    def test_validated_metadata_extracts_one_level_single_site_summary(self):
+        metadata = _validated_completion_metadata(
+            json.dumps({"summary": _round_payload()}),
+            schema_valid=True,
+            exit_reason="max_iterations",
+        )
+
+        assert metadata["site_id"] == "site_thesitemath"
+        assert metadata["run_id"] == "round_test"
+        assert metadata["target"] == 6
+
     @staticmethod
     def _unfinished(**overrides):
         payload = {
@@ -638,6 +651,13 @@ class TestToolSchemaSurface:
         assert "output_schema" not in props
         task_props = props["tasks"]["items"]["properties"]
         assert task_props["output_schema"]["type"] == "object"
+
+    def test_backlink_tasks_description_requires_one_site_per_task(self):
+        description = _build_dynamic_schema_overrides()["parameters"]["properties"][
+            "tasks"
+        ]["description"]
+        assert "each task must cover exactly one site" in description
+        assert "split multi-site work into one task per site" in description
 
 
 # ---------------------------------------------------------------------------

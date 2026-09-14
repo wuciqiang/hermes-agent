@@ -136,6 +136,15 @@ def _validated_completion_metadata(
         return metadata
     if not isinstance(payload, dict):
         return metadata
+    nested = payload.get("summary")
+    if (
+        isinstance(nested, dict)
+        and any(key in nested for key in _CONTINUATION_RESULT_FIELDS)
+    ):
+        # Unwrap one result envelope only when it contains known continuation
+        # facts. A multi-site aggregate must never become guessed site/run
+        # metadata.
+        payload = nested
     payload = normalize_completion_payload(payload)
     metadata["exit_reason"] = normalize_completion_exit_reason(
         payload,
@@ -2530,7 +2539,10 @@ def _build_tasks_param_description() -> str:
         f"The task(s), up to {max_children} in parallel for this user (set "
         "via delegation.max_concurrent_children). Each entry spawns one "
         "subagent with isolated context and terminal session; a single task "
-        "is a one-entry array. Required when spawning."
+        "is a one-entry array. Required when spawning. For "
+        "tool_profile=backlinkhub, each task must cover exactly one site; "
+        "split multi-site work into one task per site so independent "
+        "completions remain attributable."
     )
 
 def _build_dynamic_schema_overrides() -> dict:

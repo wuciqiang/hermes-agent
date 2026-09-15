@@ -78,12 +78,9 @@ def _normalize_task_list(
         tasks = None
 
     if tasks and isinstance(tasks, list):
-        if len(tasks) > max_children:
-            return None, (
-                f"Too many tasks: {len(tasks)} provided, but max_concurrent_children is {max_children}. "
-                f"Either reduce the task count, split into multiple delegate_task calls, or increase "
-                f"delegation.max_concurrent_children in config.yaml."
-            )
+        # ``max_children`` limits workers running at once.  The executor queues
+        # the remaining tasks, so a batch may legitimately be larger than the
+        # concurrency setting.
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [{"goal": goal, "context": context, "role": top_role}]

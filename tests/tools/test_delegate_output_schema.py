@@ -25,6 +25,7 @@ from tools.delegate_tool import (
     _validated_completion_metadata,
     delegate_task,
 )
+from tools.delegate_tool_tasks import _normalize_task_list
 from tools.delegation_output_schema import (
     append_output_contract,
     build_retry_message,
@@ -632,6 +633,16 @@ class TestEmptyEgoCleanup:
 
 
 class TestToolSchemaSurface:
+    def test_batch_larger_than_concurrency_limit_is_queued(self):
+        tasks = [{"goal": f"Complete independent task number {index}"} for index in range(3)]
+
+        normalized, error = _normalize_task_list(
+            None, None, tasks, None, "leaf", max_children=1
+        )
+
+        assert error is None
+        assert normalized == tasks
+
     def test_output_schema_on_task_items(self):
         item_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"][
             "items"

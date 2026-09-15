@@ -205,7 +205,8 @@ class TestDelegateRequirements(unittest.TestCase):
             definition = registry.get_definitions({"delegate_task"})[0]["function"]
 
         for parameters in (overrides["parameters"], definition["parameters"]):
-            self.assertIn("up to 7", parameters["properties"]["tasks"]["description"])
+            self.assertIn("up to 7 running concurrently", parameters["properties"]["tasks"]["description"])
+            self.assertIn("larger batches queue", parameters["properties"]["tasks"]["description"])
             self.assertNotIn("role", parameters["properties"])
         # Depth ceiling now rides the depth-derived recursion rule in the
         # top-level text (only rendered when nesting is available).

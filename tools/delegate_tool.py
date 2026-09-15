@@ -2536,8 +2536,9 @@ def _build_tasks_param_description() -> str:
     except Exception:
         max_children = _DEFAULT_MAX_CONCURRENT_CHILDREN
     return (
-        f"The task(s), up to {max_children} in parallel for this user (set "
-        "via delegation.max_concurrent_children). Each entry spawns one "
+        f"The task(s), with up to {max_children} running concurrently (set "
+        "via delegation.max_concurrent_children); larger batches queue "
+        "remaining tasks until a worker is free. Each entry spawns one "
         "subagent with isolated context and terminal session; a single task "
         "is a one-entry array. Required when spawning. For "
         "tool_profile=backlinkhub, each task must cover exactly one site; "

@@ -1376,7 +1376,7 @@ def test_batch_model_rejection_notice_requires_configured_model_in_text(monkeypa
 # together, and the units of one call share ONE capacity slot.
 # ---------------------------------------------------------------------------
 
-def _grouped_fanout(monkeypatch, tasks, gates):
+def _grouped_fanout(monkeypatch, tasks, gates, activity=None):
     """delegate_task(tasks) in the background with gated fake children; returns the parsed handle."""
     from unittest.mock import MagicMock
     import tools.delegate_tool as dt
@@ -1389,14 +1389,27 @@ def _grouped_fanout(monkeypatch, tasks, gates):
     parent._active_children_lock = None
 
     def child(task_index, goal, child=None, parent_agent=None, **kw):
-        gates[task_index].wait(timeout=60)
-        return {"task_index": task_index, "status": "completed", "summary": f"done: {goal}", "api_calls": 1,
-                "duration_seconds": 0.1, "model": "m", "exit_reason": "completed"}
+        if activity is not None:
+            with activity["lock"]:
+                activity["active"] += 1
+                activity["max_active"] = max(activity["max_active"], activity["active"])
+                activity["started"].append(task_index)
+        try:
+            gates[task_index].wait(timeout=60)
+            return {"task_index": task_index, "status": "completed", "summary": f"done: {goal}", "api_calls": 1,
+                    "duration_seconds": 0.1, "model": "m", "exit_reason": "completed"}
+        finally:
+            if activity is not None:
+                with activity["lock"]:
+                    activity["active"] -= 1
 
     def build(**kw):
         c = MagicMock()
         c._delegate_role = "leaf"
         c._subagent_id = f"s{kw['task_index']}"
+        c._interrupt_requested = False
+        if activity is not None:
+            activity.setdefault("children", {})[kw["task_index"]] = c
         return c
 
     creds = {"model": "m", "provider": None, "base_url": None, "api_key": None, "api_mode": None, "command": None,
@@ -1476,37 +1489,84 @@ def test_multi_task_call_is_one_completion_unless_independent_completions(monkey
     assert sorted(r["task_index"] for r in evt["results"]) == [0, 1, 2]
 
 
-def test_units_beyond_slot_count_still_start_and_are_not_stalled_while_queued(monkeypatch):
-    """Units of one call share a slot, so live units can exceed the slot cap; every unit must still get a worker,
-    and a unit must not be judged stalled for time it spent waiting to start."""
-    _fast_stale_monitor(monkeypatch, idle=0.3, grace=0.2)
-    started, release = [], threading.Event()
-    frozen = lambda: (((0, None, None),), False)  # noqa: E731 - child never progresses => token never changes
+def test_units_sharing_one_slot_queue_without_child_overlap_or_stale(monkeypatch):
+    """The real independent-completion path queues eight children behind max_concurrent_children=1."""
+    import tools.delegate_tool as dt
 
-    def blocker(uid):
-        def run():
-            started.append(uid)
-            release.wait(timeout=10)
-            return {"results": [{"task_index": 0, "status": "completed"}], "total_duration_seconds": 0}
-        return run
+    monkeypatch.setattr(
+        dt,
+        "_load_config",
+        lambda: {"independent_completions": True, "max_concurrent_children": 1},
+    )
+    gates = [threading.Event() for _ in range(8)]
+    activity = {"lock": threading.Lock(), "active": 0, "max_active": 0, "started": []}
+    tasks = [{"goal": f"process independent site number {index}"} for index in range(8)]
+    handle = _grouped_fanout(monkeypatch, tasks, gates, activity)
+    unit_id_by_index = {unit["task_indexes"][0]: unit["delegation_id"] for unit in handle["units"]}
 
-    common = dict(goals=["x"], context=None, toolsets=None, role="leaf", model="m", session_key="", max_async_children=1)
-    ad.dispatch_async_delegation_batch(delegation_id="deleg_c-1", runner=blocker("c-1"), progress_fn=frozen, **common)
-    ad.dispatch_async_delegation_batch(delegation_id="deleg_c-2", runner=blocker("c-2"), slot_key="deleg_c-1", **common)
     deadline = time.monotonic() + 2.0
-    while len(started) < 2 and time.monotonic() < deadline:
+    while not activity["started"] and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert sorted(started) == ["c-1", "c-2"]  # second unit started despite a 1-slot pool
-
-    # A unit whose runner has NOT started yet must not accrue stall time: pin the pool so it stays queued.
-    monkeypatch.setattr(ad, "_get_executor", lambda n: ad._executor)
-    ad.dispatch_async_delegation_batch(delegation_id="deleg_q", runner=blocker("q"), progress_fn=frozen,
-                                       **{**common, "max_async_children": 3})
-    time.sleep(0.7)  # > idle + grace with the unit still queued
+    assert len(activity["started"]) == 1
     with ad._records_lock:
-        assert ad._records["deleg_q"]["status"] == "running"
-    assert "q" not in started
-    release.set()
+        queued_ids = [uid for index, uid in unit_id_by_index.items() if index not in activity["started"]]
+        assert all(ad._records[uid].get("_started") is not True for uid in queued_ids)
+        stalled, expired, _ = ad._sweep_stale_locked(time.time() + ad._STALE_IDLE_SECONDS + 1)
+    assert stalled == [] and expired == []
+
+    completed = []
+    while len(completed) < 8:
+        deadline = time.monotonic() + 2.0
+        while len(activity["started"]) <= len(completed) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        index = activity["started"][len(completed)]
+        gates[index].set()
+        event = _drain_for(unit_id_by_index[index])
+        assert event is not None
+        assert [item["task_index"] for item in event["results"]] == [index]
+        completed.append(index)
+
+    assert sorted(completed) == list(range(8))
+    assert activity["max_active"] == 1
+
+
+def test_independent_units_use_configured_capacity_above_one(monkeypatch):
+    """The per-call limiter honors max_concurrent_children=2 instead of forcing every call serial."""
+    import tools.delegate_tool as dt
+
+    monkeypatch.setattr(
+        dt,
+        "_load_config",
+        lambda: {"independent_completions": True, "max_concurrent_children": 2},
+    )
+    gates = [threading.Event() for _ in range(3)]
+    activity = {"lock": threading.Lock(), "active": 0, "max_active": 0, "started": []}
+    tasks = [{"goal": f"process parallel site number {index}"} for index in range(3)]
+    handle = _grouped_fanout(monkeypatch, tasks, gates, activity)
+    try:
+        deadline = time.monotonic() + 2.0
+        while len(activity["started"]) < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        started = set(activity["started"])
+        assert len(started) == 2
+        assert activity["max_active"] == 2
+        cancelled = (set(range(3)) - started).pop()
+        activity["children"][cancelled]._interrupt_requested = True
+
+        for gate in gates:
+            gate.set()
+        expected_ids = {unit["delegation_id"] for unit in handle["units"]}
+        completed_ids = set()
+        while len(completed_ids) < len(expected_ids):
+            event = _drain_one()
+            assert event is not None
+            completed_ids.add(event["delegation_id"])
+        assert completed_ids == expected_ids
+        assert set(activity["started"]) == started
+        activity["children"][cancelled].close.assert_called_once_with()
+    finally:
+        for gate in gates:
+            gate.set()
 
 
 def test_child_finished_before_crash_is_recovered_with_its_result(tmp_path):

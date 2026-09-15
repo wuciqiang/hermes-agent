@@ -670,6 +670,14 @@ def active_task_count() -> int:
             for r in _records.values() if r.get("status") in {"running", "finalizing"})
 
 
+def mark_delegation_started(delegation_id: str) -> None:
+    """Arm stale monitoring when a queued unit starts its first child."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None and record.get("status") == "running" and not record.get("_started"):
+            record.update(_started=True, _progress_ts=time.time())
+
+
 def _session_records(statuses, session_key: str, origin_ui_session_id: str, parent_session_id: str,
                      platform: str = "", chat_id: str = "", user_id: str = "") -> list:
     """Records in ``statuses`` owned by a session: any non-empty selector claims the
@@ -749,6 +757,7 @@ def _dispatch(
     parent_session_id: Optional[str], runner: Callable[[], Dict[str, Any]], origin_ui_session_id: str,
     origin_session_id: str, interrupt_fn: Optional[Callable[[], None]], max_async_children: int,
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
+    externally_started: bool = False,
     task_indexes: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
@@ -789,11 +798,12 @@ def _dispatch(
     def _worker() -> None:
         result: Dict[str, Any] = {}
         status = "error"
-        with _records_lock:
-            rec = _records.get(delegation_id)
-            if rec is not None:
-                # The stall clock starts when the runner starts; a unit queued behind a full pool is not stalled.
-                rec.update(_started=True, _progress_ts=time.time())
+        if not externally_started:
+            with _records_lock:
+                rec = _records.get(delegation_id)
+                if rec is not None:
+                    # The stall clock starts when the runner starts; a unit queued behind a full pool is not stalled.
+                    rec.update(_started=True, _progress_ts=time.time())
         try:
             result = runner() or {}
             status = classify(result)
@@ -851,7 +861,7 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "", origin_session_id: str = "", interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
-    task_indexes: Optional[List[int]] = None,
+    task_indexes: Optional[List[int]] = None, externally_started: bool = False,
 ) -> Dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -869,7 +879,7 @@ def dispatch_async_delegation_batch(
         parent_session_id=parent_session_id, runner=runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
-        task_indexes=task_indexes,
+        task_indexes=task_indexes, externally_started=externally_started,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "

@@ -8,13 +8,14 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, wait as _cf_wait
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from tools.async_delegation import _new_delegation_id, record_unit_child
-from tools.delegate_tool_child_run import _detach_child, _fabricated_entry, _signal_child_stop
+from tools.delegate_tool_child_run import _close_child, _detach_child, _fabricated_entry, _signal_child_stop
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _clean_error_text, _print_completion_line, _quiet, format_batch_tag,
 )
@@ -22,6 +23,33 @@ from tools.delegate_tool_registry import _capture_gateway_steer_authority
 from tools.delegate_tool_results import _finalize_child_results
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
+
+
+class _ChildCapacity:
+    """FIFO per-call limit shared by every independent completion unit."""
+
+    def __init__(self, limit: int):
+        self._limit = max(1, limit)
+        self._condition = threading.Condition()
+        self._next_ticket = 0
+        self._next_to_admit = 0
+        self._active = 0
+
+    def acquire(self) -> None:
+        with self._condition:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            self._condition.wait_for(
+                lambda: ticket == self._next_to_admit and self._active < self._limit
+            )
+            self._next_to_admit += 1
+            self._active += 1
+            self._condition.notify_all()
+
+    def release(self) -> None:
+        with self._condition:
+            self._active -= 1
+            self._condition.notify_all()
 
 
 @dataclass
@@ -44,9 +72,15 @@ class _Batch:
     origin_owner_transport: Any
     origin_owner_session_record: Any
     overall_start: float
+    child_capacity: Optional[_ChildCapacity] = None
+    on_child_start: Optional[Callable[[], None]] = None
     # Set on per-group units carved out by ``_dispatch_background``; None for the whole batch / ungrouped units.
     group: Optional[str] = None
     unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
+
+    def __post_init__(self) -> None:
+        if self.child_capacity is None:
+            self.child_capacity = _ChildCapacity(self.max_children)
 
     def owner_kwargs(self) -> Dict[str, Any]:
         """Steer/stop authority of the originating session, passed to every child run."""
@@ -57,7 +91,23 @@ class _Batch:
 
     def run_child(self, i: int, task: Dict[str, Any], child: Any) -> Dict[str, Any]:
         from tools.delegate_tool import _run_single_child
-        return _run_single_child(task_index=i, goal=task["goal"], child=child, parent_agent=self.parent_agent, **self.owner_kwargs())
+        capacity = self.child_capacity
+        assert capacity is not None
+        capacity.acquire()
+        try:
+            if getattr(child, "_interrupt_requested", False) is True:
+                entry = _fabricated_entry(i, "interrupted", "Async delegation cancelled before child start", child)
+                _detach_child(self.parent_agent, child)
+                _close_child(child, "Failed to close cancelled queued child")
+                return entry
+            if self.on_child_start is not None:
+                self.on_child_start()
+            return _run_single_child(
+                task_index=i, goal=task["goal"], child=child,
+                parent_agent=self.parent_agent, **self.owner_kwargs(),
+            )
+        finally:
+            capacity.release()
 
 
 def _announce_batch(parent_agent, n_tasks: int, live_deleg_id: Optional[str]) -> None:
@@ -284,7 +334,8 @@ _BACKGROUND_NOTES = {
         "stop with a one-line status. Do not poll its transcript or artifacts to wait for it."
     ),
     "many": (
-        "{n} subagents are running in parallel in the background as {k} completion unit(s); each unit's results "
+        "{n} subagents are running in the background as {k} completion unit(s), with concurrency limited by "
+        "delegation.max_concurrent_children; each unit's results "
         "re-enter the conversation as their own new message when THAT unit finishes. Results are delivered only "
         "after you END YOUR TURN: do anything that does not depend on them, then stop with a one-line status. Do not "
         "poll transcripts or artifacts to wait for them."
@@ -342,12 +393,14 @@ def _units_of(batch: _Batch) -> List[_Batch]:
 
 def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str], routing: dict) -> dict:
     """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
-    from tools.async_delegation import dispatch_async_delegation_batch
+    from tools.async_delegation import dispatch_async_delegation_batch, mark_delegation_started
     child_agents = [c for (_, _, c) in unit.children]
 
     def _interrupt():
         for c in child_agents:
             _signal_child_stop(c, "Async delegation cancelled")
+
+    unit.on_child_start = lambda: mark_delegation_started(unit.unit_id or "")
 
     return dispatch_async_delegation_batch(
         # Call-wide goals: completion formatting indexes them by task_index.
@@ -357,7 +410,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
         interrupt_fn=_interrupt, delegation_id=unit_id, slot_key=slot_key,
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
-        progress_fn=lambda: _batch_progress_token(child_agents), **routing,
+        progress_fn=lambda: _batch_progress_token(child_agents), externally_started=True, **routing,
     )
 
 def _dispatch_background(batch: _Batch) -> str:

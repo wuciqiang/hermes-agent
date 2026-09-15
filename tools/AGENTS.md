@@ -83,8 +83,9 @@ concurrency capped by `delegation.max_concurrent_children`, default 3). A backgr
 completion by default; with `delegation.independent_completions` it is split into completion **units**
 (`delegate_tool_dispatch._units_of`): tasks sharing a `group` join and report together; each ungrouped
 task reports alone as it finishes. Units of one call share ONE pool slot (`slot_key` in
-`async_delegation._dispatch`) — never count units against capacity; the executor is sized by live UNITS
-and the stall clock arms when the runner starts, so a queued unit is never judged stalled. Roles: `leaf` (default;
+`async_delegation._dispatch`) — never count units against capacity; the executor is sized by live UNITS,
+while child execution shares the call's configured capacity. The stall clock arms only after a child obtains
+capacity, so a queued unit is never judged stalled. Roles: `leaf` (default;
 no `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`; keeps `execute_code`) and
 `orchestrator` (keeps `delegate_task`; gated by `delegation.orchestrator_enabled`, bounded by
 `delegation.max_spawn_depth`, default 2). Config knobs under `delegation:`:

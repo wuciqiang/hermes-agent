@@ -240,11 +240,6 @@ _SYNC_FALLBACK_NOTES = {
         "one-shot runner such as `hermes -z`, a cron job, a Kanban "
         "worker, or a stateless HTTP endpoint). The subagent(s) ran SYNCHRONOUSLY and the result is included above."
     ),
-    "at_capacity": (
-        "The background delegation pool was at capacity (delegation.max_concurrent_children), so the subagent(s) ran "
-        "SYNCHRONOUSLY and the result is included above. Raise "
-        "delegation.max_concurrent_children in config.yaml to allow more concurrent background delegations."
-    ),
 }
 
 def _run_sync_with_note(batch: _Batch, reason: str) -> str:
@@ -253,6 +248,35 @@ def _run_sync_with_note(batch: _Batch, reason: str) -> str:
     if isinstance(result, dict):
         result["note"] = _SYNC_FALLBACK_NOTES[reason]
     return json.dumps(result, ensure_ascii=False)
+
+
+def _reject_unstarted_batch(batch: _Batch, error: Any) -> str:
+    """Release a batch that the async registry refused before any child ran."""
+    from tools.delegation_live_log import update_manifest_statuses
+
+    child_by_index = {i: child for i, _, child in batch.children}
+    results = []
+    message = str(error or "Async delegation capacity reached")
+    for i, task in enumerate(batch.task_list):
+        child = child_by_index.get(i)
+        if child is not None:
+            _detach_child(batch.parent_agent, child)
+            _close_child(child, "Failed to close capacity-rejected child")
+        entry = _fabricated_entry(i, "rejected", message, child)
+        results.append(entry)
+        if i < len(batch.live_writers) and batch.live_writers[i] is not None:
+            with _quiet("Live transcript reject finalize failed", exc_info=True):
+                batch.live_writers[i].finalize(entry)
+    update_manifest_statuses(batch.live_deleg_id, results)
+    return json.dumps(
+        {
+            "status": "rejected",
+            "error": message,
+            "count": len(batch.task_list),
+            "goals": [task["goal"] for task in batch.task_list],
+        },
+        ensure_ascii=False,
+    )
 
 def _resolve_async_wake_sid(origin_wake_sid: str) -> Optional[str]:
     """Wake target for a detached batch, or None to force synchronous execution.
@@ -418,8 +442,8 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
 def _dispatch_background(batch: _Batch) -> str:
     """Dispatch the call as independent async units (see ``_units_of``) and return the tool result JSON. Every unit
     of one call shares ONE pool slot (``slot_key``), so grouping never changes capacity accounting. Falls back to
-    running synchronously (with an explanatory ``note``) when the session cannot receive detached completions or the
-    async pool is at capacity."""
+    synchronous execution only when the session cannot receive detached completions. When the async pool is at
+    capacity, the unstarted children are released and the call is rejected."""
     from tools.delegate_tool import _get_max_async_children
     wake_sid = _resolve_async_wake_sid(batch.origin_wake_sid)
     if wake_sid is None:
@@ -453,10 +477,10 @@ def _dispatch_background(batch: _Batch) -> str:
             continue
         if not dispatched:
             logger.info(
-                "delegate_task: async pool at capacity (%s); running the whole batch synchronously instead.",
+                "delegate_task: async pool at capacity (%s); rejecting the new batch.",
                 dispatch.get("error", "rejected"),
             )
-            return _run_sync_with_note(batch, "at_capacity")
+            return _reject_unstarted_batch(batch, dispatch.get("error"))
         # Later units of an admitted call share its slot and cannot be capacity-rejected; a scheduler failure runs
         # the unit inline so no task is silently dropped.
         logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.", k + 1, len(units), dispatch.get("error"))

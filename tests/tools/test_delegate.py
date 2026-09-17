@@ -1948,6 +1948,45 @@ class TestAsyncCapUnified(unittest.TestCase):
         from tools.delegate_tool import _get_max_async_children
         self.assertEqual(_get_max_async_children(), 15)
 
+    def test_capacity_rejection_closes_unstarted_batch_instead_of_running_it(self):
+        from tools.delegate_tool_dispatch import _Batch, _dispatch_background
+
+        parent = _make_mock_parent()
+        parent.session_id = "parent-capacity"
+        child = MagicMock()
+        child._delegate_role = "leaf"
+        parent._active_children = [child]
+        writer = MagicMock()
+        task = {"goal": "Run one capacity-bound delegated task"}
+        batch = _Batch(
+            [task], [(0, task, child)], parent, {"model": "test-model"},
+            None, "leaf", 1, "deleg_capacity", [writer], ["task-0.log"],
+            "wake-session", "ui-session", None, None, time.monotonic(),
+        )
+        capacity_error = "Async delegation capacity reached (1 running). Wait for one to finish."
+
+        with (
+            patch("tools.delegate_tool_dispatch._resolve_async_wake_sid", return_value="wake-session"),
+            patch("tools.delegate_tool_dispatch._resolve_async_session_key", return_value=("owner", "ui-session")),
+            patch("tools.delegate_tool_dispatch._units_of", return_value=[batch]),
+            patch(
+                "tools.delegate_tool_dispatch._dispatch_unit",
+                return_value={"status": "rejected", "error": capacity_error},
+            ),
+            patch("tools.delegate_tool_dispatch._execute_and_aggregate") as run_batch,
+            patch("tools.delegation_live_log.update_manifest_statuses") as update_manifest,
+        ):
+            result = json.loads(_dispatch_background(batch))
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["error"], capacity_error)
+        run_batch.assert_not_called()
+        child.close.assert_called_once_with()
+        writer.finalize.assert_called_once()
+        self.assertEqual(writer.finalize.call_args.args[0]["status"], "rejected")
+        update_manifest.assert_called_once()
+        self.assertNotIn(child, parent._active_children)
+
 # =========================================================================
 # max_spawn_depth clamping
 # =========================================================================

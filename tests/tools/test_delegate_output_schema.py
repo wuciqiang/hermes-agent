@@ -1233,6 +1233,73 @@ def _run_auto_continuation_scenario(payloads):
     return handle, captured["combined"], dispatched, built_goals
 
 
+def test_auto_continuation_capacity_rejection_does_not_start_a_child():
+    parent = _make_mock_parent()
+    parent.session_id = "parent-capacity"
+    parent._current_task_id = "parent-task"
+    parent._current_turn_id = "turn-test"
+    writer = MagicMock()
+    child = MagicMock()
+    child._delegate_role = "leaf"
+    build_child = MagicMock(return_value=child)
+    capacity_error = "Async delegation capacity reached (1 running). Wait for one to finish."
+    credentials = {
+        "provider": None,
+        "model": "gpt-5.6-luna",
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+        "request_overrides": None,
+        "max_output_tokens": None,
+        "command": None,
+        "args": None,
+    }
+
+    with (
+        patch(
+            "tools.delegate_tool._load_config",
+            return_value={
+                "max_iterations": 5,
+                "tool_profiles": {"backlinkhub": ["terminal"]},
+            },
+        ),
+        patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+        patch("tools.delegate_tool._build_child_preserving_parent_tools", build_child),
+        patch(
+            "tools.delegation_live_log.create_live_transcripts",
+            return_value=("deleg_capacity", [writer], ["task-0.log"]),
+        ),
+        patch(
+            "tools.async_delegation.dispatch_async_delegation_batch",
+            return_value={"status": "rejected", "error": capacity_error},
+        ),
+        patch("gateway.session_context.async_delivery_supported", return_value=True),
+        patch("gateway.session_context.get_session_env", return_value=""),
+        patch("tools.approval.get_current_session_key", return_value="owner-test"),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+        patch("tools.delegation_live_log.update_manifest_statuses") as update_manifest,
+    ):
+        result = json.loads(
+            delegate_task(
+                goal="submit backlinks for one site",
+                tool_profile="backlinkhub",
+                background=True,
+                output_schema=ROUND_SCHEMA,
+                _auto_continue=True,
+                parent_agent=parent,
+            )
+        )
+
+    assert result["status"] == "rejected"
+    assert result["error"] == capacity_error
+    build_child.assert_called_once()
+    child.run_conversation.assert_not_called()
+    child.close.assert_called_once_with()
+    writer.finalize.assert_called_once()
+    assert writer.finalize.call_args.args[0]["status"] == "rejected"
+    update_manifest.assert_called_once()
+
+
 class TestBacklinkAutoContinuation:
     def test_real_continuation_builder_uses_current_child_contract(self, monkeypatch, tmp_path):
         """Both initial and resumed segments must cross the real child builder.

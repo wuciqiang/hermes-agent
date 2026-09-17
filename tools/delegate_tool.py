@@ -58,7 +58,13 @@ from tools.delegate_tool_config import (  # noqa: F401
     _resolve_child_runtime, _resolve_delegation_credentials,
     _subagent_auto_approve, _subagent_auto_deny,
 )
-from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
+from tools.delegate_tool_dispatch import (
+    _Batch,
+    _announce_batch,
+    _capture_origin,
+    _reject_unstarted_batch,
+    _run_batch,
+)
 from tools.delegate_tool_progress import (  # noqa: F401
     DelegateEvent, SUBAGENT_FAILURE_STATUSES, _batch_prefix, _build_child_progress_callback,
     _build_child_system_prompt, _clean_error_text, _emit_parent_console, _quiet, _resolve_workspace_hint,
@@ -1519,6 +1525,7 @@ def delegate_task(
             # missing from PATH) refuse the spawn loudly (#80450).
             return tool_error(str(exc))
         children.append((i, t, child))
+    batch.children = children
 
     # The async unit may replace its single child after a native iteration
     # boundary.  Keep the interrupt/progress closures pointed at this mutable
@@ -2436,29 +2443,14 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        # Pool at capacity / schedule failure: do not run inline, because that
+        # would bypass the same concurrency limit that rejected this batch.
         logger.info(
-            "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
+            "delegate_task: async pool at capacity (%s); rejecting the new "
+            "batch.",
             dispatch.get("error", "rejected"),
         )
-        _cap_runner = (
-            _run_auto_continuation(honor_parent_interrupt=True)
-            if _auto_continue_enabled
-            else _execute_and_aggregate()
-        )
-        _cap_result = _strip_internal_completion_metadata(_cap_runner)
-        if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
-        return json.dumps(_cap_result, ensure_ascii=False)
+        return _reject_unstarted_batch(batch, dispatch.get("error"))
 
     # ----- Synchronous path -----
     return json.dumps(

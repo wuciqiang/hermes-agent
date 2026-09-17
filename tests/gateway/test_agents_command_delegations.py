@@ -45,6 +45,19 @@ class _Event:
 
 
 @pytest.mark.asyncio
+async def test_agents_command_shows_queued_delegation(monkeypatch):
+    monkeypatch.setattr(ad, "list_async_delegations", lambda: [{
+        "delegation_id": "queued-child", "status": "queued", "goal": "waiting child",
+    }])
+    runner = _make_runner()
+
+    out = await runner._handle_agents_command(_Event())
+
+    assert "queued-child" in out
+    assert "queued" in out
+
+
+@pytest.mark.asyncio
 async def test_agents_command_marks_stalling_delegation(monkeypatch):
     monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)
     monkeypatch.setattr(ad, "_STALE_IDLE_SECONDS", 0.1)
@@ -82,5 +95,4 @@ async def test_agents_command_marks_stalling_delegation(monkeypatch):
     assert res["delegation_id"] in out
     assert "stalling" in out
     assert "no progress" in out
-
 

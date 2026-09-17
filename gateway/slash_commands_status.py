@@ -410,7 +410,7 @@ class GatewayStatusCommandsMixin:
         # tool, seconds since last activity.
         from tools.async_delegation import list_async_delegations
         delegations = [d for d in _quiet_sync(list_async_delegations, [])
-                       if d.get("status") in ("running", "stalling", "finalizing")]
+                       if d.get("status") in ("queued", "running", "stalling", "finalizing")]
 
         def _agent_row(idx_row):
             idx, row = idx_row

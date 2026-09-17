@@ -1513,6 +1513,9 @@ def test_units_sharing_one_slot_queue_without_child_overlap_or_stale(monkeypatch
         assert all(ad._records[uid].get("_started") is not True for uid in queued_ids)
         stalled, expired, _ = ad._sweep_stale_locked(time.time() + ad._STALE_IDLE_SECONDS + 1)
     assert stalled == [] and expired == []
+    visible = {item["delegation_id"]: item for item in ad.list_async_delegations()}
+    assert all(visible[uid]["status"] == "queued" for uid in queued_ids)
+    assert all("seconds_since_progress" not in visible[uid] for uid in queued_ids)
 
     completed = []
     while len(completed) < 8:
@@ -1525,6 +1528,13 @@ def test_units_sharing_one_slot_queue_without_child_overlap_or_stale(monkeypatch
         assert event is not None
         assert [item["task_index"] for item in event["results"]] == [index]
         completed.append(index)
+        if len(completed) < 8:
+            deadline = time.monotonic() + 2.0
+            while len(activity["started"]) <= len(completed) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            started_id = unit_id_by_index[activity["started"][len(completed)]]
+            visible = {item["delegation_id"]: item for item in ad.list_async_delegations()}
+            assert visible[started_id]["status"] == "running"
 
     assert sorted(completed) == list(range(8))
     assert activity["max_active"] == 1

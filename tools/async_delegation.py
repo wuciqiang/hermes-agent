@@ -1250,7 +1250,12 @@ def list_async_delegations() -> List[Dict[str, Any]]:
         for r in _records.values():
             item = {k: v for k, v in r.items() if k not in {"interrupt_fn", "progress_fn"} and not k.startswith("_")}
             status = r.get("status")
-            if status in _ACTIVE_STATES:
+            # A unit occupies a live slot before its first child obtains the
+            # per-call capacity gate. Expose that distinction to UIs without
+            # changing the internal lifecycle state used by the scheduler.
+            if status == "running" and not r.get("_started"):
+                item["status"] = "queued"
+            if status in _ACTIVE_STATES and r.get("_started"):
                 if r.get("_progress_ts"):
                     item["seconds_since_progress"] = round(now - r["_progress_ts"], 1)
                 if callable(r.get("progress_fn")):

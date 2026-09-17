@@ -329,13 +329,13 @@ def _batch_progress_token(child_agents: List[Any]) -> tuple:
 
 _BACKGROUND_NOTES = {
     "one": (
-        "Subagent is running in the background; its full result re-enters the conversation as a new message when it "
+        "Subagent is scheduled in the background; its full result re-enters the conversation as a new message when it "
         "finishes. Results are delivered only after you END YOUR TURN: do anything that does not depend on it, then "
         "stop with a one-line status. Do not poll its transcript or artifacts to wait for it."
     ),
     "many": (
-        "{n} subagents are running in the background as {k} completion unit(s), with concurrency limited by "
-        "delegation.max_concurrent_children; each unit's results "
+        "{n} subagents are queued for background execution as {k} completion unit(s); they start in waves with at "
+        "most {limit} child(ren) running at once according to delegation.max_concurrent_children. Each unit's results "
         "re-enter the conversation as their own new message when THAT unit finishes. Results are delivered only "
         "after you END YOUR TURN: do anything that does not depend on them, then stop with a one-line status. Do not "
         "poll transcripts or artifacts to wait for them."
@@ -358,7 +358,9 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
     payload = {
         "status": "dispatched", "mode": "background", "count": n,
         "delegation_id": batch.live_deleg_id or units[0][1], "goals": goals,
-        "note": _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(n=n, k=len(units)),
+        "note": _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(
+            n=n, k=len(units), limit=batch.max_children,
+        ),
     }
     if len(units) > 1:
         payload["units"] = [

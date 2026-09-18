@@ -106,6 +106,7 @@ _CONTINUATION_RESULT_FIELDS = (
     "stop_reason",
     "reported_stop_reason",
     "ego_task_space_id",
+    "ego_missing_task_space_id",
     "ego_cleanup",
     "segment_iteration_boundary",
     "candidate_bound",
@@ -1818,7 +1819,9 @@ def delegate_task(
             )
         else:
             space_note = (
-                f"首个浏览器事务复用数字 Ego 空间 {space_id}，本段继续时不要提前关闭。"
+                f"首个浏览器事务复用数字 Ego 空间 {space_id}，本段继续时不要提前关闭；若该数字空间明确"
+                "返回 task space not found，按当前参考恢复同一轮次的替代空间并返回新的当前数字 ID，"
+                "先核对空间名称和任务绑定，不得因数字 ID 重用而误操作其他任务。"
             )
         target_note = (
             f"本轮显式 target_count={target}；首次 advance 必须传 target_count={target}，"
@@ -2082,17 +2085,35 @@ def delegate_task(
                     previous_cleanup = str(
                         previous_metadata.get("ego_cleanup") or ""
                     ).strip().lower()
-                    if previous_cleanup in {
-                        "preserved_for_continuation",
-                        "preserved",
-                        "open",
-                        "active",
-                        "kept",
-                        "not_closed",
-                        "reused",
-                        "preserved_for_serial_continuation",
-                    } and metadata.get("ego_task_space_id") != previous_metadata.get(
-                        "ego_task_space_id"
+                    previous_space_id = previous_metadata.get("ego_task_space_id")
+                    missing_space_id = metadata.get("ego_missing_task_space_id")
+                    current_space_id = metadata.get("ego_task_space_id")
+                    allowed_missing_space_recovery = (
+                        isinstance(previous_space_id, int)
+                        and not isinstance(previous_space_id, bool)
+                        and previous_space_id > 0
+                        and isinstance(missing_space_id, int)
+                        and not isinstance(missing_space_id, bool)
+                        and missing_space_id > 0
+                        and missing_space_id == previous_space_id
+                        and isinstance(current_space_id, int)
+                        and not isinstance(current_space_id, bool)
+                        and current_space_id > 0
+                    )
+                    if (
+                        previous_cleanup
+                        in {
+                            "preserved_for_continuation",
+                            "preserved",
+                            "open",
+                            "active",
+                            "kept",
+                            "not_closed",
+                            "reused",
+                            "preserved_for_serial_continuation",
+                        }
+                        and current_space_id != previous_space_id
+                        and not allowed_missing_space_recovery
                     ):
                         combined["continuation_error"] = (
                             "worker changed a preserved Ego task space between segments"

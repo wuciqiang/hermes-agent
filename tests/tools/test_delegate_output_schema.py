@@ -17,6 +17,8 @@ import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.delegate_tool import (
     DELEGATE_TASK_SCHEMA,
     _build_dynamic_schema_overrides,
@@ -87,6 +89,7 @@ ROUND_SCHEMA = {
                 {"type": "null"},
             ]
         },
+        "ego_missing_task_space_id": {"type": "integer", "minimum": 1},
         "ego_cleanup": {"type": "string"},
         "segment_iteration_boundary": {"type": "boolean"},
         "candidate_bound": {"type": "boolean"},
@@ -1668,6 +1671,40 @@ class TestBacklinkAutoContinuation:
 
         assert len(built_goals) == 2
         assert "changed a preserved Ego task space" in combined["continuation_error"]
+
+    @pytest.mark.parametrize(
+        ("missing_space_id", "new_space_id", "continues"),
+        ((7, 9, True), (8, 9, False), (None, 9, False)),
+    )
+    def test_missing_space_recovery_allows_only_matching_previous_id(
+        self, missing_space_id, new_space_id, continues
+    ):
+        replacement = _round_payload(
+            failed_retryable=3,
+            ego_task_space_id=new_space_id,
+            ego_missing_task_space_id=missing_space_id,
+        )
+        if missing_space_id is None:
+            replacement.pop("ego_missing_task_space_id")
+        terminal = _round_payload(
+            pending=3,
+            remaining=0,
+            target_reached=True,
+            stop_reason="target_reached",
+            ego_task_space_id=new_space_id,
+            ego_cleanup="closed",
+            segment_iteration_boundary=False,
+        )
+
+        _handle, combined, _dispatched, built_goals = _run_auto_continuation_scenario(
+            [_round_payload(), replacement, terminal]
+        )
+
+        assert len(built_goals) == (3 if continues else 2)
+        if continues:
+            assert "continuation_error" not in combined
+        else:
+            assert "changed a preserved Ego task space" in combined["continuation_error"]
 
     def test_repeated_progress_stops_after_one_recovery_segment(self):
         unchanged = _round_payload()

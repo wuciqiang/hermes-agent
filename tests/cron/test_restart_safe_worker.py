@@ -422,7 +422,7 @@ def test_gateway_tool_run_without_adapter_objects_hands_off(monkeypatch):
     monkeypatch.setattr(scheduler, "create_execution", created)
     monkeypatch.setattr(scheduler, "_launch_external_cron_worker", launch)
     monkeypatch.setattr(scheduler, "run_job", run)
-    job = {"id": "tool-job"}
+    job = {"id": "tool-job", "_scheduled_instant": "2026-09-24T17:00:00Z"}
 
     assert scheduler.run_one_job(job, adapters=None) is True
 

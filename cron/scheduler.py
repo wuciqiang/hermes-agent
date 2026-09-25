@@ -2519,7 +2519,7 @@ def run_one_job(
     # attempt to adopt before any launch can occur.
     if not job.get("execution_id"):
         execution = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
+            job["id"], source="direct", scheduled_instant=None)
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
@@ -2881,7 +2881,7 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
+            job["id"], source="direct", scheduled_instant=None)["id"]
     delivery_attempted = False
     delivery_error = None
     from agent.secret_scope import (

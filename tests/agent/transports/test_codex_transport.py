@@ -39,6 +39,19 @@ class TestCodexTransportBasic:
 
 class TestCodexBuildKwargs:
 
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("effort", ["none", "low", "medium", "high", "xhigh", "max"])
+    def test_gpt6_sol_luna_effort_levels_pass_through(self, transport, model, effort):
+        kw = transport.build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            base_url="https://api.openai.com/v1",
+            reasoning_config={"enabled": True, "effort": effort},
+        )
+
+        assert kw["reasoning"]["effort"] == effort
+
     def test_astra_direct_request_applies_model_contract_after_overrides(self, transport):
         kw = transport.build_kwargs(
             model="gpt-6-astra",

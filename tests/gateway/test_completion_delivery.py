@@ -122,6 +122,96 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     adapter.handle_message.assert_awaited_once()
 
 
+def _recovery_event():
+    return {
+        "type": "async_delegation",
+        "delegation_id": "deleg_recovery_gateway",
+        "session_key": "agent:main:telegram:dm:12345:678",
+        "recovery_continuation": {"kind": "continuation"},
+        "recovery_task": {
+            "goal": "resume one backlink site", "context": "ctx",
+            "tool_profile": "backlinkhub", "auto_continue": True,
+            "output_schema": {"type": "object"},
+        },
+    }
+
+
+def test_recovery_marker_is_requeued_when_host_dispatch_is_not_ready(monkeypatch, isolated_registry):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_recovery_event())
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner._dispatch_recovery_continuation = AsyncMock(return_value=None)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert isolated.qsize() == 1
+    assert runner.adapters[Platform.TELEGRAM].handle_message.await_count == 0
+
+
+def test_recovery_marker_is_consumed_only_after_host_dispatch(monkeypatch, isolated_registry):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_recovery_event())
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner._dispatch_recovery_continuation = AsyncMock(return_value=True)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert isolated.empty()
+    assert runner.adapters[Platform.TELEGRAM].handle_message.await_count == 0
+
+
+def test_recovery_dispatcher_builds_parent_on_cold_cache(monkeypatch):
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    parent = MagicMock()
+    source = SimpleNamespace(
+        platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", thread_id=None,
+        user_id="u", user_id_alt="", user_name="user", chat_name="",
+    )
+    runner._build_process_event_source = lambda _evt: source
+    runner._build_recovery_parent_agent = lambda _source, _key: parent
+    monkeypatch.setattr("tools.async_delegation.claim_recovery_continuation", lambda *_: True)
+    monkeypatch.setattr("tools.async_delegation.release_recovery_continuation", lambda *_: True)
+    dispatch = MagicMock(return_value=json.dumps({"status": "dispatched"}))
+    monkeypatch.setattr("tools.delegate_tool.delegate_task", dispatch)
+    event = _recovery_event()
+    event["recovery_continuation"].update({
+        "run_id": "run-1", "site_id": "site-1", "work_item_id": "item-1",
+        "kind": "attempted_unconfirmed",
+    })
+    assert asyncio.run(runner._dispatch_recovery_continuation(event)) is True
+    assert dispatch.call_args.kwargs["parent_agent"] is parent
+    assert dispatch.call_args.kwargs["_auto_continue"] is True
+    context = dispatch.call_args.kwargs["context"]
+    assert "run-1" in context and "site-1" in context and "item-1" in context
+    assert "attempted_unconfirmed" in context
+
+
+def test_recovery_claim_race_requeues_active_claim(monkeypatch):
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner._agent_cache = {"agent:main:telegram:dm:12345:678": (MagicMock(), None, None, "sid")}
+    runner._agent_cache_lock = None
+    monkeypatch.setattr("tools.async_delegation.claim_recovery_continuation", lambda *_: False)
+    monkeypatch.setattr("tools.async_delegation.recovery_continuation_state", lambda *_: "claimed")
+
+    assert asyncio.run(runner._dispatch_recovery_continuation(_recovery_event())) is None
+
+
+def test_recovery_claim_race_consumes_replaced_marker(monkeypatch):
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner._agent_cache = {"agent:main:telegram:dm:12345:678": (MagicMock(), None, None, "sid")}
+    runner._agent_cache_lock = None
+    monkeypatch.setattr("tools.async_delegation.claim_recovery_continuation", lambda *_: False)
+    monkeypatch.setattr("tools.async_delegation.recovery_continuation_state", lambda *_: "missing")
+
+    assert asyncio.run(runner._dispatch_recovery_continuation(_recovery_event())) is True
+
+
 def test_backlinkhub_progress_notice_is_plain_text_and_deduplicated(monkeypatch):
     adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
     runner = _runner(adapter)

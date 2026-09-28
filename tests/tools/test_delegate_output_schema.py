@@ -24,6 +24,7 @@ from tools.delegate_tool import (
     _build_dynamic_schema_overrides,
     _cleanup_empty_agent_ego_space,
     _run_single_child,
+    _latest_candidate_checkpoint_stage,
     _validated_completion_metadata,
     delegate_task,
 )
@@ -34,11 +35,46 @@ from tools.delegation_output_schema import (
     completion_can_continue,
     coerce_output_schema,
     continuation_progress_fingerprint,
+    continuation_hard_stop_kind,
     failed_segment_can_continue,
     normalize_completion_exit_reason,
     normalize_completion_payload,
     validate_output,
+    merge_authoritative_tool_facts,
 )
+
+
+def test_authoritative_progress_continues_despite_model_stop_wording():
+    payload = _round_payload(
+        remaining=5,
+        target_reached=True,
+        queue_exhausted=True,
+        stop_reason="done_for_now",
+        candidate_external_side_effect="confirmed",
+    )
+    merged = merge_authoritative_tool_facts(payload, [{
+        "backlinkhub_advance_submission_round": {
+            "run_id": payload["run_id"], "site_id": payload["site_id"],
+            "site_progress": {"remaining": 5, "target_reached": False, "queue_exhausted": False},
+        },
+        "backlinkhub_record_submission_result": {
+            "run_id": payload["run_id"], "site_id": payload["site_id"],
+            "outcome": "published", "work_item_id": "item-1",
+        },
+    }])
+    assert merged["authoritative_pending_work"] is True
+    assert merged["target_reached"] is False
+    assert merged["queue_exhausted"] is False
+
+
+def test_new_continuation_segment_does_not_reuse_previous_checkpoint():
+    checkpoints = [
+        {"task_index": 0, "stage": "advanced"},
+        {"task_index": 0, "stage": "browser_started"},
+        {"task_index": 0, "stage": "segment_started"},
+    ]
+
+    assert _latest_candidate_checkpoint_stage(checkpoints) == ""
 
 ADDRESS_SCHEMA = {
     "type": "object",
@@ -64,6 +100,8 @@ ROUND_SCHEMA = {
         "queue_exhausted",
         "target_reached",
         "stop_reason",
+        "continuation_terminal",
+        "continuation_stop_kind",
         "ego_task_space_id",
         "ego_cleanup",
         "segment_iteration_boundary",
@@ -83,6 +121,8 @@ ROUND_SCHEMA = {
         "queue_exhausted": {"type": "boolean"},
         "target_reached": {"type": "boolean"},
         "stop_reason": {"type": "string"},
+        "continuation_terminal": {"type": "boolean"},
+        "continuation_stop_kind": {"type": ["string", "null"]},
         "ego_task_space_id": {
             "anyOf": [
                 {"type": "integer", "minimum": 1},
@@ -116,6 +156,8 @@ def _round_payload(**overrides):
         "queue_exhausted": False,
         "target_reached": False,
         "stop_reason": "segment_iteration_boundary",
+        "continuation_terminal": False,
+        "continuation_stop_kind": None,
         "ego_task_space_id": 7,
         "ego_cleanup": "preserved_for_continuation",
         "segment_iteration_boundary": True,
@@ -205,16 +247,74 @@ class TestPromptPlumbing:
 
 
 class TestContinuationBoundary:
+    @pytest.mark.parametrize(
+        ("stop_reason", "kind"),
+        [
+            ("page_unavailable", "page_unavailable"),
+            ("task_space_unavailable", "task_space_unavailable"),
+        ],
+    )
+    def test_managed_page_or_task_space_hard_stop_is_terminal(self, stop_reason, kind):
+        payload = self._unfinished(
+            stop_reason=stop_reason,
+            continuation_terminal=True,
+            continuation_stop_kind=kind,
+            segment_iteration_boundary=False,
+        )
+
+        assert continuation_hard_stop_kind(payload) == kind
+        assert completion_can_continue(payload) is False
+
+    def test_page_failure_before_submission_can_resume_next_candidate(self):
+        payload = self._unfinished(
+            stop_reason="page_unavailable: Page.getFrameTree timed out",
+            continuation_terminal=True,
+            continuation_stop_kind="page_unavailable",
+            segment_iteration_boundary=False,
+            candidate_bound=True,
+            candidate_external_side_effect="none",
+        )
+
+        assert continuation_hard_stop_kind(payload) == "page_unavailable"
+        assert completion_can_continue(payload, exit_reason="completed") is True
+
+    def test_navigation_timeout_remains_recoverable_when_page_is_available(self):
+        payload = self._unfinished(
+            stop_reason="segment_iteration_boundary",
+            reported_stop_reason="navigation_timeout",
+            segment_iteration_boundary=True,
+        )
+
+        assert continuation_hard_stop_kind(payload) is None
+        assert completion_can_continue(payload) is True
+        assert normalize_completion_exit_reason(
+            payload, schema_valid=True, exit_reason="completed"
+        ) == "completed"
+
     def test_validated_metadata_extracts_one_level_single_site_summary(self):
+        payload = _round_payload(
+            stop_reason="页面不可用，保留现场",
+            continuation_terminal=True,
+            continuation_stop_kind="page_unavailable",
+            segment_iteration_boundary=False,
+            ego_cleanup="preserved_for_continuation",
+        )
         metadata = _validated_completion_metadata(
-            json.dumps({"summary": _round_payload()}),
+            json.dumps({"summary": payload}),
             schema_valid=True,
-            exit_reason="max_iterations",
+            exit_reason="completed",
         )
 
         assert metadata["site_id"] == "site_thesitemath"
         assert metadata["run_id"] == "round_test"
         assert metadata["target"] == 6
+        assert metadata["stop_reason"] == "页面不可用，保留现场"
+        assert metadata["continuation_terminal"] is True
+        assert metadata["continuation_stop_kind"] == "page_unavailable"
+        assert metadata["segment_iteration_boundary"] is False
+        assert metadata["ego_cleanup"] == "preserved_for_continuation"
+        assert metadata["exit_reason"] == "completed"
+        assert metadata["truncated"] is False
 
     @staticmethod
     def _unfinished(**overrides):
@@ -232,6 +332,8 @@ class TestContinuationBoundary:
             "queue_exhausted": False,
             "target_reached": False,
             "stop_reason": "max_iterations",
+            "continuation_terminal": False,
+            "continuation_stop_kind": None,
             "ego_task_space_id": 7,
             "ego_cleanup": "preserved_for_continuation",
             "segment_iteration_boundary": False,
@@ -259,9 +361,7 @@ class TestContinuationBoundary:
 
         assert completion_can_continue(payload, exit_reason="completed") is False
         assert normalize_completion_exit_reason(
-            payload,
-            schema_valid=True,
-            exit_reason="completed",
+            payload, schema_valid=True, exit_reason="completed"
         ) == "completed"
 
     def test_completed_bound_candidate_without_side_effect_can_continue(self):
@@ -276,10 +376,8 @@ class TestContinuationBoundary:
 
         assert completion_can_continue(payload, exit_reason="completed") is True
         assert normalize_completion_exit_reason(
-            payload,
-            schema_valid=True,
-            exit_reason="completed",
-        ) == "max_iterations"
+            payload, schema_valid=True, exit_reason="completed"
+        ) == "completed"
 
     def test_completed_candidate_handoff_requires_bound_untouched_candidate(self):
         for candidate_bound, side_effect in (
@@ -296,6 +394,29 @@ class TestContinuationBoundary:
 
             assert completion_can_continue(payload, exit_reason="completed") is False
 
+    def test_single_candidate_canary_stops_after_recorded_outcome(self):
+        next_candidate_bound = self._unfinished(
+            target=1,
+            failed_retryable=1,
+            remaining=1,
+            stop_reason="candidate_available",
+            segment_iteration_boundary=False,
+            candidate_bound=True,
+            candidate_external_side_effect="none",
+            canary_mode=True,
+        )
+        assert completion_can_continue(next_candidate_bound, exit_reason="completed") is False
+
+        before_candidate_work = self._unfinished(
+            target=1,
+            published=0,
+            failed_retryable=0,
+            remaining=1,
+            stop_reason="segment_iteration_boundary",
+            segment_iteration_boundary=True,
+        )
+        assert completion_can_continue(before_candidate_work, exit_reason="completed") is True
+
     def test_explicit_segment_boundary_can_continue(self):
         payload = self._unfinished(
             stop_reason="segment_iteration_boundary",
@@ -304,25 +425,48 @@ class TestContinuationBoundary:
 
         assert completion_can_continue(payload, exit_reason="completed") is True
         assert normalize_completion_exit_reason(
-            payload,
-            schema_valid=True,
-            exit_reason="completed",
-        ) == "max_iterations"
+            payload, schema_valid=True, exit_reason="completed"
+        ) == "completed"
         assert completion_can_continue(payload, exit_reason="max_iterations") is True
 
+    def test_explicit_segment_boundary_with_zero_remaining_and_safe_result_continues(self):
+        payload = self._unfinished(
+            remaining=0,
+            failed_retryable=1,
+            stop_reason="segment_iteration_boundary",
+            continuation_terminal=False,
+            segment_iteration_boundary=True,
+            candidate_external_side_effect="none",
+        )
+
+        assert completion_can_continue(payload, exit_reason="completed") is True
+
+    def test_zero_remaining_boundary_without_safe_result_stays_terminal(self):
+        payload = self._unfinished(
+            remaining=0,
+            failed_retryable=0,
+            published=0,
+            pending=0,
+            failed_final=0,
+            stop_reason="segment_iteration_boundary",
+            continuation_terminal=False,
+            segment_iteration_boundary=True,
+            candidate_external_side_effect="none",
+        )
+
+        assert completion_can_continue(payload, exit_reason="completed") is False
+
     def test_completed_host_with_worker_max_iterations_boundary_can_continue(self):
-        """Accept the observed worker/native exit-reason compatibility pair."""
+        """The worker exhaustion reason is not a voluntary segment yield."""
         payload = self._unfinished(
             stop_reason="max_iterations",
             segment_iteration_boundary=True,
         )
 
-        assert completion_can_continue(payload, exit_reason="completed") is True
+        assert completion_can_continue(payload, exit_reason="completed") is False
         assert normalize_completion_exit_reason(
-            payload,
-            schema_valid=True,
-            exit_reason="completed",
-        ) == "max_iterations"
+            payload, schema_valid=True, exit_reason="completed"
+        ) == "completed"
 
     def test_worker_max_iterations_requires_explicit_boundary_marker(self):
         payload = self._unfinished(
@@ -332,18 +476,43 @@ class TestContinuationBoundary:
 
         assert completion_can_continue(payload, exit_reason="completed") is False
         assert normalize_completion_exit_reason(
-            payload,
-            schema_valid=True,
-            exit_reason="completed",
+            payload, schema_valid=True, exit_reason="completed"
         ) == "completed"
 
-    def test_natural_language_max_iterations_is_not_a_boundary(self):
+    def test_chinese_hard_stop_with_true_boundary_marker_fails_closed(self):
         payload = self._unfinished(
-            stop_reason="max_iterations reached; please continue",
+            stop_reason="页面不可用，保留现场",
+            continuation_terminal=True,
+            continuation_stop_kind="page_unavailable",
             segment_iteration_boundary=True,
         )
-
+        assert continuation_hard_stop_kind(payload) == "page_unavailable"
         assert completion_can_continue(payload, exit_reason="completed") is False
+        assert normalize_completion_exit_reason(
+            payload, schema_valid=True, exit_reason="completed"
+        ) == "completed"
+
+    def test_free_form_reason_without_boundary_marker_is_not_resumable(self):
+        payload = self._unfinished(
+            stop_reason="本段迭代边界到达；最后候选已绑定",
+            segment_iteration_boundary=False,
+        )
+        assert completion_can_continue(payload, exit_reason="completed") is False
+
+    def test_navigation_timeout_is_not_a_hard_stop(self):
+        payload = self._unfinished(
+            stop_reason="navigation_timeout",
+            segment_iteration_boundary=False,
+        )
+        assert continuation_hard_stop_kind(payload) is None
+
+    @pytest.mark.parametrize("host_exit", ["interrupted", "timeout", "server_error"])
+    def test_host_exit_overrides_worker_boundary(self, host_exit):
+        payload = self._unfinished(
+            stop_reason="本段迭代边界到达；最后候选已绑定",
+            segment_iteration_boundary=True,
+        )
+        assert completion_can_continue(payload, exit_reason=host_exit) is False
 
     def test_observed_iteration_cleanup_alias_is_safe_to_continue(self):
         payload = self._unfinished(
@@ -356,10 +525,8 @@ class TestContinuationBoundary:
         assert normalized["ego_cleanup"] == "preserved_for_continuation"
         assert completion_can_continue(payload, exit_reason="completed") is True
         assert normalize_completion_exit_reason(
-            payload,
-            schema_valid=True,
-            exit_reason="completed",
-        ) == "max_iterations"
+            payload, schema_valid=True, exit_reason="completed"
+        ) == "completed"
 
     def test_known_defensive_early_return_can_continue_with_closed_space(self):
         payload = self._unfinished(
@@ -374,7 +541,7 @@ class TestContinuationBoundary:
             payload,
             schema_valid=True,
             exit_reason="completed",
-        ) == "max_iterations"
+        ) == "completed"
 
     def test_serial_continuation_preserves_reusable_space(self):
         payload = self._unfinished(
@@ -410,9 +577,7 @@ class TestContinuationBoundary:
 
         assert completion_can_continue(payload) is False
         assert normalize_completion_exit_reason(
-            payload,
-            schema_valid=True,
-            exit_reason="completed",
+            payload, schema_valid=True, exit_reason="completed"
         ) == "completed"
 
     def test_all_known_user_control_variants_do_not_continue(self):
@@ -437,6 +602,21 @@ class TestContinuationBoundary:
 
             assert completion_can_continue(payload) is False
 
+    def test_confirmed_side_effect_continues_only_with_recorded_checkpoint(self):
+        payload = self._unfinished(
+            candidate_bound=True,
+            candidate_external_side_effect="confirmed",
+            candidate_checkpoint_stage="recorded",
+            segment_iteration_boundary=True,
+            continuation_terminal=False,
+            stop_reason="segment_iteration_boundary",
+            published=1,
+        )
+        assert completion_can_continue(payload, exit_reason="completed") is True
+
+        payload.pop("candidate_checkpoint_stage")
+        assert completion_can_continue(payload, exit_reason="completed") is False
+
     def test_latest_real_boundary_ignores_historical_effect_after_record(self):
         payload = self._unfinished(
             site_id="site_thesitemath",
@@ -460,10 +640,8 @@ class TestContinuationBoundary:
         assert normalized["candidate_external_side_effect"] == "none"
         assert completion_can_continue(payload, exit_reason="completed") is True
         assert normalize_completion_exit_reason(
-            payload,
-            schema_valid=True,
-            exit_reason="completed",
-        ) == "max_iterations"
+            payload, schema_valid=True, exit_reason="completed"
+        ) == "completed"
 
     def test_already_terminal_result_does_not_continue(self):
         payload = self._unfinished(target_reached=True, remaining=0)
@@ -757,7 +935,7 @@ class TestRunSingleChildSchemaValidation:
         schema = {
             "type": "object",
             "required": ["site_id", "run_id", "remaining"],
-            "properties": {
+        "properties": {
                 "site_id": {"type": "string"},
                 "run_id": {"type": "string"},
                 "remaining": {"type": "integer"},
@@ -789,7 +967,7 @@ class TestRunSingleChildSchemaValidation:
         assert metadata["ego_task_space_id"] == 7
         assert metadata["candidate_external_side_effect"] == "none"
 
-    def test_early_completed_backlink_result_is_marked_native_boundary(self):
+    def test_early_completed_backlink_result_preserves_voluntary_yield(self):
         schema = {
             "type": "object",
             "required": [
@@ -803,8 +981,10 @@ class TestRunSingleChildSchemaValidation:
                 "failed_final",
                 "remaining",
                 "queue_exhausted",
-                "target_reached",
-                "stop_reason",
+            "target_reached",
+            "stop_reason",
+            "continuation_terminal",
+            "continuation_stop_kind",
                 "ego_task_space_id",
                 "ego_cleanup",
                 "segment_iteration_boundary",
@@ -824,9 +1004,9 @@ class TestRunSingleChildSchemaValidation:
         entry = _run(child)
 
         assert entry["status"] == "completed"
-        assert entry["exit_reason"] == "max_iterations"
-        assert entry["truncated"] is True
-        assert entry["_completion_metadata"]["exit_reason"] == "max_iterations"
+        assert entry["exit_reason"] == "completed"
+        assert entry["truncated"] is False
+        assert entry["_completion_metadata"]["exit_reason"] == "completed"
 
     def test_legacy_progress_result_is_normalized_for_hot_reload(self):
         """An old session schema still produces resumable completion metadata."""
@@ -1132,7 +1312,7 @@ class TestDelegateTaskDispatch:
         assert results and results[0].get("schema_valid") is True
 
 
-def _run_auto_continuation_scenario(payloads):
+def _run_auto_continuation_scenario(payloads, *, checkpoint_stage=None):
     children = []
     for index, payload in enumerate(payloads, start=1):
         if isinstance(payload, dict) and "_raw_child_response" in payload:
@@ -1207,7 +1387,11 @@ def _run_auto_continuation_scenario(payloads):
         ),
         patch(
             "tools.delegation_live_log.create_live_transcripts",
-            return_value=(None, [], []),
+            return_value=("deleg_prompt_checkpoint" if checkpoint_stage else None, [], []),
+        ),
+        patch(
+            "tools.delegation_live_log.get_manifest_checkpoints",
+            return_value=([{"task_index": 0, "stage": checkpoint_stage}] if checkpoint_stage else []),
         ),
         patch(
             "tools.async_delegation.dispatch_async_delegation_batch",
@@ -1304,6 +1488,103 @@ def test_auto_continuation_capacity_rejection_does_not_start_a_child():
 
 
 class TestBacklinkAutoContinuation:
+    def test_recorded_confirmed_candidate_prompt_releases_before_next_candidate(self):
+        first = _round_payload(
+            published=1,
+            remaining=5,
+            stop_reason="segment_iteration_boundary",
+            segment_iteration_boundary=True,
+            continuation_terminal=False,
+            candidate_bound=True,
+            candidate_external_side_effect="confirmed",
+        )
+        terminal = _round_payload(
+            published=6,
+            remaining=0,
+            target_reached=True,
+            stop_reason="target_reached",
+            segment_iteration_boundary=False,
+            candidate_bound=False,
+            candidate_external_side_effect="none",
+            ego_cleanup="closed",
+        )
+        _handle, _combined, dispatched, built_goals = _run_auto_continuation_scenario(
+            [first, terminal], checkpoint_stage="recorded"
+        )
+        assert len(dispatched) == 1
+        assert len(built_goals) == 2
+        assert "已成功回写 durable result" in built_goals[1]
+        assert "禁止再次提交上一候选" in built_goals[1]
+        assert "领取下一候选" in built_goals[1]
+
+    @pytest.mark.parametrize(
+        "stop_reason",
+        ["page_unavailable", "task_space_unavailable"],
+    )
+    def test_hard_stop_preserves_scene_and_does_not_advance(self, stop_reason):
+        hard_stop = _round_payload(
+            stop_reason=stop_reason,
+            ego_cleanup="preserved_for_continuation",
+            segment_iteration_boundary=False,
+            continuation_terminal=True,
+            continuation_stop_kind=(
+                "task_space_unavailable"
+                if stop_reason == "task_space_unavailable"
+                else "page_unavailable"
+            ),
+        )
+
+        _handle, combined, dispatched, built_goals = _run_auto_continuation_scenario(
+            [hard_stop]
+        )
+
+        assert len(dispatched) == 1
+        assert len(built_goals) == 1
+        assert combined["continuation_stop_reason"] in {
+            "page_unavailable",
+            "task_space_unavailable",
+        }
+        assert combined["continuation_terminal"] is True
+        assert combined["results"][0]["segment_iteration_boundary"] is False
+        assert combined["results"][0]["continuation_stop_reason"] == combined[
+            "continuation_stop_reason"
+        ]
+        assert combined["continuation_history"][0]["remaining"] == hard_stop[
+            "remaining"
+        ]
+
+    def test_safe_page_failure_dispatches_recovery_segment(self):
+        page_failure = _round_payload(
+            stop_reason="page_unavailable: Page.getFrameTree timed out",
+            ego_cleanup="preserved_for_continuation",
+            segment_iteration_boundary=False,
+            continuation_terminal=True,
+            continuation_stop_kind="page_unavailable",
+            candidate_bound=True,
+            candidate_external_side_effect="none",
+        )
+        terminal = _round_payload(
+            published=1,
+            pending=5,
+            remaining=0,
+            target_reached=True,
+            stop_reason="target_reached",
+            ego_cleanup="closed",
+            segment_iteration_boundary=False,
+            candidate_bound=False,
+            candidate_external_side_effect="none",
+        )
+
+        _handle, combined, dispatched, built_goals = _run_auto_continuation_scenario(
+            [page_failure, terminal]
+        )
+
+        assert len(dispatched) == 1
+        assert len(built_goals) == 2
+        assert "failed_retryable" in built_goals[1]
+        assert "page_unavailable_before_submission" in built_goals[1]
+        assert combined["results"][0]["continuation_segments"] == 2
+
     def test_real_continuation_builder_uses_current_child_contract(self, monkeypatch, tmp_path):
         """Both initial and resumed segments must cross the real child builder.
 
@@ -1549,9 +1830,9 @@ class TestBacklinkAutoContinuation:
         assert len(built_goals) == 2
         assert "site_id=site_thesitemath" in built_goals[1]
 
-    def test_completed_host_with_worker_max_boundary_dispatches_next_segment(self):
+    def test_completed_host_machine_boundary_dispatches_next_segment(self):
         mixed_boundary = _round_payload(
-            stop_reason="max_iterations",
+            stop_reason="segment_iteration_boundary",
             segment_iteration_boundary=True,
             candidate_bound=True,
             candidate_external_side_effect="none",

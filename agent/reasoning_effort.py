@@ -27,14 +27,21 @@ EFFORT_LADDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "x
 #: Widest OpenAI-compatible wire vocabulary (OpenRouter, Nous Portal).
 OPENAI_COMPAT_WIRE_EFFORTS: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
-#: OpenAI/Codex Responses per model generation (live-verified): ``minimal`` is rejected by
-#: both (clamps to low); ``max`` is gpt-5.6-only.
+#: OpenAI/Codex Responses model generations: ``minimal`` is rejected by these
+#: families (clamps to low); ``max`` is supported by gpt-5.6 and GPT-6 Sol/Luna.
 CODEX_GPT56_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
 CODEX_LEGACY_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh")
 # GPT-6 Astra is account-gated and its Responses API accepts no disable/minimal
 # wire level; callers normalize those requests to ``low`` at the transport boundary.
 CODEX_ASTRA_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 ASTRA_MODEL_IDS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6-astra-900k"})
+GPT6_SOL_LUNA_MODEL_MARKERS: tuple[str, ...] = ("gpt-6-sol", "gpt-6-luna")
+
+
+def is_gpt6_sol_luna_model(model: Optional[str]) -> bool:
+    """True for GPT-6 Sol/Luna model ids and dated/qualified variants."""
+    slug = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return any(slug == marker or slug.startswith(marker + "-") for marker in GPT6_SOL_LUNA_MODEL_MARKERS)
 
 #: xAI Responses — Grok 4.6+ accepts xhigh; older Grok tops out at high.
 XAI_GROK46_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
@@ -93,7 +100,7 @@ def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for an OpenAI/Codex Responses model."""
     if is_astra_model(model):
         return CODEX_ASTRA_EFFORTS
-    return CODEX_GPT56_EFFORTS if "gpt-5.6" in (model or "").lower() else CODEX_LEGACY_EFFORTS
+    return CODEX_GPT56_EFFORTS if "gpt-5.6" in (model or "").lower() or is_gpt6_sol_luna_model(model) else CODEX_LEGACY_EFFORTS
 
 
 def kimi_supported_efforts(model: Optional[str]) -> tuple[str, ...]:

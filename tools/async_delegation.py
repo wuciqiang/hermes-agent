@@ -44,6 +44,8 @@ _STRUCTURED_RESULT_FIELDS = (
     "queue_exhausted",
     "target_reached",
     "stop_reason",
+    "continuation_terminal",
+    "continuation_stop_kind",
     "reported_stop_reason",
     "ego_task_space_id",
     "ego_cleanup",
@@ -87,24 +89,6 @@ def _completion_metadata(result: Any) -> Dict[str, Any]:
     if not isinstance(result, dict):
         return {}
 
-    def _normalize_boundary(metadata: Dict[str, Any], payload: Any) -> None:
-        """Apply the shared fact-only continuation rule to restored results."""
-
-        if metadata.get("schema_valid") is not True:
-            return
-        try:
-            from tools.delegation_output_schema import normalize_completion_exit_reason
-
-            effective = normalize_completion_exit_reason(
-                payload,
-                schema_valid=metadata.get("schema_valid"),
-                exit_reason=metadata.get("exit_reason"),
-            )
-        except Exception:
-            return
-        metadata["exit_reason"] = effective
-        metadata["truncated"] = effective == "max_iterations"
-
     # ``delegate_tool`` captures this before host-side summary budgeting.  A
     # detached child may therefore still be resumable even when its visible
     # summary has been replaced by a head/tail excerpt.
@@ -120,7 +104,6 @@ def _completion_metadata(result: Any) -> Dict[str, Any]:
             for key in allowed
             if key in private_metadata
         }
-        _normalize_boundary(metadata, metadata)
         return metadata
 
     metadata: Dict[str, Any] = {}
@@ -140,7 +123,6 @@ def _completion_metadata(result: Any) -> Dict[str, Any]:
         for key in _STRUCTURED_RESULT_FIELDS:
             if key in payload:
                 metadata[key] = payload[key]
-        _normalize_boundary(metadata, payload)
     return metadata
 
 
@@ -184,6 +166,8 @@ def _attach_completion_metadata(event: Dict[str, Any], result: Any) -> None:
             "queue_exhausted",
             "target_reached",
             "stop_reason",
+            "continuation_terminal",
+            "continuation_stop_kind",
             "reported_stop_reason",
             "ego_task_space_id",
             "ego_cleanup",
@@ -224,6 +208,9 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # Pending completions older than this are dropped on restart replay instead of
 # re-run as a full-context turn; 48h keeps weekend results deliverable.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
+# A gateway may die after claiming a recovery marker but before dispatching it.
+# Expiring the claim keeps that crash recoverable without allowing concurrent retries.
+_RECOVERY_CLAIM_TTL_S = 300.0
 _DB_LOCK = threading.Lock()
 
 # ── Stale-delegation detection (progress-based, on by default) ──────────────
@@ -349,7 +336,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", *_ROUTING_ORIGIN_FIELDS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "live_delegation_id", "tool_profile", "auto_continue", "output_schema", *_ROUTING_ORIGIN_FIELDS)
         if key in record}
     with _DB_LOCK, _transaction() as conn:
         conn.execute("""INSERT OR REPLACE INTO async_delegations
@@ -426,7 +413,97 @@ def _recovered_results(task: Dict[str, Any], result_json: Optional[str], error: 
         return None
     recorded = {r["task_index"]: r for r in partial["results"] if isinstance(r.get("task_index"), int)}
     indexes = task.get("task_indexes") or list(range(len(task.get("goals") or [])))
-    return [recorded.get(i) or {"task_index": i, "status": "unknown", "summary": None, "error": error} for i in indexes]
+    return [recorded.get(i) or {"task_index": i, "status": "recoverable", "summary": None, "error": error,
+                                "recovery_required": True} for i in indexes]
+
+
+def _recovery_continuation_request(
+    task: Dict[str, Any], checkpoints: List[Dict[str, Any]],
+    tool_facts: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a durable, conservative request for a BacklinkHub continuation.
+
+    The worker closure cannot be reconstructed after its owner process exits, so
+    this function only records a request for a host-owned dispatcher.  Ordinary
+    delegations and checkpoints after a possible side effect fail closed.
+    """
+    if (
+        task.get("tool_profile") != "backlinkhub"
+        or task.get("auto_continue") is not True
+        or not task.get("is_batch")
+        or len(task.get("goals") or []) != 1
+    ):
+        return None
+    current = None
+    saw_segment = False
+    for checkpoint in checkpoints:
+        if not isinstance(checkpoint, dict):
+            continue
+        stage = str(checkpoint.get("stage") or "").strip().lower()
+        if stage == "segment_started":
+            saw_segment = True
+            current = None
+        elif stage in {"advanced", "browser_started", "final_action_started", "record_started"}:
+            if not current or str(current.get("stage") or "") not in {"final_action_started", "record_started"}:
+                current = checkpoint
+        elif stage in {"recorded", "record_failed"}:
+            current = None
+        elif stage == "advance_failed":
+            details = str(checkpoint.get("details") or "").strip().lower()
+            if details in {
+                "candidate_page_failure_before_submission",
+                "page_unavailable_before_submission",
+            }:
+                current = checkpoint
+            else:
+                current = None
+    advance_fact = {}
+    for item in tool_facts or []:
+        if isinstance(item, dict) and isinstance(item.get("backlinkhub_advance_submission_round"), dict):
+            advance_fact = item["backlinkhub_advance_submission_round"]
+    identity = {
+        key: advance_fact[key]
+        for key in ("run_id", "site_id", "work_item_id")
+        if advance_fact.get(key)
+    }
+    if not current:
+        if not saw_segment:
+            return None
+        return {
+            "kind": "continuation",
+            "checkpoint_stage": "segment_started",
+            "dedupe_before_retry": False,
+            "auto_submit": False,
+            **identity,
+        }
+    stage = str(current.get("stage") or "").strip().lower()
+    if stage in {"final_action_started", "record_started"}:
+        return {
+            "kind": "attempted_unconfirmed",
+            "checkpoint_stage": stage,
+            "dedupe_before_retry": True,
+            "auto_submit": False,
+            **identity,
+        }
+    return {
+        "kind": "continuation",
+        "checkpoint_stage": stage,
+        "dedupe_before_retry": False,
+        "auto_submit": False,
+        **identity,
+    }
+
+
+def _recovery_task_payload(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only serializable fields needed by the host-owned redispatcher."""
+    return {
+        key: task[key]
+        for key in (
+            "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+            "task_indexes", "live_delegation_id", "tool_profile", "auto_continue", "output_schema",
+        )
+        if key in task
+    }
 
 
 def recover_abandoned_delegations() -> int:
@@ -437,6 +514,7 @@ def recover_abandoned_delegations() -> int:
     except Exception:
         return 0
     now, recovered = time.time(), 0
+    manifest_updates = []
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute("""SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
@@ -449,10 +527,20 @@ def recover_abandoned_delegations() -> int:
             task = json.loads(task_json or "{}")
             error = "Delegation owner exited before recording a terminal result; outcome unknown."
             recovered_results = _recovered_results(task, result_json, error)
+            manifest_id = task.get("live_delegation_id") or delegation_id
+            recovery_checkpoints = []
+            recovery_facts = []
+            try:
+                from tools.delegation_live_log import get_manifest_checkpoints, get_manifest_tool_facts
+                recovery_checkpoints = get_manifest_checkpoints(manifest_id)
+                recovery_facts = get_manifest_tool_facts(manifest_id)
+            except Exception:
+                logger.debug("Could not read live checkpoints for recovered delegation %s", delegation_id, exc_info=True)
+            continuation_request = _recovery_continuation_request(task, recovery_checkpoints, recovery_facts)
             if recovered_results:
-                done = sum(1 for r in recovered_results if r.get("status") != "unknown")
+                done = sum(1 for r in recovered_results if r.get("status") != "recoverable")
                 error = (f"Delegation owner exited before the unit finished; {done}/{len(recovered_results)} child "
-                         "results were recorded and are included below, the rest are unknown.")
+                         "results were recorded and are included below, the rest are recoverable.")
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id, "session_key": session_key,
                 "origin_ui_session_id": origin_ui, "origin_session_id": origin_sid or "",
@@ -462,13 +550,35 @@ def recover_abandoned_delegations() -> int:
                 "status": "unknown", "summary": None, "error": error,
                 **({"results": recovered_results} if recovered_results else {}),
                 "dispatched_at": dispatched_at, "completed_at": now,
+                **({"recovery_checkpoints": recovery_checkpoints} if recovery_checkpoints else {}),
+                **({"recovery_continuation": continuation_request} if continuation_request else {}),
+                **({"recovery_task": _recovery_task_payload(task)} if continuation_request else {}),
                 **{k: task[k] for k in _ROUTING_ORIGIN_FIELDS if task.get(k)}}
             result = {"status": "unknown", "summary": None, "error": event["error"],
-                      **({"results": recovered_results} if recovered_results else {})}
+                      **({"results": recovered_results} if recovered_results else {}),
+                      **({"recovery_continuation": continuation_request} if continuation_request else {}),
+                      **({"recovery_task": _recovery_task_payload(task)} if continuation_request else {})}
             conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
                    WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result), delegation_id))
+            manifest_updates.append((manifest_id, recovered_results or [{"task_index": 0, "status": "unknown", "error": error}]))
             recovered += 1
+    if manifest_updates:
+        try:
+            from tools.delegation_live_log import recover_live_manifest
+        except Exception:
+            logger.warning("Recovered async delegations but could not import live manifest updater", exc_info=True)
+        else:
+            for manifest_id, results in manifest_updates:
+                try:
+                    recover_live_manifest(
+                        manifest_id,
+                        reason="owner_process_exited",
+                        results=results,
+                    )
+                except Exception:  # noqa: BLE001 - optional live logs cannot block recovery
+                    logger.warning("Recovered delegation %s but could not update live manifest", manifest_id,
+                                   exc_info=True)
     return recovered
 
 
@@ -558,6 +668,84 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
         return ""
     claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
     return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+
+
+def claim_recovery_continuation(delegation_id: str, claim_id: str) -> bool:
+    """Atomically claim a host-owned recovery request exactly once."""
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT event_json, result_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        event = json.loads(row[0] or "{}")
+        result = json.loads(row[1] or "{}")
+        request = event.get("recovery_continuation") or result.get("recovery_continuation")
+        if not isinstance(request, dict):
+            return False
+        claimed_at = request.get("claimed_at")
+        if request.get("claimed_by") and isinstance(claimed_at, (int, float)) \
+                and time.time() - float(claimed_at) < _RECOVERY_CLAIM_TTL_S:
+            return False
+        request = dict(request, claimed_by=claim_id, claimed_at=time.time())
+        for payload in (event, result):
+            if isinstance(payload.get("recovery_continuation"), dict):
+                payload["recovery_continuation"] = request
+        now = time.time()
+        conn.execute(
+            "UPDATE async_delegations SET event_json=?, result_json=?, updated_at=? WHERE delegation_id=?",
+            (json.dumps(event), json.dumps(result), now, delegation_id),
+        )
+        return True
+
+
+def recovery_continuation_state(delegation_id: str) -> str:
+    """Return ``available``, ``claimed`` or ``missing`` for a recovery marker."""
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT event_json, result_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+    if row is None:
+        return "missing"
+    for payload_text in row:
+        payload = json.loads(payload_text or "{}")
+        request = payload.get("recovery_continuation")
+        if isinstance(request, dict):
+            claimed_at = request.get("claimed_at")
+            if request.get("claimed_by") and isinstance(claimed_at, (int, float)) \
+                    and time.time() - float(claimed_at) < _RECOVERY_CLAIM_TTL_S:
+                return "claimed"
+            return "available"
+    return "missing"
+
+
+def release_recovery_continuation(delegation_id: str, claim_id: str) -> bool:
+    """Release a failed host claim so startup can retry when the session is ready."""
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT event_json, result_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        payloads = [json.loads(row[0] or "{}"), json.loads(row[1] or "{}")]
+        changed = False
+        for payload in payloads:
+            request = payload.get("recovery_continuation")
+            if isinstance(request, dict) and request.get("claimed_by") == claim_id:
+                payload["recovery_continuation"] = {
+                    key: value for key, value in request.items()
+                    if key not in {"claimed_by", "claimed_at"}
+                }
+                changed = True
+        if changed:
+            conn.execute(
+                "UPDATE async_delegations SET event_json=?, result_json=?, updated_at=? WHERE delegation_id=?",
+                (json.dumps(payloads[0]), json.dumps(payloads[1]), time.time(), delegation_id),
+            )
+        return changed
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -759,6 +947,10 @@ def _dispatch(
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
     externally_started: bool = False,
     task_indexes: Optional[List[int]] = None,
+    live_delegation_id: Optional[str] = None,
+    tool_profile: Optional[str] = None,
+    auto_continue: bool = False,
+    output_schema: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
@@ -782,6 +974,10 @@ def _dispatch(
         "slot_key": slot_key or delegation_id,
         # Which of the call's ``goals`` this unit runs (None = all of them).
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
+        **({"live_delegation_id": live_delegation_id} if live_delegation_id else {}),
+        **({"tool_profile": tool_profile} if tool_profile else {}),
+        "auto_continue": bool(auto_continue),
+        **({"output_schema": output_schema} if output_schema else {}),
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None}
     with _records_lock:
@@ -811,7 +1007,11 @@ def _dispatch(
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
             result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
         finally:
-            _finalize(delegation_id, result, status)
+            try:
+                _finalize(delegation_id, result, status)
+            except Exception as exc:  # noqa: BLE001 - terminal convergence must outlive finalization plumbing
+                logger.exception("Async delegation %s finalization crashed", delegation_id)
+                _force_terminal_after_finalize_failure(delegation_id, result, exc)
 
     try:
         # Propagate the dispatching profile so the detached child resolves get_hermes_home() correctly.
@@ -832,6 +1032,9 @@ def dispatch_async_delegation(
     session_key: str, parent_session_id: Optional[str] = None, runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "", origin_session_id: str = "", interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, progress_fn: Optional[Callable[[], tuple]] = None,
+    live_delegation_id: Optional[str] = None,
+    tool_profile: Optional[str] = None, auto_continue: bool = False,
+    output_schema: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
@@ -845,6 +1048,9 @@ def dispatch_async_delegation(
         parent_session_id=parent_session_id, runner=runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn,
+        live_delegation_id=live_delegation_id,
+        tool_profile=tool_profile, auto_continue=auto_continue,
+        output_schema=output_schema,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or run this task synchronously (background=false). "
@@ -862,6 +1068,9 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None, externally_started: bool = False,
+    live_delegation_id: Optional[str] = None,
+    tool_profile: Optional[str] = None, auto_continue: bool = False,
+    output_schema: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -880,6 +1089,9 @@ def dispatch_async_delegation_batch(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         task_indexes=task_indexes, externally_started=externally_started,
+        live_delegation_id=live_delegation_id,
+        tool_profile=tool_profile, auto_continue=auto_continue,
+        output_schema=output_schema,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
@@ -910,6 +1122,59 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
     with _records_lock:
         if delegation_id in _records:
             _records[delegation_id]["status"] = status
+        _prune_completed_locked()
+
+
+def _force_terminal_after_finalize_failure(
+    delegation_id: str, result: Any, original_error: BaseException
+) -> None:
+    """Persist an error terminal when completion plumbing itself raises.
+
+    This path deliberately does not reinterpret the child result: hard-stop and
+    side-effect metadata remain in the original payload. It only prevents a
+    worker exception from leaving the ledger in ``finalizing`` forever.
+    """
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None:
+            return
+        completed_at = time.time()
+        record["status"] = "error"
+        record["completed_at"] = completed_at
+        record["interrupt_fn"] = None
+        record["progress_fn"] = None
+        snapshot = dict(record)
+
+    error_text = f"Completion finalization failed: {type(original_error).__name__}: {original_error}"
+    fallback_result = dict(result) if isinstance(result, dict) else {}
+    fallback_result.setdefault("status", "error")
+    fallback_result.setdefault("summary", None)
+    fallback_result["error"] = error_text
+    event = {
+        "type": "async_delegation", "delegation_id": delegation_id,
+        "session_key": snapshot.get("session_key", ""),
+        "origin_ui_session_id": snapshot.get("origin_ui_session_id", ""),
+        "origin_session_id": snapshot.get("origin_session_id", ""),
+        "parent_session_id": snapshot.get("parent_session_id"),
+        "goal": snapshot.get("goal", ""),
+        **({"goals": snapshot.get("goals")} if snapshot.get("is_batch") else {}),
+        "status": "error", "error": error_text, "summary": fallback_result.get("summary"),
+        "dispatched_at": snapshot.get("dispatched_at", completed_at), "completed_at": completed_at,
+        **{k: snapshot[k] for k in _ROUTING_ORIGIN_FIELDS if snapshot.get(k)},
+    }
+    if snapshot.get("is_batch"):
+        event["is_batch"] = True
+        event["results"] = fallback_result.get("results") or []
+    try:
+        _persist_completion(event, fallback_result)
+    except Exception:  # noqa: BLE001 - there is no higher terminal path
+        logger.exception("Async delegation %s fallback persistence failed", delegation_id)
+    try:
+        from tools.process_registry import process_registry
+        process_registry.completion_queue.put(event)
+    except Exception:  # noqa: BLE001 - durable record remains the recovery source
+        logger.exception("Async delegation %s fallback completion enqueue failed", delegation_id)
+    with _records_lock:
         _prune_completed_locked()
 
 

@@ -91,6 +91,15 @@ _NON_RESUMABLE_STOP_REASONS = frozenset(
     }
 )
 
+# A managed Ego page can disappear or stop answering while the worker still
+# has candidates in BacklinkHub.  These labels are terminal unless the result
+# also proves that the currently bound candidate has no external side effect;
+# that narrow pre-submission case is converted to a candidate-level recovery
+# boundary by ``completion_can_continue``.  Match normalized machine labels
+# only; free-form error prose must not turn a retryable transport failure into
+# a hard stop.
+_HARD_STOP_KINDS = frozenset({"page_unavailable", "task_space_unavailable"})
+
 _PRESERVED_EGO_CLEANUP_STATES = frozenset(
     {
         "preserved_for_continuation",
@@ -129,6 +138,73 @@ _TRACE_RECORD_TOOL = "backlinkhub_record_submission_result"
 _TRACE_TERMINAL_TOOLS = frozenset({"terminal", "terminal_exec"})
 
 
+def merge_authoritative_tool_facts(
+    payload: Dict[str, Any], tool_facts: Any
+) -> Dict[str, Any]:
+    """Overlay progress reported by successful BacklinkHub calls.
+
+    The final JSON is model-authored, while these results come from the tool
+    boundary.  Only known progress fields are copied, and nested ``progress``
+    or ``counts`` objects are accepted to tolerate the bridge's response
+    envelope without interpreting arbitrary prose.
+    """
+    merged = dict(payload) if isinstance(payload, dict) else {}
+    if not isinstance(tool_facts, list):
+        return merged
+    expected_run = str(merged.get("run_id") or "")
+    expected_site = str(merged.get("site_id") or "")
+    direct_fields = {
+        "remaining", "queue_exhausted", "target_reached", "target", "target_count", "daily_target",
+    }
+    progress_fields = {
+        "published", "pending_review", "submission_unconfirmed",
+        "failed_retryable", "failed_final", "remaining", "queue_exhausted",
+            "target_reached", "target", "target_count", "daily_target",
+    }
+
+    # Preserve tool order supplied by the observer; record is applied after
+    # advance so durable outcome counters win over a stale summary.
+    ordered = []
+    for item in tool_facts:
+        if not isinstance(item, dict):
+            continue
+        for name in ("backlinkhub_advance_submission_round", "backlinkhub_record_submission_result"):
+            fact = item.get(name)
+            if isinstance(fact, dict):
+                ordered.append((name, fact))
+    for name, fact in ordered:
+        if expected_run and str(fact.get("run_id") or "") != expected_run:
+            continue
+        if expected_site and str(fact.get("site_id") or "") != expected_site:
+            continue
+        for key in direct_fields:
+            if key in fact:
+                merged[key] = fact[key]
+        progress = fact.get("site_progress")
+        if not isinstance(progress, dict):
+            progress = {}
+        for key in progress_fields:
+            if key in progress:
+                target_key = {
+        "pending_review": "pending",
+        "pending": "pending",
+        "submission_unconfirmed": "attempted_unconfirmed",
+        "attempted_unconfirmed": "attempted_unconfirmed",
+                    "daily_target": "target",
+                }.get(key, key)
+                merged[target_key] = progress[key]
+    if (
+        ordered
+        and merged.get("remaining", 0) > 0
+        and merged.get("target_reached") is False
+        and merged.get("queue_exhausted") is False
+        and not _is_non_resumable_reason(merged.get("stop_reason"))
+        and merged.get("candidate_external_side_effect") in {None, "none", "confirmed"}
+    ):
+        merged["authoritative_pending_work"] = True
+    return merged
+
+
 def _normalize_reason(value: Any) -> str:
     """Normalize a machine reason without interpreting free-form prose."""
 
@@ -161,6 +237,42 @@ def _is_non_resumable_reason(value: Any) -> bool:
     )
 
 
+def continuation_hard_stop_kind(payload: Any) -> Optional[str]:
+    """Return the terminal kind for an unavailable managed page/TaskSpace.
+
+    The result is intentionally conservative.  Only explicit structured
+    labels (or boolean terminal markers) qualify, so a normal provider
+    timeout continues to use the existing one-retry recovery path.
+    """
+
+    data = _structured_payload(payload)
+    if not data:
+        return None
+    kind = _normalize_reason(data.get("continuation_stop_kind"))
+    if data.get("continuation_terminal") is True and kind in _HARD_STOP_KINDS:
+        return kind
+    return None
+
+
+def _candidate_page_failure_can_continue(data: Dict[str, Any]) -> bool:
+    """Return whether a dead page only affected the currently bound candidate.
+
+    A worker may discover the page failure after ``advance`` but before any
+    final submit action.  When the structured result proves that the candidate
+    is still bound and has no external side effect, the host can hand the same
+    run to a fresh segment.  That segment records this candidate as
+    ``failed_retryable`` before advancing, so the failed page cannot block the
+    rest of the queue and the candidate is never retried blindly.
+    """
+
+    return (
+        continuation_hard_stop_kind(data) == "page_unavailable"
+        and data.get("continuation_terminal") is True
+        and data.get("candidate_bound") is True
+        and data.get("candidate_external_side_effect") == "none"
+    )
+
+
 def _valid_ego_space_id(value: Any) -> bool:
     """Ego task-space ids are positive integers; bool is not an id."""
 
@@ -184,14 +296,14 @@ def _continuation_boundary_kind(
     stop_reason = _normalize_reason(data.get("stop_reason"))
     reported_reason = _normalize_reason(data.get("reported_stop_reason"))
 
+    if _candidate_page_failure_can_continue(data) and effective_exit in {"", "completed"}:
+        return "candidate_page_failure"
+
+    # Only the machine boundary label is resumable. Historical localized
+    # reasons paired with the marker are ambiguous and fail closed.
     explicit_boundary = (
         data.get("segment_iteration_boundary") is True
         and stop_reason == _EXPLICIT_SEGMENT_STOP_REASON
-    )
-    legacy_boundary = (
-        data.get("segment_iteration_boundary") is True
-        and stop_reason == "worker_returned_early"
-        and reported_reason == _EXPLICIT_SEGMENT_STOP_REASON
     )
     known_early_boundary = (
         stop_reason in _KNOWN_EARLY_STOP_REASONS
@@ -206,10 +318,13 @@ def _continuation_boundary_kind(
         and data.get("candidate_external_side_effect") == "none"
     )
 
+    if effective_exit and effective_exit not in {
+        "completed",
+        _NATIVE_RESUMABLE_EXIT_REASON,
+    }:
+        return None
     if explicit_boundary:
         return "explicit"
-    if legacy_boundary:
-        return "legacy"
     if known_early_boundary:
         return "known_early"
     if safe_bound_candidate:
@@ -219,26 +334,11 @@ def _continuation_boundary_kind(
         # and the outer continuation loop stops repeated no-progress states.
         return "bound_candidate"
 
-    # Some BacklinkHub workers report their own segment budget as
-    # ``stop_reason=max_iterations`` even when the Hermes child itself exits
-    # normally with ``exit_reason=completed``.  The explicit boundary marker
-    # makes this compatibility case safe and unambiguous; do not infer it from
-    # a free-form reason or from remaining work alone.  Once normalized, the
-    # host may call this predicate again with ``exit_reason=max_iterations``.
-    if (
-        effective_exit in {"completed", _NATIVE_RESUMABLE_EXIT_REASON}
-        and stop_reason == _NATIVE_RESUMABLE_EXIT_REASON
-        and data.get("segment_iteration_boundary") is True
-    ):
-        return "native_segment"
-
     if effective_exit == _NATIVE_RESUMABLE_EXIT_REASON or (
         not effective_exit and stop_reason == _NATIVE_RESUMABLE_EXIT_REASON
     ):
-        # Check explicit/legacy boundaries first: a completed safe boundary is
-        # normalized to ``max_iterations`` before its private metadata reaches
-        # the host continuation loop. Reject only an otherwise-unexplained
-        # segment marker paired with a native max-iteration result.
+        # Native exhaustion is resumable only without the voluntary-yield
+        # marker; a marked result was handled above as a voluntary yield.
         if data.get("segment_iteration_boundary") is True:
             return None
         return "native"
@@ -291,22 +391,60 @@ def completion_can_continue(
         return False
     if data.get("queue_exhausted") is not False:
         return False
+    # A managed page/TaskSpace hard-stop leaves the current scene for the
+    # operator.  Never interpret remaining candidates as permission to issue
+    # another ADVANCE after this point.
+    if (
+        continuation_hard_stop_kind(data) is not None
+        and not _candidate_page_failure_can_continue(data)
+    ):
+        return False
     if not _valid_nonnegative_int(data.get("remaining")):
-        return False
-    if data["remaining"] <= 0:
-        return False
-    if not _valid_ego_space_id(data.get("target")):
         return False
     if any(
         not _valid_nonnegative_int(data.get(field))
         for field in _CONTINUATION_COUNT_FIELDS
     ):
         return False
+    # A voluntary segment can finish the current candidate exactly as the
+    # worker may report the whole-round remaining count as zero.  The recorded outcome is still a safe host
+    # boundary: the next segment may advance the same run/site/Ego space and
+    # discover the next candidate.  Require an explicit marker, a non-terminal
+    # result, no external side effect, and at least one durable outcome field;
+    # this does not turn a bare zero into permission to continue.
+    safe_zero_remaining_boundary = (
+        data["remaining"] == 0
+        and data.get("segment_iteration_boundary") is True
+        and data.get("stop_reason") == _EXPLICIT_SEGMENT_STOP_REASON
+        and data.get("continuation_terminal") is False
+        and data.get("candidate_external_side_effect") == "none"
+        and any(data.get(field, 0) > 0 for field in (
+            "published", "pending", "failed_retryable", "failed_final",
+        ))
+    )
+    if data["remaining"] <= 0 and not safe_zero_remaining_boundary:
+        return False
+    if not _valid_ego_space_id(data.get("target")):
+        return False
     if data.get("candidate_bound") not in (False, True):
         return False
+    recorded_confirmed_boundary = (
+        data.get("candidate_bound") is True
+        and data.get("candidate_external_side_effect") in {
+            "confirmed", "unconfirmed", "attempted_unconfirmed",
+        }
+        and data.get("candidate_checkpoint_stage") == "recorded"
+        and data.get("segment_iteration_boundary") is True
+        and data.get("stop_reason") == _EXPLICIT_SEGMENT_STOP_REASON
+        and data.get("continuation_terminal") is False
+        and any(data.get(field, 0) > 0 for field in (
+            "published", "pending", "attempted_unconfirmed", "failed_retryable", "failed_final",
+        ))
+    )
     if (
         data.get("candidate_bound") is True
         and data.get("candidate_external_side_effect") != "none"
+        and not recorded_confirmed_boundary
     ):
         return False
 
@@ -315,6 +453,12 @@ def completion_can_continue(
     # active stop reason to ``worker_returned_early``.
     if _is_non_resumable_reason(data.get("stop_reason")) or _is_non_resumable_reason(
         data.get("reported_stop_reason")
+    ):
+        return False
+
+    if (
+        data.get("canary_mode") is True
+        and any(data.get(field, 0) > 0 for field in _CONTINUATION_COUNT_FIELDS[:-1])
     ):
         return False
 
@@ -472,27 +616,9 @@ def normalize_completion_exit_reason(
     schema_valid: Any,
     exit_reason: Any,
 ) -> str:
-    """Promote only an explicit safe boundary to Hermes' native boundary.
+    """Preserve the child runtime's exit semantics; continuation is separate."""
 
-    ``completed`` is not evidence that a round is unfinished or resumable.
-    The compatibility mapping is limited to the exact segment marker emitted
-    by the BacklinkHub contract and the one observed defensive early-return
-    reason.  User handoff, errors, and uncertain side effects retain their
-    original exit reason.
-    """
-
-    reason = str(exit_reason or "")
-    if reason != "completed" or schema_valid is not True:
-        return reason
-    return (
-        _NATIVE_RESUMABLE_EXIT_REASON
-        if completion_can_continue(
-            payload,
-            exit_reason=reason,
-            schema_valid=schema_valid,
-        )
-        else reason
-    )
+    return str(exit_reason or "")
 
 
 def normalize_completion_payload(payload: Dict[str, Any]) -> Dict[str, Any]:

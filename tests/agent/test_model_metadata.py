@@ -984,6 +984,16 @@ class TestNousPortalContextResolution:
 # =========================================================================
 
 class TestGetModelContextLength:
+    def test_gpt6_sol_luna_direct_context_defaults(self):
+        """GPT-6 Sol/Luna direct API entries beat the broad legacy gpt-5 fallback."""
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None):
+            for model in ("gpt-6-sol", "gpt-6-luna", "openai/gpt-6-sol-2026-09-01"):
+                assert get_model_context_length(model, provider="openai") == 1_050_000
+
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_known_model_from_api(self, mock_fetch):
         mock_fetch.return_value = {

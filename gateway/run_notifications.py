@@ -1553,6 +1553,12 @@ class GatewayNotificationsMixin:
                         break
                     if evt.get("type") == "async_delegation":
                         self._queue_backlinkhub_progress_notice(evt)
+                        if evt.get("recovery_continuation"):
+                            dispatched = await self._dispatch_recovery_continuation(evt)
+                            if dispatched is True:
+                                continue
+                            requeue.append(evt)
+                            continue
                     (async_events if evt.get("type") == "async_delegation" else requeue).append(evt)
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
@@ -1576,6 +1582,112 @@ class GatewayNotificationsMixin:
                             _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
             await asyncio.sleep(interval)
+
+    async def _dispatch_recovery_continuation(self, evt: dict) -> Optional[bool]:
+        """Dispatch a durable BacklinkHub recovery marker through the cached host agent.
+
+        ``None`` means the session agent is not ready yet and leaves the marker queued;
+        ``True`` means the marker was claimed and dispatched; ``False`` releases a failed
+        claim so a later startup tick can retry it.
+        """
+        request = evt.get("recovery_continuation")
+        task = evt.get("recovery_task")
+        session_key = str(evt.get("session_key") or "").strip()
+        delegation_id = str(evt.get("delegation_id") or "").strip()
+        if not isinstance(request, dict) or not isinstance(task, dict) or not session_key or not delegation_id:
+            return False
+        cache = getattr(self, "_agent_cache", None)
+        lock = getattr(self, "_agent_cache_lock", None)
+        cached = None
+        if cache is not None:
+            with lock if lock is not None else suppress():
+                cached = cache.get(session_key)
+        parent_agent = cached[0] if isinstance(cached, tuple) and cached else cached
+        if parent_agent is None:
+            source = await asyncio.to_thread(self._build_process_event_source, evt)
+            if source is None:
+                return None
+            try:
+                parent_agent = await asyncio.to_thread(
+                    self._build_recovery_parent_agent, source, session_key,
+                )
+            except Exception:
+                logger.warning("Could not build recovery parent agent for %s", delegation_id, exc_info=True)
+                return None
+        if parent_agent is None:
+            return None
+        claim_id = f"gateway-recovery:{id(self)}:{delegation_id}"
+        from tools.async_delegation import (
+            claim_recovery_continuation, recovery_continuation_state,
+            release_recovery_continuation,
+        )
+        if not claim_recovery_continuation(delegation_id, claim_id):
+            # A competing live gateway may have claimed it. Requeue until its
+            # claim expires; only a replaced/deleted ledger row is consumed.
+            return None if recovery_continuation_state(delegation_id) == "claimed" else True
+        try:
+            from gateway.session_context import clear_session_vars, set_session_vars
+            tokens = set_session_vars(
+                platform=str(evt.get("platform") or ""), source="gateway",
+                chat_id=str(evt.get("chat_id") or ""), chat_type=str(evt.get("chat_type") or ""),
+                thread_id=str(evt.get("thread_id") or ""), user_id=str(evt.get("user_id") or ""),
+                user_name=str(evt.get("user_name") or ""), scope_id=str(evt.get("scope_id") or ""),
+                session_key=session_key, session_id=str(evt.get("parent_session_id") or session_key),
+                ui_session_id=str(evt.get("origin_ui_session_id") or ""), async_delivery=True,
+            )
+            try:
+                from tools.delegate_tool import delegate_task
+                recovery_context = task.get("context") or ""
+                recovery_context = (
+                    f"{recovery_context}\n\nRECOVERY CONTINUATION FACTS (host-owned): "
+                    f"{json.dumps(request, ensure_ascii=False, sort_keys=True)}"
+                )
+                raw = await asyncio.to_thread(
+                    delegate_task,
+                    goal=str(task.get("goal") or (task.get("goals") or [""])[0]),
+                    context=recovery_context, tool_profile="backlinkhub", role=task.get("role"),
+                    output_schema=task.get("output_schema"), background=True, _auto_continue=True,
+                    parent_agent=parent_agent, _live_delegation_id=task.get("live_delegation_id") or delegation_id,
+                )
+            finally:
+                clear_session_vars(tokens)
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(payload, dict) and payload.get("status") == "dispatched":
+                logger.info("Dispatched recovered BacklinkHub continuation %s", delegation_id)
+                return True
+        except Exception:
+            logger.warning("BacklinkHub recovery dispatch failed for %s", delegation_id, exc_info=True)
+        release_recovery_continuation(delegation_id, claim_id)
+        return False
+
+    def _build_recovery_parent_agent(self, source: SessionSource, session_key: str):
+        """Construct the host parent used by a recovery dispatch, without a model turn."""
+        from run_agent import AIAgent
+        from gateway.run import (
+            _checkpoint_agent_kwargs, _current_max_iterations, _load_gateway_config,
+            _platform_config_key,
+        )
+
+        user_config = _load_gateway_config()
+        model, runtime = self._resolve_session_agent_runtime(source=source, user_config=user_config)
+        if not runtime.get("api_key"):
+            return None
+        platform_key = _platform_config_key(source.platform)
+        enabled, disabled = self._resolve_turn_toolsets(user_config, source, platform_key)
+        reasoning = self._resolve_session_reasoning_config(source=source, model=model)
+        service_tier = self._resolve_session_service_tier(source=source)
+        return AIAgent(
+            model=model, **runtime, **_checkpoint_agent_kwargs(user_config),
+            max_iterations=_current_max_iterations(), quiet_mode=True, verbose_logging=False,
+            enabled_toolsets=enabled, disabled_toolsets=disabled,
+            reasoning_config=reasoning, service_tier=service_tier,
+            session_id=session_key, platform=platform_key,
+            user_id=source.user_id, user_id_alt=source.user_id_alt, user_name=source.user_name,
+            chat_id=source.chat_id, chat_name=source.chat_name, chat_type=source.chat_type,
+            thread_id=source.thread_id, gateway_session_key=session_key,
+            session_db=getattr(getattr(self, "_session_db", None), "_db", getattr(self, "_session_db", None)),
+            load_soul_identity=True,
+        )
 
     @staticmethod
     def _redacted_output_tail(session, limit: int) -> str:

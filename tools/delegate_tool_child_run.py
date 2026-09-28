@@ -330,7 +330,9 @@ def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_i
         )
     return None
 
-def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
+def _defer_close_after_timeout(
+    child: Any, child_future: Any, worker_thread: Optional[threading.Thread] = None,
+) -> None:
     """Hand ``child.close()`` to a Future done-callback and drain its transports.
 
     The interrupt is cooperative: the worker still runs its finally path, so closing now could close SQLite under its
@@ -340,7 +342,15 @@ def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
     sweep + one delayed re-sweep for a connection opened in between; a worker that still won't settle keeps its
     resources until process exit.
     """
-    child_future.add_done_callback(lambda _done: _close_child(child, "Failed to close timed-out child after worker exit"))
+    def _close_when_unwound(_done: Any = None) -> None:
+        if worker_thread is not None and worker_thread.is_alive():
+            timer = threading.Timer(0.05, _close_when_unwound)
+            timer.daemon = True
+            timer.start()
+            return
+        _close_child(child, "Failed to close timed-out child after worker exit")
+
+    child_future.add_done_callback(_close_when_unwound)
     # Bounded drain (#94248 native half): the deferred close above only fires once the abandoned worker
     # unwinds, but that worker is typically parked inside an in-flight OpenSSL read (Codex / httpx). Never
     # hard-close that transport from this thread — releasing FDs under a live SSL read is the #29507/#70773
@@ -731,9 +741,13 @@ class _ChildRun:
             _error_entry["failure_reason"] = "provider_json_decode_error"
             _error_entry["failure_retryable"] = True
         self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
-        close_deferred = is_timeout and not future.done()
+        # A timeout always crosses the worker-owned teardown boundary.  The
+        # Future callback is safe for both states: when already done,
+        # add_done_callback invokes it immediately; otherwise it waits until
+        # the worker has unwound its finally path.
+        close_deferred = is_timeout
         if close_deferred:
-            _defer_close_after_timeout(child, future)
+            _defer_close_after_timeout(child, future, worker_thread_holder.get("t"))
         return None, _error_entry, close_deferred
 
     def append_sibling_write_reminder(self, entry: Dict[str, Any]) -> None:

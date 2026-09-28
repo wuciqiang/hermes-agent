@@ -200,6 +200,97 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+@pytest.mark.parametrize(
+    ("checkpoints", "kind", "stage"),
+    [
+        ([{"stage": "segment_started"}, {"stage": "advanced"}], "continuation", "advanced"),
+        ([{"stage": "segment_started"}, {"stage": "browser_started"}], "continuation", "browser_started"),
+        ([{"stage": "segment_started"}, {"stage": "final_action_started"}], "attempted_unconfirmed", "final_action_started"),
+        ([{"stage": "segment_started"}, {"stage": "record_started"}], "attempted_unconfirmed", "record_started"),
+        ([{"stage": "segment_started"}, {"stage": "advance_failed", "details": "page_unavailable_before_submission"}], "continuation", "advance_failed"),
+    ],
+)
+def test_backlinkhub_recovery_request_is_checkpoint_gated(checkpoints, kind, stage):
+    task = {"is_batch": True, "goals": ["one site"], "tool_profile": "backlinkhub", "auto_continue": True}
+    request = ad._recovery_continuation_request(task, checkpoints)
+    assert request == {
+        "kind": kind,
+        "checkpoint_stage": stage,
+        "dedupe_before_retry": kind == "attempted_unconfirmed",
+        "auto_submit": False,
+    }
+
+
+def test_recovery_request_fails_closed_for_ordinary_delegation_or_unknown_side_effect():
+    task = {"is_batch": True, "goals": ["one site"], "tool_profile": "other", "auto_continue": True}
+    assert ad._recovery_continuation_request(task, [{"stage": "advanced"}]) is None
+    backlink_task = {"is_batch": True, "goals": ["one site"], "tool_profile": "backlinkhub", "auto_continue": True}
+    assert ad._recovery_continuation_request(backlink_task, [{"stage": "advance_failed", "details": "network_timeout"}]) is None
+    assert ad._recovery_continuation_request(backlink_task, [{"stage": "segment_started"}])["checkpoint_stage"] == "segment_started"
+
+
+def test_recovery_continuation_claim_is_idempotent():
+    event = {"recovery_continuation": {"kind": "continuation"}}
+    result = {"recovery_continuation": {"kind": "continuation"}}
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "INSERT INTO async_delegations "
+            "(delegation_id, origin_session, state, dispatched_at, updated_at, event_json, result_json) "
+            "VALUES (?, ?, 'unknown', ?, ?, ?, ?)",
+            ("deleg_recovery_claim", "session", time.time(), time.time(), json.dumps(event), json.dumps(result)),
+        )
+    assert ad.claim_recovery_continuation("deleg_recovery_claim", "claim-1") is True
+    assert ad.claim_recovery_continuation("deleg_recovery_claim", "claim-2") is False
+    assert ad.release_recovery_continuation("deleg_recovery_claim", "claim-1") is True
+    assert ad.claim_recovery_continuation("deleg_recovery_claim", "claim-2") is True
+
+
+def test_recovery_continuation_claim_expires_after_gateway_crash():
+    event = {"recovery_continuation": {"kind": "continuation", "claimed_by": "dead", "claimed_at": time.time() - 301}}
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "INSERT INTO async_delegations "
+            "(delegation_id, origin_session, state, dispatched_at, updated_at, event_json, result_json) "
+            "VALUES (?, ?, 'unknown', ?, ?, ?, ?)",
+            ("deleg_recovery_expired", "session", time.time(), time.time(), json.dumps(event), json.dumps(event)),
+        )
+    assert ad.claim_recovery_continuation("deleg_recovery_expired", "claim-new") is True
+
+
+def test_runner_exception_persists_terminal_error_state():
+    def runner():
+        raise RuntimeError("worker exploded")
+
+    res = ad.dispatch_async_delegation(
+        goal="crash", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=1,
+    )
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == "error"
+    assert "RuntimeError: worker exploded" in evt["error"]
+    durable = ad.get_durable_delegation(res["delegation_id"])
+    assert durable["state"] not in {"running", "finalizing"}
+
+
+def test_finalize_failure_has_terminal_fallback(monkeypatch):
+    def broken_push(*args, **kwargs):
+        raise RuntimeError("queue plumbing failed")
+
+    monkeypatch.setattr(ad, "_push_completion_event", broken_push)
+    res = ad.dispatch_async_delegation(
+        goal="finalize failure", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=lambda: {"status": "completed", "summary": "done"},
+        max_async_children=1,
+    )
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == "error"
+    assert "Completion finalization failed" in evt["error"]
+    durable = ad.get_durable_delegation(res["delegation_id"])
+    assert durable["state"] == "error"
+
+
 def test_completion_event_preserves_feishu_reply_anchor():
     from gateway.config import Platform
     from gateway.run import GatewayRunner
@@ -808,6 +899,57 @@ def test_batch_completion_promotes_validated_continuation_metadata():
     assert event["continuation_signal"]["candidate_external_side_effect"] == "none"
 
 
+def test_async_event_exposes_hard_stop_kind_and_terminal_marker():
+    from tools.delegate_tool import _validated_completion_metadata
+
+    event_record = {
+        "delegation_id": "deleg_page_hard_stop",
+        "session_key": "owner-session",
+        "goal": "run backlink round",
+        "goals": ["run backlink round"],
+        "role": "leaf",
+        "model": "gpt-5.6-luna",
+        "dispatched_at": 1000.0,
+        "completed_at": 1010.0,
+    }
+    payload = {
+        "site_id": "site_one",
+        "run_id": "run_one",
+        "target": 3,
+        "remaining": 2,
+        "queue_exhausted": False,
+        "target_reached": False,
+        "stop_reason": "页面不可用，保留现场",
+        "continuation_terminal": True,
+        "continuation_stop_kind": "page_unavailable",
+        "segment_iteration_boundary": False,
+        "ego_task_space_id": 7,
+        "ego_cleanup": "preserved_for_continuation",
+    }
+    metadata = _validated_completion_metadata(
+        json.dumps({"summary": payload}), schema_valid=True, exit_reason="completed"
+    )
+    child_result = {
+        "task_index": 0,
+        "status": "completed",
+        "schema_valid": True,
+        "exit_reason": "completed",
+        "truncated": False,
+        "summary": "shortened",
+        "_completion_metadata": metadata,
+    }
+    ad._push_batch_completion_event(
+        event_record, {"results": [child_result]}, "completed"
+    )
+    event = _drain_one()
+
+    assert event is not None
+    assert event["exit_reason"] == "completed"
+    assert event["truncated"] is False
+    assert event["continuation_signal"]["continuation_terminal"] is True
+    assert event["continuation_signal"]["continuation_stop_kind"] == "page_unavailable"
+
+
 def test_single_task_batch_completion_exposes_cumulative_continuation_usage():
     event_record = {
         "delegation_id": "deleg_usage",
@@ -854,7 +996,7 @@ def test_single_task_batch_completion_exposes_cumulative_continuation_usage():
     assert "reasoning_tokens=800" in rendered
 
 
-def test_batch_completion_promotes_safe_early_completed_result_to_boundary():
+def test_batch_completion_preserves_safe_early_completed_result_exit():
     """A valid unfinished no-side-effect result remains resumable after transport."""
     event_record = {
         "delegation_id": "deleg_early_completed",
@@ -906,8 +1048,8 @@ def test_batch_completion_promotes_safe_early_completed_result_to_boundary():
     event = _drain_one()
 
     assert event is not None
-    assert event["exit_reason"] == "max_iterations"
-    assert event["truncated"] is True
+    assert event["exit_reason"] == "completed"
+    assert event["truncated"] is False
     assert event["continuation_signal"]["remaining"] == 3
 
 
@@ -1581,7 +1723,7 @@ def test_independent_units_use_configured_capacity_above_one(monkeypatch):
 
 def test_child_finished_before_crash_is_recovered_with_its_result(tmp_path):
     """Real-import E2E: a 2-task group unit whose owner dies mid-run replays the finished child's real result
-    and marks only the unfinished sibling unknown — a crash costs the stragglers, never the finished work."""
+    and marks only the unfinished sibling recoverable — a crash costs the stragglers, never the finished work."""
     repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo}
     producer = r'''
@@ -1616,6 +1758,7 @@ print(json.dumps(q.get_nowait(), sort_keys=True))
     evt = json.loads(second.stdout.strip().splitlines()[-1])
     by_index = {r["task_index"]: r for r in evt["results"]}
     assert by_index[0]["status"] == "completed" and by_index[0]["summary"] == "done: fast member of the group task"
-    assert by_index[1]["status"] == "unknown"
+    assert by_index[1]["status"] == "recoverable"
+    assert by_index[1]["recovery_required"] is True
     assert "1/2 child results were recorded" in evt["error"]
     assert "done: fast member" in format_process_notification(evt)

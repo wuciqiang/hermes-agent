@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -23,6 +24,12 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 LIVE_RETENTION_DAYS = 7
+
+# Manifest writes are intentionally tiny but can be triggered by both the
+# child progress relay and the async recovery thread.  Serializing the
+# read/modify/write cycle keeps a checkpoint from being lost when a tool
+# completion and a terminal recovery notice arrive together.
+_MANIFEST_LOCK = threading.RLock()
 
 # Per-line truncation budgets (chars): the .log is a compact operational view;
 # the child's SessionDB transcript and summary spill files carry full text.
@@ -77,7 +84,166 @@ def _joined(*parts: str) -> str:
 
 
 def _dump_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    """Atomically publish a manifest so a crash cannot leave partial JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+_CHECKPOINT_STAGES = frozenset({
+    "segment_started",
+    "advance_started", "advanced", "advance_failed", "browser_started",
+    "stage_started", "final_action_started", "record_started", "recorded", "record_failed",
+})
+
+
+def _stage_from_runtime_metric(payload: Any) -> Optional[str]:
+    """Read a bounded candidate checkpoint encoded in a runtime metric reason."""
+    if not isinstance(payload, dict):
+        return None
+    reason = str(payload.get("reason") or "").strip().lower()
+    prefix = "candidate_stage:"
+    if not reason.startswith(prefix):
+        return None
+    stage = reason.removeprefix(prefix).strip()
+    return stage if stage in _CHECKPOINT_STAGES else None
+
+
+def _update_manifest_checkpoint(
+    delegation_id: str, task_index: int, stage: str, details: str = ""
+) -> None:
+    """Best-effort atomic-ish manifest checkpoint update.
+
+    The live transcript remains the full operational trace; this small field
+    is the recovery index used after an owner process disappears.  It is kept
+    deliberately independent of business outcomes so a checkpoint can never
+    be mistaken for a published backlink.
+    """
+    if stage not in _CHECKPOINT_STAGES:
+        return
+    with _best_effort("manifest checkpoint"):
+        with _MANIFEST_LOCK:
+            path = _manifest_path(delegation_id)
+            if not path.is_file():
+                return
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            tasks = manifest.get("tasks")
+            if not isinstance(tasks, list):
+                return
+            now = time.strftime(_TIME_FMT)
+            for task in tasks:
+                if task.get("index") == task_index:
+                    task["checkpoint"] = {
+                        "stage": stage,
+                        "at": now,
+                        **({"details": details} if details else {}),
+                    }
+                    break
+            manifest["updated"] = now
+            _dump_json(path, manifest)
+
+
+def _update_manifest_tool_facts(
+    delegation_id: str, task_index: int, facts: Dict[str, Dict[str, Any]]
+) -> None:
+    """Persist the current segment's structured BacklinkHub tool results."""
+    with _best_effort("manifest tool facts"):
+        with _MANIFEST_LOCK:
+            path = _manifest_path(delegation_id)
+            if not path.is_file():
+                return
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            now = time.strftime(_TIME_FMT)
+            for task in manifest.get("tasks", []):
+                if task.get("index") == task_index:
+                    task["tool_facts"] = facts
+                    break
+            manifest["updated"] = now
+            _dump_json(path, manifest)
+
+
+def recover_live_manifest(
+    delegation_id: Optional[str], *, reason: str, results: Optional[List[Dict[str, Any]]] = None
+) -> None:
+    """Converge a manifest whose owner process died before normal finalization."""
+    if not delegation_id:
+        return
+    with _best_effort("manifest recovery"):
+        with _MANIFEST_LOCK:
+            path = _manifest_path(str(delegation_id))
+            if not path.is_file():
+                return
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            by_index = {
+                item.get("task_index"): item
+                for item in (results or [])
+                if isinstance(item, dict)
+            }
+            now = time.strftime(_TIME_FMT)
+            for task in manifest.get("tasks", []):
+                if task.get("status") != "running":
+                    continue
+                result = by_index.get(task.get("index"), {})
+                task["status"] = result.get("status") or "abandoned"
+                task["exit_reason"] = reason
+                task["recovered_at"] = now
+                task["recovery_required"] = True
+            manifest["status"] = "recovered"
+            manifest["recovery_reason"] = reason
+            manifest["completed"] = now
+            manifest["updated"] = now
+            _dump_json(path, manifest)
+
+
+def get_manifest_checkpoints(delegation_id: Optional[str]) -> List[Dict[str, Any]]:
+    """Return the last checkpoint for each live task, if a manifest exists."""
+    if not delegation_id:
+        return []
+    with _best_effort("manifest checkpoint read"):
+        with _MANIFEST_LOCK:
+            path = _manifest_path(str(delegation_id))
+            if not path.is_file():
+                return []
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            checkpoints = []
+            for task in manifest.get("tasks", []):
+                checkpoint = task.get("checkpoint")
+                if isinstance(checkpoint, dict):
+                    checkpoints.append({
+                        "task_index": task.get("index"),
+                        **checkpoint,
+                    })
+            return checkpoints
+    return []
+
+
+def get_manifest_tool_facts(delegation_id: Optional[str]) -> List[Dict[str, Any]]:
+    """Return structured tool results captured during the current segment."""
+    if not delegation_id:
+        return []
+    with _best_effort("manifest tool facts read"):
+        with _MANIFEST_LOCK:
+            path = _manifest_path(str(delegation_id))
+            if not path.is_file():
+                return []
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            facts = []
+            for task in manifest.get("tasks", []):
+                task_facts = task.get("tool_facts")
+                if isinstance(task_facts, dict):
+                    facts.append({"task_index": task.get("index"), **task_facts})
+            return facts
+    return []
 
 
 class LiveTranscriptWriter:
@@ -85,26 +251,33 @@ class LiveTranscriptWriter:
     failure flips ``_ok`` off and later calls become debug-logged no-ops."""
 
     def __init__(self, delegation_id: str, task_index: int, goal: str,
-                 context: Optional[str] = None, root: Optional[Path] = None):
+                 context: Optional[str] = None, root: Optional[Path] = None,
+                 append: bool = False):
         self.delegation_id = delegation_id
         self.task_index = task_index
         self._ok = False
         self._lock = threading.Lock()
         self._stream_buf: List[str] = []
         self._stream_len = 0
+        self._tool_facts: Dict[str, Dict[str, Any]] = {}
         self.path: Optional[Path] = None
         with _best_effort(f"init ({delegation_id} task {task_index})"):
             goal_line = _one_line(goal, _KICKOFF_MAX)
             d = (root if root is not None else live_transcript_root()) / delegation_id
             d.mkdir(parents=True, exist_ok=True)
             path = d / f"task-{task_index}.log"
-            path.write_text(
+            header = (
                 "=== Hermes subagent live transcript ===\n"
                 f"delegation: {delegation_id}   task: {task_index}\n"
                 f"goal: {_redact(goal_line)}\n"  # header bypasses event(), so redact here too
                 f"started: {time.strftime(_TIME_FMT)}\n"
                 "(append-only; streams while the subagent runs — tail -f me)\n"
-                + "=" * 40 + "\n", encoding="utf-8")
+                + "=" * 40 + "\n")
+            if append and path.exists():
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write("\n=== Hermes subagent continuation resumed ===\n")
+            else:
+                path.write_text(header, encoding="utf-8")
             self.path, self._ok = path, True
             self.event("user", "kickoff: " + goal_line
                        + (f" | context: {_one_line(context, _KICKOFF_MAX)}" if context else ""))
@@ -135,6 +308,103 @@ class LiveTranscriptWriter:
     def tool_start(self, name: str, args_preview: Any = None) -> None:
         self.flush_stream()
         self.event("tool", f"-> {name or '?'}({_one_line(args_preview, _ARGS_MAX)})")
+
+    def checkpoint(self, stage: str, details: Any = None) -> None:
+        """Persist a compact lifecycle checkpoint beside the transcript.
+
+        Checkpoints are operational metadata, not submission results.  They
+        let recovery distinguish a child that died after ``advance`` from one
+        that had already started a final browser action.  Values are bounded
+        and redacted; no form values, cookies, or page text are persisted.
+        """
+        stage = str(stage or "").strip().lower()
+        if not stage or not self._ok or self.path is None:
+            return
+        safe_details = _one_line(details, 220) if details is not None else ""
+        if stage == "segment_started":
+            self._tool_facts.clear()
+            _update_manifest_tool_facts(self.delegation_id, self.task_index, {})
+        self.event("checkpoint", _joined(stage, safe_details))
+        _update_manifest_checkpoint(self.delegation_id, self.task_index, stage, safe_details)
+
+    def _capture_tool_fact(self, tool: str, result: Any, *, is_error: bool) -> bool:
+        """Keep a redacted, allowlisted BacklinkHub result for host progress."""
+        if is_error or tool not in {
+            "backlinkhub_advance_submission_round",
+            "backlinkhub_record_submission_result",
+        }:
+            return False
+        payload = result
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+        if not isinstance(payload, dict):
+            return False
+        envelope = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+        if payload.get("success") is False or payload.get("error") or envelope.get("success") is False or envelope.get("error"):
+            return False
+        scalar_keys = {
+            "success", "run_id", "site_id", "work_item_id", "outcome",
+            "remaining", "queue_exhausted", "target_reached", "target",
+            "target_count", "daily_target", "candidate_bound", "candidate_external_side_effect",
+            "platform_id",
+        }
+        progress_keys = {
+            "published", "pending", "pending_review", "submission_unconfirmed",
+            "failed_retryable", "failed_final", "remaining", "queue_exhausted",
+            "target_reached", "target", "target_count",
+        }
+        fact = {key: envelope[key] for key in scalar_keys if key in envelope}
+        site = envelope.get("site")
+        site_id = site.get("site_id") if isinstance(site, dict) else None
+        status = envelope.get("status")
+        if isinstance(status, dict):
+            status_site_id = status.get("site_id")
+            if site_id and status_site_id and str(site_id) != str(status_site_id):
+                return False
+            site_id = site_id or status_site_id
+            progress_site_id = status.get("site_progress", {}).get("site_id") if isinstance(status.get("site_progress"), dict) else None
+            if site_id and progress_site_id and str(site_id) != str(progress_site_id):
+                return False
+            fact["site_progress"] = {
+                key: status[key] for key in progress_keys | {"daily_target"}
+                if key in status
+            }
+        if site_id:
+            fact["site_id"] = site_id
+        candidate = envelope.get("candidate")
+        if isinstance(candidate, dict) and candidate.get("platform_id"):
+            fact["platform_id"] = candidate["platform_id"]
+        for key in ("run_id", "site_id"):
+            if key not in fact and key in payload:
+                fact[key] = payload[key]
+        site_progress = envelope.get("site_progress")
+        if isinstance(site_progress, dict):
+            fact["site_progress"] = {
+                key: site_progress[key] for key in progress_keys | {"daily_target"}
+                if key in site_progress
+            }
+        if tool == "backlinkhub_record_submission_result":
+            previous = self._tool_facts.get("backlinkhub_advance_submission_round", {})
+            fact.setdefault("run_id", previous.get("run_id"))
+            fact.setdefault("site_id", previous.get("site_id"))
+            previous_item = previous.get("work_item_id")
+            if previous_item and fact.get("work_item_id") and str(previous_item) != str(fact["work_item_id"]):
+                return False
+        if not fact.get("run_id") or not fact.get("site_id"):
+            return False
+        if tool == "backlinkhub_record_submission_result" and str(
+            fact.get("outcome") or ""
+        ).strip().lower() not in {
+            "published", "pending", "pending_review", "submission_unconfirmed", "attempted_unconfirmed",
+            "failed_retryable", "failed_final",
+        }:
+            return False
+        self._tool_facts[tool] = fact
+        _update_manifest_tool_facts(self.delegation_id, self.task_index, self._tool_facts)
+        return True
 
     def tool_result(self, name: str, result: Any = None,
                     duration: Any = None, is_error: bool = False) -> None:
@@ -190,7 +460,43 @@ class LiveTranscriptWriter:
                 args: Any = None, **kwargs: Any) -> None:
         """Map a child tool_progress_callback event onto transcript lines.
         Unknown events are ignored. Never raises (event() swallows I/O)."""
-        handler = self._OBSERVERS.get(str(event_type or ""))
+        event_name = str(event_type or "")
+        tool = str(tool_name or "").strip()
+        if event_name == "tool.started":
+            if tool == "backlinkhub_advance_submission_round":
+                self.checkpoint("advance_started")
+            elif tool == "backlinkhub_record_submission_result":
+                self.checkpoint("record_started")
+            elif tool == "backlinkhub_record_runtime_metric":
+                metric = args if isinstance(args, dict) else preview
+                stage = _stage_from_runtime_metric(metric)
+                if stage:
+                    self.checkpoint(stage, metric.get("fingerprint"))
+            elif tool == "terminal" and "ego-browser" in str(preview or args or ""):
+                self.checkpoint("browser_started")
+        elif event_name == "tool.completed":
+            ok = not bool(kwargs.get("is_error"))
+            if tool == "backlinkhub_advance_submission_round":
+                captured = self._capture_tool_fact(tool, kwargs.get("result"), is_error=not ok)
+                fact = self._tool_facts.get(tool, {})
+                detail = json.dumps({key: fact[key] for key in ("run_id", "site_id", "work_item_id") if fact.get(key)}, sort_keys=True)
+                self.checkpoint("advanced" if captured else "advance_failed", detail if captured else None)
+            elif tool == "backlinkhub_record_submission_result":
+                captured = self._capture_tool_fact(tool, kwargs.get("result"), is_error=not ok)
+                fact = self._tool_facts.get(tool, {})
+                detail = json.dumps({key: fact[key] for key in ("run_id", "site_id", "work_item_id", "outcome") if fact.get(key)}, sort_keys=True)
+                self.checkpoint("recorded" if captured else "record_failed", detail if captured else None)
+            elif tool == "backlinkhub_record_runtime_metric" and ok:
+                metric = args if isinstance(args, dict) else preview
+                stage = _stage_from_runtime_metric(metric)
+                if stage:
+                    self.checkpoint(stage, metric.get("fingerprint"))
+            if tool not in {
+                "backlinkhub_advance_submission_round",
+                "backlinkhub_record_submission_result",
+            }:
+                self._capture_tool_fact(tool, kwargs.get("result"), is_error=not ok)
+        handler = self._OBSERVERS.get(event_name)
         if handler is not None:
             handler(self, tool_name, preview, args, kwargs)
 
@@ -237,13 +543,27 @@ def create_live_transcripts(
     with _best_effort("creation"):
         # Same id shape as async_delegation's so the dir name matches the handle.
         deleg_id = delegation_id or f"deleg_{uuid.uuid4().hex[:8]}"
-        made = [LiveTranscriptWriter(deleg_id, i, str(t.get("goal", "")), context=t.get("context") or context)
+        existing_manifest = _manifest_path(deleg_id).is_file() if delegation_id else False
+        made = [LiveTranscriptWriter(
+                    deleg_id, i, str(t.get("goal", "")), context=t.get("context") or context,
+                    append=existing_manifest,
+                )
                 for i, t in enumerate(task_list)]
         writers: List[Optional[LiveTranscriptWriter]] = [w if w.path is not None else None for w in made]
         paths: List[str] = [str(w.path) for w in made if w.path is not None]
         if not paths:
             return None, [None] * n, []
-        _write_manifest(deleg_id, task_list, paths, model=model, provider=provider)
+        if not existing_manifest:
+            _write_manifest(deleg_id, task_list, paths, model=model, provider=provider)
+        else:
+            with _MANIFEST_LOCK, _best_effort("continuation manifest resume"):
+                manifest_path = _manifest_path(deleg_id)
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["status"] = "running"
+                manifest.pop("recovery_reason", None)
+                manifest.pop("completed", None)
+                manifest["updated"] = time.strftime(_TIME_FMT)
+                _dump_json(manifest_path, manifest)
         return deleg_id, writers, paths
     return None, [None] * n, []
 
@@ -256,15 +576,16 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str], model: Optional[str] = None,
                     provider: Optional[str] = None) -> None:
     with _best_effort("manifest write"):
-        _dump_json(_manifest_path(delegation_id), {
-            "delegation_id": delegation_id, "started": time.strftime(_TIME_FMT),
-            "task_count": len(task_list), "model": model, "provider": provider,
-            "tasks": [{
-                "index": i,
-                # Same mounted dir as the .log files, so the goal needs the same redaction.
-                "goal": _redact(str(t.get("goal", ""))[:500]),
-                "log": paths[i] if i < len(paths) else None,
-                "status": "running"} for i, t in enumerate(task_list)]})
+        with _MANIFEST_LOCK:
+            _dump_json(_manifest_path(delegation_id), {
+                "delegation_id": delegation_id, "started": time.strftime(_TIME_FMT),
+                "task_count": len(task_list), "model": model, "provider": provider,
+                "tasks": [{
+                    "index": i,
+                    # Same mounted dir as the .log files, so the goal needs the same redaction.
+                    "goal": _redact(str(t.get("goal", ""))[:500]),
+                    "log": paths[i] if i < len(paths) else None,
+                    "status": "running"} for i, t in enumerate(task_list)]})
 
 
 def update_manifest_statuses(delegation_id: Optional[str],
@@ -273,17 +594,18 @@ def update_manifest_statuses(delegation_id: Optional[str],
     if not delegation_id:
         return
     with _best_effort("manifest update"):
-        mp = _manifest_path(delegation_id)
-        manifest = json.loads(mp.read_text(encoding="utf-8"))
-        by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
-        for task in manifest.get("tasks", []):
-            r = by_index.get(task.get("index"))
-            if r is not None:
-                task["status"] = r.get("status", task.get("status"))
-                if r.get("exit_reason"):
-                    task["exit_reason"] = r["exit_reason"]
-        manifest["completed"] = time.strftime(_TIME_FMT)
-        _dump_json(mp, manifest)
+        with _MANIFEST_LOCK:
+            mp = _manifest_path(delegation_id)
+            manifest = json.loads(mp.read_text(encoding="utf-8"))
+            by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
+            for task in manifest.get("tasks", []):
+                r = by_index.get(task.get("index"))
+                if r is not None:
+                    task["status"] = r.get("status", task.get("status"))
+                    if r.get("exit_reason"):
+                        task["exit_reason"] = r["exit_reason"]
+            manifest["completed"] = time.strftime(_TIME_FMT)
+            _dump_json(mp, manifest)
 
 
 def prune_stale_live_dirs(max_age_days: int = LIVE_RETENTION_DAYS) -> int:

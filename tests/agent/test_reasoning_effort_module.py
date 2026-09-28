@@ -152,7 +152,10 @@ class TestCodexVocabulary:
 
         assert codex_supported_efforts("gpt-5.6") is CODEX_GPT56_EFFORTS
         assert codex_supported_efforts("gpt-5.6-codex") is CODEX_GPT56_EFFORTS
+        assert codex_supported_efforts("gpt-6-sol") is CODEX_GPT56_EFFORTS
+        assert codex_supported_efforts("openai/gpt-6-luna-2026-09-01") is CODEX_GPT56_EFFORTS
         assert codex_supported_efforts("gpt-5.5") is CODEX_LEGACY_EFFORTS
+        assert codex_supported_efforts("gpt-6-astra") is not CODEX_GPT56_EFFORTS
         assert codex_supported_efforts("o5-pro") is CODEX_LEGACY_EFFORTS
         # The consequential clamps:
         assert clamp_effort("max", CODEX_GPT56_EFFORTS) == "max"

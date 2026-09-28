@@ -209,6 +209,24 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         usage_parts.append(f"cost_usd={evt['cumulative_cost_usd']}")
     if usage_parts:
         lines.append("Cumulative continuation usage: " + " ".join(usage_parts))
+    checkpoints = evt.get("recovery_checkpoints") or []
+    if checkpoints:
+        lines.append("")
+        lines.append(
+            "Recovery checkpoint: owner process exited before terminal delivery. "
+            "Use the checkpoint to reconcile the current candidate before taking the next queue item."
+        )
+        for checkpoint in checkpoints:
+            if not isinstance(checkpoint, dict):
+                continue
+            stage = checkpoint.get("stage") or "unknown"
+            idx = checkpoint.get("task_index")
+            lines.append(f"- task {idx}: {stage}" + (f" ({checkpoint['at']})" if checkpoint.get("at") else ""))
+        lines.append(
+            "A checkpoint at final_action_started/record_started means the external result may be "
+            "unconfirmed; do not submit that same candidate again. A checkpoint at advanced/browser_started "
+            "means the candidate still needs a single bounded reconciliation and then exactly one record."
+        )
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {evt['error']}"]
         return "\n".join(lines)

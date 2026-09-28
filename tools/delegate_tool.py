@@ -77,6 +77,17 @@ from tools.delegate_tool_registry import (  # noqa: F401
     steer_subagent,
 )
 from tools.delegate_tool_tasks import _coerce_task_schemas, _normalize_task_list
+
+
+def _latest_candidate_checkpoint_stage(checkpoints: List[Dict[str, Any]]) -> str:
+    """Return the current segment's candidate stage, respecting segment boundaries."""
+    for checkpoint in reversed(checkpoints):
+        stage = str(checkpoint.get("stage") or "").strip().lower()
+        if stage == "segment_started":
+            return ""
+        if stage in {"advanced", "browser_started", "final_action_started", "record_started", "recorded"}:
+            return stage
+    return ""
 from tools.delegate_tool_toolsets import (  # noqa: F401
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
 )
@@ -104,7 +115,10 @@ _CONTINUATION_RESULT_FIELDS = (
     "queue_exhausted",
     "target_reached",
     "stop_reason",
+    "continuation_terminal",
+    "continuation_stop_kind",
     "reported_stop_reason",
+    "canary_mode",
     "ego_task_space_id",
     "ego_missing_task_space_id",
     "ego_cleanup",
@@ -134,7 +148,6 @@ def _validated_completion_metadata(
     try:
         from tools.delegation_output_schema import (
             extract_json_candidate,
-            normalize_completion_exit_reason,
             normalize_completion_payload,
         )
 
@@ -153,12 +166,8 @@ def _validated_completion_metadata(
         # metadata.
         payload = nested
     payload = normalize_completion_payload(payload)
-    metadata["exit_reason"] = normalize_completion_exit_reason(
-        payload,
-        schema_valid=schema_valid,
-        exit_reason=exit_reason,
-    )
-    metadata["truncated"] = metadata["exit_reason"] == "max_iterations"
+    # Continuation is decided from the validated structured fields below.
+    # Preserve the child runtime's native completion semantics in metadata.
     for key in _CONTINUATION_RESULT_FIELDS:
         if key in payload:
             metadata[key] = payload[key]
@@ -1312,6 +1321,7 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None, tool_profile: Optional[str] = None,
     _auto_continue: Optional[bool] = False, action: Optional[str] = None, subagent_id: Optional[str] = None,
     message: Optional[str] = None, parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
+    _live_delegation_id: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -1384,7 +1394,8 @@ def delegate_task(
     # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
     from tools.delegation_live_log import create_live_transcripts
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list, context, delegation_id=_live_delegation_id,
+        model=creds.get("model"), provider=creds.get("provider")
     )
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
@@ -1506,6 +1517,7 @@ def delegate_task(
         # same log, so the operator gets one complete audit trail per task.
         writer = live_writers[task_index] if task_index < len(live_writers) else None
         if writer is not None:
+            writer.checkpoint("segment_started")
             child.tool_progress_callback = wrap_progress_callback(
                 getattr(child, "tool_progress_callback", None), writer
             )
@@ -1804,6 +1816,28 @@ def delegate_task(
 
     def _continuation_goal(metadata: Dict[str, Any]) -> str:
         """Build a compact next-segment prompt without replaying history."""
+        recovery = metadata.get("pending_recovery_request")
+        if isinstance(recovery, dict):
+            stage = str(recovery.get("stage") or "").strip().lower()
+            identity = (
+                f"run_id={recovery.get('run_id')}; site_id={recovery.get('site_id')}; "
+                f"work_item_id={recovery.get('work_item_id')}; platform_id={recovery.get('platform_id')}."
+            )
+            if stage in {"final_action_started", "record_started", "browser_started"}:
+                action = (
+                    "先对原 work_item_id 调用 backlinkhub_record_submission_result，"
+                    "outcome=attempted_unconfirmed，明确说明宿主在该候选执行中断，外部副作用无法确认；"
+                    "若工具返回 already_recorded，保留其 durable outcome，禁止再次提交。完成后再 advance。"
+                )
+            elif stage == "recorded":
+                action = "原候选已记录，首个业务调用必须是同一 run/site 的 advance 领取下一候选。"
+            else:
+                action = "原候选只完成 advance，首个业务调用继续复用该候选；禁止假设页面失败或跳过它。"
+            return (
+                "恢复 BacklinkHub 同一轮次，不创建新 run；只处理 host recovery request 指定身份。"
+                f"{identity} 当前阶段={stage}。{action} "
+                "不要重复最终点击；若无法确认原 work item 或发现用户控制/歧义，立即停止并返回。"
+            )
         site_id = str(metadata.get("site_id") or "")
         run_id = str(metadata.get("run_id") or "")
         target = metadata.get("target")
@@ -1829,18 +1863,40 @@ def delegate_task(
             if isinstance(target, int) and not isinstance(target, bool) and target > 0
             else "本轮没有可验证的显式 target_count；仅在 BacklinkHub 已持久化目标时省略该参数。"
         )
+        candidate_recovery_note = ""
+        if metadata.get("candidate_page_failure_pending") is True:
+            candidate_recovery_note = (
+                "上一段已在最终提交前确认当前候选的 managed Page 不可用，且没有外部副作用。"
+                "本段第一次 advance 重新绑定同一 run/site 的当前候选后，必须立即以"
+                "outcome=failed_retryable 回写 failure_reason=page_unavailable_before_submission，"
+                "不要再次打开或提交该候选；回写成功后继续按参考推进下一候选。"
+            )
+        checkpoint_stage = str(metadata.get("candidate_checkpoint_stage") or "").strip().lower()
+        if checkpoint_stage == "recorded":
+            candidate_recovery_note = (
+                "上一段已成功回写 durable result，当前候选无需再次浏览、提交或 record。"
+                "本段第一项 advance 只释放/确认该已回写候选并领取下一候选；禁止再次提交上一候选，"
+                "随后按参考继续处理当前轮次候选。"
+            )
+        elif checkpoint_stage in {"final_action_started", "record_started"}:
+            candidate_recovery_note = (
+                "上一段已进入当前候选的最终动作或结果回写边界，但执行者未完成终态；"
+                "本段第一次 advance 重新绑定同一候选后，不得再次浏览或提交，直接以"
+                "outcome=attempted_unconfirmed 回写一次，然后按参考继续推进下一候选。"
+            )
         return (
             "继续：复用 BacklinkHub 同一外链轮次，不创建新轮次。"
             f"site_id={site_id}；run_id={run_id}；target={target}；"
             f"ego_task_space_id={space_id}；ego_cleanup={cleanup}。{target_note}"
+            f"{candidate_recovery_note}"
             "先用 skill_view(name=\"backlink-round-execution\", "
             "file_path=\"references/luna-worker.md\") 加载叶子参考一次，再用 "
             "skill_view(name=\"ego-browser\") 加载官方技能一次，不得重复加载。"
             "随后第一项业务调用必须是同一 run_id、site_id 的 "
             "backlinkhub_advance_submission_round；若上面给出显式 target_count，必须原样传入，"
             "否则由 BacklinkHub 恢复已持久化目标和未回写候选。"
-            f"{space_note}之后严格执行参考中的 "
-            "ADVANCE -> BROWSE -> RECORD -> ADVANCE；不重复最终提交。"
+            f"{space_note}之后严格执行参考中的 ADVANCE -> BROWSE -> RECORD；"
+            "若当前轮次仍有候选，继续按参考推进，直到达到目标或明确返回边界。"
         )
 
     def _detach_child_from_parent(child: Any) -> None:
@@ -1864,6 +1920,7 @@ def delegate_task(
         from tools.delegation_output_schema import (
             completion_can_continue,
             continuation_progress_fingerprint,
+            continuation_hard_stop_kind,
             failed_segment_can_continue,
         )
 
@@ -1879,7 +1936,144 @@ def delegate_task(
         transport_recovery_exhausted = False
         combined: Dict[str, Any] = {}
 
+        def _latest_candidate_checkpoint() -> str:
+            """Read the last durable browser boundary for the current segment."""
+            if not live_deleg_id:
+                return ""
+            try:
+                from tools.delegation_live_log import get_manifest_checkpoints
+
+                checkpoints = get_manifest_checkpoints(live_deleg_id)
+            except Exception:
+                return ""
+            return _latest_candidate_checkpoint_stage(checkpoints)
+
+        def _authoritative_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+            """Merge facts emitted by the current segment's BacklinkHub tools."""
+            if not live_deleg_id:
+                return metadata
+            try:
+                from tools.delegation_live_log import get_manifest_tool_facts
+                from tools.delegation_output_schema import merge_authoritative_tool_facts
+                facts = get_manifest_tool_facts(live_deleg_id)
+                return merge_authoritative_tool_facts(metadata, facts)
+            except Exception:
+                logger.debug("Could not merge BacklinkHub tool facts", exc_info=True)
+                return metadata
+
+        def _recovery_request_from_live_state() -> Optional[Dict[str, Any]]:
+            if not live_deleg_id:
+                return None
+            try:
+                from tools.delegation_live_log import get_manifest_checkpoints, get_manifest_tool_facts
+                facts = get_manifest_tool_facts(live_deleg_id)
+                advance = next((item.get("backlinkhub_advance_submission_round") for item in facts if isinstance(item, dict) and isinstance(item.get("backlinkhub_advance_submission_round"), dict)), {})
+                if not advance:
+                    return None
+                checkpoints = get_manifest_checkpoints(live_deleg_id)
+                stage = ""
+                for checkpoint in reversed(checkpoints):
+                    candidate_stage = str(checkpoint.get("stage") or "").strip().lower()
+                    if candidate_stage == "segment_started":
+                        break
+                    if candidate_stage in {"advanced", "browser_started", "final_action_started", "record_started", "recorded"}:
+                        stage = candidate_stage
+                        break
+                if not stage:
+                    return None
+                return {
+                    "run_id": advance.get("run_id"), "site_id": advance.get("site_id"),
+                    "work_item_id": advance.get("work_item_id"), "platform_id": advance.get("platform_id"),
+                    "target": advance.get("target_count") or advance.get("daily_target")
+                    or (advance.get("site_progress") or {}).get("daily_target"),
+                    "stage": stage,
+                }
+            except Exception:
+                logger.debug("Could not build host recovery request", exc_info=True)
+                return None
+        def _publish_authoritative_metadata(result: Dict[str, Any], metadata: Dict[str, Any]) -> None:
+            """Keep private continuation state and returned progress identical."""
+            private = result.get("_completion_metadata")
+            if isinstance(private, list) and private and isinstance(private[0], dict):
+                private[0].update(metadata)
+            entries = result.get("results")
+            if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+                public_fields = {
+                    "run_id", "site_id", "target", "published", "pending",
+                    "attempted_unconfirmed", "failed_retryable", "failed_final",
+                    "remaining", "queue_exhausted", "target_reached",
+                }
+                entries[0].update({key: metadata[key] for key in public_fields if key in metadata})
+
+        def _mark_hard_stop(result: Dict[str, Any], metadata: Dict[str, Any]) -> None:
+            """Expose a managed page/TaskSpace stop without changing progress.
+
+            A page can die after ``advance`` but before the worker performs any
+            final submit action.  The structured result then proves that the
+            current candidate is still bound and has no external side effect.
+            Convert that narrow case into a host continuation boundary so the
+            next segment can record ``failed_retryable`` and move to the next
+            candidate.  Unknown side effects and TaskSpace/control failures
+            remain terminal hard-stops.
+            """
+            kind = continuation_hard_stop_kind(metadata)
+            if kind is None:
+                return
+            safe_candidate_page_failure = (
+                kind == "page_unavailable"
+                and metadata.get("candidate_bound") is True
+                and metadata.get("candidate_external_side_effect") == "none"
+            )
+            if safe_candidate_page_failure:
+                recovery_fields = {
+                    "continuation_terminal": False,
+                    "continuation_stop_kind": None,
+                    "segment_iteration_boundary": True,
+                    "stop_reason": "segment_iteration_boundary",
+                    "ego_cleanup": "preserved_for_continuation",
+                }
+                metadata.update(recovery_fields)
+                metadata["candidate_page_failure_pending"] = True
+                result["continuation_stop_reason"] = (
+                    "candidate_page_unavailable_before_submission"
+                )
+                result.update(recovery_fields)
+                result["candidate_page_failure_pending"] = True
+                private_metadata = result.get("_completion_metadata")
+                if (
+                    isinstance(private_metadata, list)
+                    and private_metadata
+                    and isinstance(private_metadata[0], dict)
+                ):
+                    private_metadata[0].update(recovery_fields)
+                    private_metadata[0]["candidate_page_failure_pending"] = True
+                entries = result.get("results")
+                if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+                    entries[0].update(recovery_fields)
+                    entries[0]["candidate_page_failure_pending"] = True
+                return
+            result["continuation_stop_reason"] = kind
+            result["continuation_terminal"] = True
+            result["continuation_stop_kind"] = kind
+            entries = result.get("results")
+            if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+                entries[0]["continuation_stop_reason"] = kind
+                entries[0]["continuation_terminal"] = True
+                entries[0]["continuation_stop_kind"] = kind
+                entries[0]["segment_iteration_boundary"] = False
+                entries[0]["ego_cleanup"] = "preserved_for_continuation"
+
         def _continuation_decision(metadata: Dict[str, Any]) -> bool:
+            if isinstance(metadata.get("pending_recovery_request"), dict):
+                return True
+            if metadata.get("authoritative_pending_work") is True:
+                if metadata.get("candidate_checkpoint_stage") in {"final_action_started", "record_started"}:
+                    return False
+                if metadata.get("stop_reason") in {
+                    "user_stop", "user_control", "user_takeover", "external_side_effect_unknown",
+                }:
+                    return False
+                return True
             can_continue = completion_can_continue(
                 metadata,
                 exit_reason=metadata.get("exit_reason"),
@@ -1985,12 +2179,32 @@ def delegate_task(
             )
             _record_segment(combined)
             metadata = _single_completion_metadata(combined)
+            metadata = _authoritative_metadata(metadata)
+            if not metadata:
+                first_entries = combined.get("results") if isinstance(combined, dict) else None
+                first_entry = first_entries[0] if isinstance(first_entries, list) and first_entries and isinstance(first_entries[0], dict) else {}
+                if str(first_entry.get("exit_reason") or "").strip().lower() in {
+                    "server_error", "overloaded", "provider_timeout", "timeout", "provider_json_decode_error",
+                }:
+                    recovery = _recovery_request_from_live_state()
+                    if recovery:
+                        metadata = {"pending_recovery_request": recovery}
+            checkpoint_stage = _latest_candidate_checkpoint()
+            if metadata and checkpoint_stage:
+                metadata["candidate_checkpoint_stage"] = checkpoint_stage
             if metadata:
                 last_safe_metadata = dict(metadata)
+                _mark_hard_stop(combined, metadata)
+                _publish_authoritative_metadata(combined, metadata)
 
             expected_site_id = str(metadata.get("site_id") or "")
             expected_run_id = str(metadata.get("run_id") or "")
             expected_target = metadata.get("target")
+            pending_recovery = metadata.get("pending_recovery_request")
+            if isinstance(pending_recovery, dict):
+                expected_site_id = str(pending_recovery.get("site_id") or "")
+                expected_run_id = str(pending_recovery.get("run_id") or "")
+                expected_target = pending_recovery.get("target")
             previous_fingerprint = continuation_progress_fingerprint(metadata)
 
             while _continuation_decision(metadata):
@@ -2006,9 +2220,10 @@ def delegate_task(
                 if (
                     not expected_site_id
                     or not expected_run_id
-                    or str(metadata.get("site_id") or "") != expected_site_id
-                    or str(metadata.get("run_id") or "") != expected_run_id
-                    or str(metadata.get("target")) != str(expected_target)
+                    or (not isinstance(metadata.get("pending_recovery_request"), dict)
+                        and (str(metadata.get("site_id") or "") != expected_site_id
+                             or str(metadata.get("run_id") or "") != expected_run_id
+                             or str(metadata.get("target")) != str(expected_target)))
                 ):
                     combined["continuation_error"] = (
                         "worker returned a different BacklinkHub site, run_id, or target"
@@ -2069,8 +2284,14 @@ def delegate_task(
                 combined = next_combined
                 _record_segment(combined)
                 metadata = _single_completion_metadata(combined)
+                metadata = _authoritative_metadata(metadata)
+                checkpoint_stage = _latest_candidate_checkpoint()
+                if metadata and checkpoint_stage:
+                    metadata["candidate_checkpoint_stage"] = checkpoint_stage
                 if metadata:
                     last_safe_metadata = dict(metadata)
+                    _mark_hard_stop(combined, metadata)
+                    _publish_authoritative_metadata(combined, metadata)
 
                     if (
                         str(metadata.get("site_id") or "") != expected_site_id
@@ -2131,7 +2352,27 @@ def delegate_task(
                         and isinstance(entries[0], dict)
                         else {}
                     )
-                    if failed_segment_can_continue(failed_entry, last_safe_metadata):
+                    checkpoint_stage = _latest_candidate_checkpoint()
+                    checkpoint_recovery = checkpoint_stage in {
+                        "final_action_started",
+                        "record_started",
+                        "recorded",
+                    }
+                    if checkpoint_recovery and last_safe_metadata:
+                        last_safe_metadata = dict(last_safe_metadata)
+                        last_safe_metadata["candidate_checkpoint_stage"] = checkpoint_stage
+                        combined["candidate_checkpoint_stage"] = checkpoint_stage
+                    if checkpoint_recovery and checkpoint_stage in {
+                        "final_action_started",
+                        "record_started",
+                        "recorded",
+                    }:
+                        failed_segment_safe = True
+                    else:
+                        failed_segment_safe = failed_segment_can_continue(
+                            failed_entry, last_safe_metadata
+                        )
+                    if failed_segment_safe:
                         recovery_fingerprint = continuation_progress_fingerprint(
                             last_safe_metadata
                         )
@@ -2418,6 +2659,9 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            tool_profile=tool_profile,
+            auto_continue=_auto_continue_enabled,
+            output_schema=task_schemas[0] if len(task_schemas) == 1 else None,
         )
 
         if dispatch.get("status") == "dispatched":

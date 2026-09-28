@@ -22,6 +22,7 @@ from tools import delegation_live_log as dll
 from tools.delegation_live_log import (
     LiveTranscriptWriter,
     create_live_transcripts,
+    get_manifest_tool_facts,
     live_transcript_root,
     prune_stale_live_dirs,
     update_manifest_statuses,
@@ -92,6 +93,122 @@ def test_observe_maps_child_callback_events_to_lines():
     assert "final reply streamed in parts" in text
     assert "status=completed" in text
     assert "did the thing" in text
+
+
+def test_runtime_metric_checkpoint_updates_manifest():
+    delegation_id, writers, _paths = create_live_transcripts(
+        [{"goal": "submit one candidate"}], delegation_id="deleg_stage"
+    )
+    assert delegation_id == "deleg_stage"
+    writer = writers[0]
+    assert writer is not None
+
+    metric = {
+        "check_kind": "preflight",
+        "reason": "candidate_stage:browser_started",
+        "fingerprint": "sha256:" + "a" * 64,
+    }
+    writer.observe("tool.started", "backlinkhub_record_runtime_metric", metric, metric)
+    writer.observe(
+        "tool.completed",
+        "backlinkhub_record_runtime_metric",
+        metric,
+        metric,
+        is_error=False,
+        result={"success": True},
+    )
+
+    checkpoints = dll.get_manifest_checkpoints("deleg_stage")
+    assert checkpoints[-1]["stage"] == "browser_started"
+
+
+def test_backlinkhub_tool_facts_are_current_segment_authority():
+    delegation_id, writers, _paths = create_live_transcripts(
+        [{"goal": "submit one candidate"}], delegation_id="deleg_facts"
+    )
+    writer = writers[0]
+    writer.observe(
+        "tool.completed", "backlinkhub_advance_submission_round", None, None,
+        is_error=False,
+        result={"success": True, "run_id": "run-1", "site_id": "site-1", "remaining": 2},
+    )
+    assert get_manifest_tool_facts(delegation_id)[0][
+        "backlinkhub_advance_submission_round"
+    ]["remaining"] == 2
+    writer.checkpoint("segment_started")
+    assert get_manifest_tool_facts(delegation_id) == [{"task_index": 0}]
+
+
+def test_failed_backlinkhub_result_does_not_create_fact_or_recorded_checkpoint():
+    delegation_id, writers, _paths = create_live_transcripts(
+        [{"goal": "submit one candidate"}], delegation_id="deleg_bad_fact"
+    )
+    writer = writers[0]
+    writer.observe(
+        "tool.completed", "backlinkhub_record_submission_result", None, None,
+        is_error=False,
+        result={"success": False, "error": "validation failed"},
+    )
+    assert get_manifest_tool_facts(delegation_id) == []
+    assert dll.get_manifest_checkpoints(delegation_id)[0]["stage"] != "recorded"
+
+
+def test_real_backlinkhub_envelopes_bind_advance_status_and_record_identity():
+    delegation_id, writers, _paths = create_live_transcripts(
+        [{"goal": "submit one candidate"}], delegation_id="deleg_real_shape"
+    )
+    writer = writers[0]
+    writer.observe(
+        "tool.completed", "backlinkhub_advance_submission_round", None, None,
+        is_error=False,
+        result={
+            "run_id": "run-1",
+            "site": {"site_id": "site-1"},
+            "status": {"site_id": "site-1", "daily_target": 6, "published": 2, "pending_review": 1},
+            "candidate": {"email": "secret@example.com", "links": ["https://secret.invalid"]},
+        },
+    )
+    writer.observe(
+        "tool.completed", "backlinkhub_record_submission_result", None, None,
+        is_error=False,
+        result={"event_id": "event-1", "identity_source": "last_advance", "outcome": "pending", "status": "recorded", "success": True, "work_item_id": "item-1"},
+    )
+    facts = get_manifest_tool_facts(delegation_id)[0]
+    assert facts["backlinkhub_advance_submission_round"]["site_id"] == "site-1"
+    assert facts["backlinkhub_advance_submission_round"]["site_progress"]["pending_review"] == 1
+    record = facts["backlinkhub_record_submission_result"]
+    assert record["run_id"] == "run-1" and record["site_id"] == "site-1"
+    assert "email" not in str(facts) and "links" not in str(facts)
+
+
+def test_real_envelope_identity_mismatch_and_stale_record_are_rejected():
+    delegation_id, writers, _paths = create_live_transcripts(
+        [{"goal": "submit one candidate"}], delegation_id="deleg_identity_guard"
+    )
+    writer = writers[0]
+    writer.observe(
+        "tool.completed", "backlinkhub_advance_submission_round", None, None,
+        is_error=False,
+        result={"run_id": "run-1", "site": {"site_id": "site-1"},
+                "status": {"site_id": "site-2", "published": 9},
+                "work_item_id": "item-1"},
+    )
+    assert get_manifest_tool_facts(delegation_id) == []
+    writer.observe(
+        "tool.completed", "backlinkhub_advance_submission_round", None, None,
+        is_error=False,
+        result={"run_id": "run-1", "site": {"site_id": "site-1"},
+                "status": {"site_id": "site-1", "published": 1},
+                "work_item_id": "item-1"},
+    )
+    writer.observe(
+        "tool.completed", "backlinkhub_record_submission_result", None, None,
+        is_error=False,
+        result={"event_id": "event-2", "outcome": "attempted_unconfirmed",
+                "status": "recorded", "success": True, "work_item_id": "stale-item"},
+    )
+    facts = get_manifest_tool_facts(delegation_id)[0]
+    assert "backlinkhub_record_submission_result" not in facts
 
 
 def test_finalize_records_budget_exhaustion_and_errors():

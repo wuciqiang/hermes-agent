@@ -237,6 +237,41 @@ def test_backlinkhub_progress_notice_is_plain_text_and_deduplicated(monkeypatch)
     assert kwargs["metadata"] == {"thread_id": "topic-1"}
 
 
+def test_feishu_thread_metadata_uses_reply_anchor_without_thread_id():
+    runner = object.__new__(GatewayRunner)
+    source = SimpleNamespace(
+        platform=Platform.FEISHU, chat_id="chat-1", thread_id=None, message_id="om_root",
+    )
+
+    assert runner._thread_metadata_for_source(source) == {"reply_to_message_id": "om_root"}
+
+
+def test_process_event_origin_inherits_event_message_id_without_rerouting():
+    runner = object.__new__(GatewayRunner)
+    origin = SessionSource(
+        platform=Platform.FEISHU, chat_id="chat-1", chat_type="group", thread_id="thread-1",
+        user_id="user-1", message_id=None,
+    )
+    runner.session_store = SimpleNamespace(
+        _ensure_loaded=lambda: None,
+        _entries={"agent:main:feishu:group:chat-1:thread-1": SimpleNamespace(origin=origin)},
+    )
+    event = {
+        "session_key": "agent:main:feishu:group:chat-1:thread-1",
+        "message_id": "om_root",
+        "platform": "telegram",
+        "chat_id": "wrong-chat",
+        "thread_id": "wrong-thread",
+    }
+
+    source = runner._build_process_event_source(event)
+
+    assert source.message_id == "om_root"
+    assert source.platform == Platform.FEISHU
+    assert source.chat_id == "chat-1"
+    assert source.thread_id == "thread-1"
+
+
 def test_non_backlink_site_id_does_not_trigger_progress_notice():
     runner = _runner(SimpleNamespace(send=AsyncMock()))
     event = _async_event("generic-site")
@@ -268,7 +303,7 @@ def test_backlinkhub_progress_notice_failure_does_not_raise(caplog, monkeypatch)
     assert "BacklinkHub progress notice failed" in caplog.text
 
 
-def test_backlinkhub_progress_notice_retries_without_thread_on_rejection(caplog):
+def test_backlinkhub_progress_notice_does_not_fallback_to_top_level_on_rejection(caplog):
     adapter = SimpleNamespace(send=AsyncMock(side_effect=[
         SimpleNamespace(success=False, error="99992402"),
         SimpleNamespace(success=True),
@@ -286,9 +321,9 @@ def test_backlinkhub_progress_notice_retries_without_thread_on_rejection(caplog)
         await asyncio.gather(*list(runner._background_tasks))
 
     asyncio.run(exercise())
-    assert adapter.send.await_count == 2
-    assert adapter.send.await_args_list[1].kwargs["metadata"] == {"scope_id": "tenant-1"}
-    assert "retrying without thread_id" in caplog.text
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.kwargs["metadata"] == {"thread_id": "topic-1", "scope_id": "tenant-1"}
+    assert "retrying without thread_id" not in caplog.text
 
 
 def test_unroutable_async_event_remains_retryable(

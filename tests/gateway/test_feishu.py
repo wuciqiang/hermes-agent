@@ -949,6 +949,7 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._dispatch_inbound_event.assert_awaited_once()
         event = adapter._dispatch_inbound_event.await_args.args[0]
         self.assertEqual(event.message_type, MessageType.TEXT)
+        self.assertEqual(event.source.message_id, "om_text")
         self.assertEqual(event.source.user_id, "u_user")  # tenant-scoped user_id preferred over app-scoped open_id
         self.assertEqual(event.source.user_name, "张三")
         self.assertEqual(event.source.user_id_alt, "on_union")

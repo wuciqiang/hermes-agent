@@ -11,6 +11,8 @@ import pytest
 
 from agent import chat_completion_helpers
 from agent.error_classifier import FailoverReason
+from agent.turn_recovery import route_classified_error
+from agent.turn_retry_state import TurnRetryState
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
 
@@ -98,6 +100,47 @@ class TestFallbackChainAdvancement:
     def test_exhausted_returns_false(self):
         agent = _make_agent(fallback_model=None)
         assert agent._try_activate_fallback() is False
+
+    @pytest.mark.parametrize("status_code", [500, 502])
+    def test_server_error_falls_back_after_retries(self, status_code):
+        """HTTP 500/502 failures use the transport fallback threshold."""
+        agent = _make_agent(fallback_model={"provider": "zai", "model": "glm-4.7"})
+        agent._try_activate_fallback = MagicMock(return_value=True)
+        classified = type("Classified", (), {
+            "reason": FailoverReason.server_error,
+            "error_context": {},
+            "billing_unverified": False,
+            "is_auth": False,
+        })()
+        error = RuntimeError(f"Error code: {status_code} - internal server error")
+        error.status_code = status_code
+
+        with patch("agent.conversation_loop._arm_fallback_restart", return_value="system"):
+            verdict = route_classified_error(
+                agent,
+                error,
+                classified,
+                TurnRetryState(),
+                error_msg=str(error).lower(),
+                error_context={},
+                recovered_with_pool=False,
+                base_url=agent.base_url,
+                model=agent.model,
+                messages=[],
+                api_messages=[],
+                system_message=None,
+                active_system_prompt="system",
+                conversation_history=[],
+                retry_count=2,
+                max_retries=3,
+                compression_attempts=0,
+                max_compression_attempts=1,
+                api_call_count=1,
+                effective_task_id=None,
+            )
+
+        assert verdict.action == "break"
+        agent._try_activate_fallback.assert_called_once_with(reason=FailoverReason.server_error)
 
     def test_advances_index(self):
         fbs = [

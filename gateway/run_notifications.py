@@ -782,7 +782,13 @@ class GatewayNotificationsMixin:
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    origin = entry.origin
+                    origin_updates = {
+                        field: evt[field]
+                        for field in ("message_id", "scope_id", "user_id", "user_name")
+                        if evt.get(field) and hasattr(origin, field)
+                    }
+                    return dataclasses.replace(origin, **origin_updates) if origin_updates else origin
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
             cached_source = self._get_cached_session_source(session_key)
@@ -1496,13 +1502,9 @@ class GatewayNotificationsMixin:
             result_obj = await adapter.send(source.chat_id, text, metadata=metadata)
             if getattr(result_obj, "success", True) is False:
                 logger.warning(
-                    "BacklinkHub progress notice with thread routing was rejected for site %s: %s; "
-                    "retrying without thread_id",
+                    "BacklinkHub progress notice with thread routing was rejected for site %s: %s",
                     result.get("site_id"), getattr(result_obj, "error", "unknown error"),
                 )
-                fallback_metadata = dict(metadata or {})
-                fallback_metadata.pop("thread_id", None)
-                await adapter.send(source.chat_id, text, metadata=fallback_metadata or None)
         except Exception:
             logger.exception("BacklinkHub progress notice failed for site %s", result.get("site_id"))
 

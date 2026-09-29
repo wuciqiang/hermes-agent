@@ -825,6 +825,55 @@ class TestFailedSegmentRecovery:
 
         assert failed_segment_can_continue(entry, self._progress()) is True
 
+    def test_recovers_timeout_entry_without_tool_trace_from_safe_progress(self):
+        """A host timeout can arrive without child messages/tool_trace."""
+        entry = {
+            "status": "failed",
+            "exit_reason": "timeout",
+            "error": "subagent timed out after provider transport failure",
+            "api_calls": 3,
+        }
+        progress = self._progress()
+        progress.update(
+            candidate_checkpoint_stage="browser_started",
+            candidate_bound=True,
+            candidate_external_side_effect="none",
+        )
+
+        assert failed_segment_can_continue(entry, progress) is True
+
+    def test_timeout_after_unrecorded_terminal_work_stops(self):
+        entry = {
+            "status": "timeout",
+            "exit_reason": "timeout",
+            "tool_trace": [self._tool("terminal")],
+        }
+
+        assert failed_segment_can_continue(entry, self._progress()) is False
+
+    def test_specific_failure_reason_overrides_generic_exit_reason(self):
+        entry = {
+            "status": "failed",
+            "exit_reason": "error",
+            "failure_reason": "api_connection_error",
+        }
+
+        assert failed_segment_can_continue(entry, self._progress()) is True
+
+    def test_timeout_with_specific_failure_reason_is_recoverable(self):
+        entry = {
+            "status": "timeout",
+            "exit_reason": "timeout",
+            "failure_reason": "api_connection_error",
+        }
+
+        assert failed_segment_can_continue(entry, self._progress()) is True
+
+    def test_generic_error_without_specific_reason_stops(self):
+        entry = {"status": "failed", "exit_reason": "error"}
+
+        assert failed_segment_can_continue(entry, self._progress()) is False
+
     def test_recovers_when_browser_work_was_durably_recorded(self):
         entry = self._entry(
             self._tool("terminal"),

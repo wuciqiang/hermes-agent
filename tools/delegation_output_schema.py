@@ -570,10 +570,13 @@ def failed_segment_can_continue(entry: Any, last_safe_payload: Any) -> bool:
     owns the one-retry-per-progress bound.
     """
 
-    if not isinstance(entry, dict) or entry.get("status") != "failed":
+    if not isinstance(entry, dict) or entry.get("status") not in {"failed", "timeout"}:
         return False
+    # Child lifecycle entries may use the generic ``error`` exit reason while
+    # preserving the provider's specific transport classification separately.
+    # Prefer that concrete classification; generic errors remain terminal.
     exit_reason = _normalize_reason(
-        entry.get("exit_reason") or entry.get("failure_reason")
+        entry.get("failure_reason") or entry.get("exit_reason")
     )
     if exit_reason not in _TRANSPORT_RECOVERY_EXIT_REASONS:
         return False

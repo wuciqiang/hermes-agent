@@ -25,6 +25,11 @@ _LEGACY_MAX_ASYNC_WARNED = False
 # models) was being killed mid-task. Stuck-child detection is the heartbeat staleness monitor;
 # delegation.child_timeout_seconds opts back in.
 DEFAULT_CHILD_TIMEOUT: Optional[float] = None
+# BacklinkHub owns a continuation loop, so a wedged provider must eventually
+# return control to that loop. Ordinary delegation keeps the unlimited default.
+# This exceeds the existing 600s provider request timeout, leaving a grace
+# window for a healthy slow response to unwind before host recovery starts.
+DEFAULT_BACKLINKHUB_CHILD_TIMEOUT = 900.0
 
 def _cfg() -> dict:
     """The ``delegation`` section, read through the origin so tests can patch it."""
@@ -128,15 +133,39 @@ def _parse_timeout(raw: Any) -> Optional[float]:
     parsed = float(raw)
     return None if parsed <= 0 else max(30.0, parsed)
 
-def _get_child_timeout() -> Optional[float]:
-    """Hard wall-clock cap for one child, or None (default: no timeout). Failures should come from what the child does
-    (API/tool errors, iteration budget), not a stopwatch; stuck children are caught by the heartbeat staleness
-    monitor. delegation.child_timeout_seconds > 0 opts in (floor 30 s); 0 or negative disables. Env fallback:
-    DELEGATION_CHILD_TIMEOUT_SECONDS."""
-    return _knob(
-        "child_timeout_seconds", "DELEGATION_CHILD_TIMEOUT_SECONDS", _parse_timeout, DEFAULT_CHILD_TIMEOUT,
-        "delegation.child_timeout_seconds=%r is not a valid number; using default (no timeout)",
+def _get_child_timeout(tool_profile: Optional[str] = None) -> Optional[float]:
+    """Resolve the child wall-clock cap while preserving ordinary delegation.
+
+    BacklinkHub has a host-owned continuation/recovery loop, so a wedged child
+    must eventually return control to it. Its profile-specific key wins, then
+    the existing generic setting; absent, invalid, or non-positive values use
+    the finite BacklinkHub default.
+    """
+    if tool_profile != "backlinkhub":
+        return _knob(
+            "child_timeout_seconds", "DELEGATION_CHILD_TIMEOUT_SECONDS", _parse_timeout, DEFAULT_CHILD_TIMEOUT,
+            "delegation.child_timeout_seconds=%r is not a valid number; using default (no timeout)",
+        )
+
+    cfg = _cfg()
+    profile_key = "backlinkhub_child_timeout_seconds"
+    raw = cfg.get(profile_key)
+    if raw is not None:
+        try:
+            parsed = _parse_timeout(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "delegation.%s=%r is not a valid number; using BacklinkHub default %.1fs",
+                profile_key, raw, DEFAULT_BACKLINKHUB_CHILD_TIMEOUT,
+            )
+            return DEFAULT_BACKLINKHUB_CHILD_TIMEOUT
+        return parsed or DEFAULT_BACKLINKHUB_CHILD_TIMEOUT
+
+    generic = _knob(
+        "child_timeout_seconds", "DELEGATION_CHILD_TIMEOUT_SECONDS", _parse_timeout, None,
+        "delegation.child_timeout_seconds=%r is not a valid number; using BacklinkHub default",
     )
+    return generic or DEFAULT_BACKLINKHUB_CHILD_TIMEOUT
 
 def _get_max_spawn_depth() -> int:
     """delegation.max_spawn_depth floored at 1 (no ceiling). Depth 0 is the parent; agents at depths 0..N-1 may spawn,

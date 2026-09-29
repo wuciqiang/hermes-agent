@@ -173,6 +173,31 @@ class TestDumpSubagentTimeoutDiagnostic:
         assert result is None or Path(result).exists()
 
 
+def test_backlinkhub_timeout_has_finite_profile_default(monkeypatch):
+    from tools import delegate_tool
+    from tools.delegate_tool_config import _get_child_timeout
+
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
+    assert _get_child_timeout() is None
+    assert _get_child_timeout("backlinkhub") == 900.0
+
+
+def test_backlinkhub_timeout_accepts_positive_config_and_nonpositive_uses_default(monkeypatch):
+    from tools import delegate_tool
+    from tools.delegate_tool_config import _get_child_timeout
+
+    config = {"backlinkhub_child_timeout_seconds": 45}
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: config)
+    assert _get_child_timeout("backlinkhub") == 45.0
+
+    config["backlinkhub_child_timeout_seconds"] = 0
+    assert _get_child_timeout("backlinkhub") == 900.0
+
+    config.clear()
+    config["child_timeout_seconds"] = 600
+    assert _get_child_timeout("backlinkhub") == 600.0
+
+
 # ── _run_single_child timeout branch wiring ───────────────────────────
 
 class TestRunSingleChildTimeoutDump:
@@ -200,6 +225,10 @@ class TestRunSingleChildTimeoutDump:
         result = self._invoke_with_short_timeout(child, monkeypatch)
 
         assert result["status"] == "timeout"
+        assert result["exit_reason"] == "timeout"
+        assert result["failure_reason"] == "provider_timeout"
+        assert result["timeout_phase"] == "before_first_llm_call"
+        assert result["tool_trace"] == []
         assert result["api_calls"] == 0
         assert result["diagnostic_path"] is not None
         dump_path = Path(result["diagnostic_path"])

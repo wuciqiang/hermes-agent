@@ -1453,6 +1453,9 @@ def delegate_task(
     )
     if err:
         return tool_error(err)
+    for _, _, child in children:
+        # This metadata never changes the model-facing tool schema.
+        setattr(child, "_delegate_tool_profile", tool_profile)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
@@ -1508,6 +1511,8 @@ def delegate_task(
             routing_cfg=routing_cfg,
             role=effective_role,
         )
+        # Session-local metadata for profile-specific child timeout policy.
+        setattr(child, "_delegate_tool_profile", tool_profile)
         if task_schema is not None:
             try:
                 child._delegate_output_schema = task_schema

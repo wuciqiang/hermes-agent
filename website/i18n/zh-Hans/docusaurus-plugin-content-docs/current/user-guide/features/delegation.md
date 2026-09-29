@@ -227,7 +227,7 @@ delegate_task(
 
 ## 子智能体超时
 
-默认情况下，子智能体**没有挂钟超时限制**。子智能体只会因其实际执行的操作而失败——API 错误、工具错误或达到迭代预算上限——而不会被委派层面的计时器终止。早期版本曾设有硬性上限（300 秒，后为 600 秒），但这会在任务执行过程中误杀正常工作的子智能体：深度代码审查、大规模研究分发以及慢速推理模型经常需要超过 10 分钟，而它们全程都在稳定推进。
+默认情况下，普通 delegation 子智能体**没有挂钟超时限制**；BacklinkHub 单站 worker 是下文说明的 profile-specific 例外。普通子智能体只会因其实际执行的操作而失败——API 错误、工具错误或达到迭代预算上限——而不会被委派层面的计时器终止。早期版本曾设有硬性上限（300 秒，后为 600 秒），但这会在任务执行过程中误杀正常工作的子智能体：深度代码审查、大规模研究分发以及慢速推理模型经常需要超过 10 分钟，而它们全程都在稳定推进。
 
 真正卡死的子智能体仍会被检测到：当子智能体没有任何进展（无 API 调用、无工具启动）时，心跳陈旧度监控会停止刷新父智能体的活动状态，从而让网关的不活动超时机制对真正卡死的工作进程生效。
 
@@ -237,9 +237,18 @@ delegate_task(
 delegation:
   child_timeout_seconds: 0     # 默认：0 = 无超时
   # child_timeout_seconds: 1800  # 选择启用的硬性上限（下限 30 秒）
+  backlinkhub_child_timeout_seconds: 900  # BacklinkHub 单站 worker 的挂钟上限，默认有限
 ```
 
-正值会对每个子智能体强制执行挂钟时间硬限制；`0` 或负值表示禁用。
+正值会对普通 delegation 子智能体强制执行挂钟时间硬限制；`child_timeout_seconds: 0` 或负值只表示
+普通 delegation 无限等待。BacklinkHub 单站 worker 优先使用 `backlinkhub_child_timeout_seconds`；该键
+缺失或无效时默认使用 `900` 秒。对 BacklinkHub 而言，专用值为 `0` 或负值也会回退到有限的 `900` 秒，
+不会关闭宿主层超时。只有在专用键缺失时，正的通用 `child_timeout_seconds` 才会作为下一优先级，之后
+才回退到内置的 `900` 秒。这个有限返回时间让现有 continuation 和 transport-recovery 链处理 provider
+不可达；`900` 秒也为现有 `600` 秒 provider request timeout 留出恢复余量。
+
+超时结果会保留 `status: "timeout"`、`exit_reason: "timeout"`、`failure_reason: "provider_timeout"`、
+API 调用次数、超时阶段和 tool trace。BacklinkHub 只有在现有 checkpoint 与副作用安全门确认可恢复时才会重试。
 
 :::tip 零调用超时时的诊断转储
 在配置了硬性上限的情况下，如果子智能体在**零次** API 调用的情况下超时（通常原因：provider 不可达、认证失败或工具 schema 被拒绝），`delegate_task` 会将结构化诊断信息写入 `~/.hermes/logs/subagent-timeout-<session>-<timestamp>.log`，其中包含子智能体的配置快照、凭据解析追踪以及早期错误消息。比之前的静默超时行为更易于定位根因。

@@ -665,7 +665,10 @@ class _ChildRun:
         from tools.delegate_tool import (_get_child_timeout, _get_subagent_approval_callback, _set_subagent_approval_cb)
         from tools.daemon_pool import DaemonThreadPoolExecutor
         child, task_index = self.child, self.task_index
-        child_timeout = _get_child_timeout()
+        profile = getattr(child, "_delegate_tool_profile", None)
+        # Preserve the no-argument seam used by ordinary delegation callers
+        # and tests; only a named profile needs the profile-aware resolver.
+        child_timeout = _get_child_timeout(profile) if profile else _get_child_timeout()
         executor = DaemonThreadPoolExecutor(
             max_workers=1, initializer=_set_subagent_approval_cb, initargs=(_get_subagent_approval_callback(),),
         )
@@ -728,12 +731,18 @@ class _ChildRun:
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,
+            "tool_trace": [],
             "timeout_seconds": child_timeout if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
             "timeout_phase": "before_first_llm_call" if before_first_call else "after_llm_calls" if is_timeout else None,
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
+        if is_timeout:
+            # Keep the generic timeout exit reason for compatibility while
+            # exposing the transport classification used by continuation.
+            _error_entry["failure_reason"] = "provider_timeout"
+            _error_entry["failure_retryable"] = True
         if isinstance(exc, json.JSONDecodeError):
             # A few provider SDK paths leak malformed response bodies as the
             # stdlib exception. Keep the failure typed so the backlink

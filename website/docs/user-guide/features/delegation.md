@@ -304,7 +304,7 @@ delegate_task(
 
 ## Child Timeout
 
-By default there is **no wall-clock timeout** on subagents. Children fail only from what they're actually doing — API errors, tool errors, or hitting their iteration budget — never from a delegation-level stopwatch. Earlier releases shipped a hard cap (300s, later 600s), which kept killing legitimately busy children mid-task: deep code reviews, large research fan-outs, and slow reasoning models routinely need more than 10 minutes while making steady progress the whole time.
+By default there is **no wall-clock timeout** on ordinary subagents. BacklinkHub single-site workers are the profile-specific exception described below. Ordinary children fail only from what they're actually doing — API errors, tool errors, or hitting their iteration budget — never from a delegation-level stopwatch. Earlier releases shipped a hard cap (300s, later 600s), which kept killing legitimately busy children mid-task: deep code reviews, large research fan-outs, and slow reasoning models routinely need more than 10 minutes while making steady progress the whole time.
 
 Genuinely stuck children are still detected: the heartbeat staleness monitor stops refreshing the parent's activity when a child makes no progress (no API calls, no tool starts, and no activity-timestamp ticks), letting the gateway inactivity timeout fire on a truly wedged worker. An in-flight model wait still counts as progress — subagents refresh the activity clock while waiting on the provider, so a slow local / long-prefill completion is not treated as stalled.
 
@@ -314,9 +314,21 @@ If you want a hard cap anyway (e.g. cost control on unattended cron-driven deleg
 delegation:
   child_timeout_seconds: 0     # default: 0 = no timeout
   # child_timeout_seconds: 1800  # opt-in hard cap (floor 30s)
+  backlinkhub_child_timeout_seconds: 900  # BacklinkHub site worker cap; finite by default
 ```
 
-A positive value enforces a hard wall-clock limit on each child; `0` or a negative value disables it.
+A positive `child_timeout_seconds` enforces a hard wall-clock limit on ordinary children; `0` or a negative
+value keeps ordinary delegation unlimited. BacklinkHub single-site workers use
+`backlinkhub_child_timeout_seconds` first and default to `900` seconds when that key is absent or invalid.
+For BacklinkHub, `0` or a negative value also falls back to the finite `900` second cap rather than disabling
+the host-owned timeout. If the profile-specific key is absent, a positive generic `child_timeout_seconds`
+value is used before the built-in `900` second default. This bounded return lets the existing continuation
+and transport-recovery path handle an unreachable provider; `900` seconds leaves grace beyond a provider
+request timeout of `600` seconds.
+
+The timeout result preserves `status: "timeout"`, `exit_reason: "timeout"`, `failure_reason: "provider_timeout"`,
+API-call count, timeout phase, and tool trace. BacklinkHub retries only when its existing checkpoint and
+side-effect gates prove recovery safe.
 
 When a configured cap fires, the child's result carries structured timeout
 metadata alongside the error message so parents and hooks can distinguish a

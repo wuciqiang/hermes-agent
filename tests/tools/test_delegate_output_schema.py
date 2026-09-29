@@ -67,6 +67,84 @@ def test_authoritative_progress_continues_despite_model_stop_wording():
     assert merged["queue_exhausted"] is False
 
 
+def test_authoritative_advance_facts_fill_missing_identity_for_transport_recovery():
+    payload = {"remaining": 6, "target_reached": False, "queue_exhausted": False}
+    merged = merge_authoritative_tool_facts(payload, [{
+        "backlinkhub_advance_submission_round": {
+            "run_id": "round_live",
+            "site_id": "site_live",
+            "work_item_id": "wri_live",
+            "platform_id": "platform_live",
+            "target_count": 6,
+            "site_progress": {
+                "remaining": 6,
+                "target_reached": False,
+                "queue_exhausted": False,
+            },
+        },
+    }])
+    assert merged["run_id"] == "round_live"
+    assert merged["site_id"] == "site_live"
+    assert merged["target"] == 6
+    assert merged["work_item_id"] == "wri_live"
+    assert merged["platform_id"] == "platform_live"
+    assert merged["authoritative_pending_work"] is True
+
+
+def test_stale_advance_facts_do_not_reopen_terminal_payload():
+    payload = {
+        "run_id": "round_live",
+        "site_id": "site_live",
+        "target": 6,
+        "remaining": 0,
+        "target_reached": True,
+        "queue_exhausted": True,
+    }
+    merged = merge_authoritative_tool_facts(payload, [{
+        "backlinkhub_advance_submission_round": {
+            "run_id": "round_live",
+            "site_id": "site_live",
+            "work_item_id": "wri_live",
+            "platform_id": "platform_live",
+            "site_progress": {
+                "remaining": 6,
+                "target_reached": False,
+                "queue_exhausted": False,
+            },
+        },
+    }])
+    assert merged["target_reached"] is True
+    assert merged["queue_exhausted"] is True
+    assert merged["remaining"] == 0
+    assert "authoritative_pending_work" not in merged
+
+
+def test_authoritative_facts_reject_target_mismatch_when_only_target_is_present():
+    payload = {"run_id": "round_live", "site_id": "site_live", "target": 6}
+    merged = merge_authoritative_tool_facts(payload, [{
+        "backlinkhub_advance_submission_round": {
+            "run_id": "round_live",
+            "site_id": "site_live",
+            "target": 7,
+            "site_progress": {"remaining": 7},
+        },
+    }])
+    assert merged == payload
+
+
+def test_authoritative_facts_reject_conflicting_target_fields():
+    payload = {"run_id": "round_live", "site_id": "site_live", "target": 6}
+    merged = merge_authoritative_tool_facts(payload, [{
+        "backlinkhub_advance_submission_round": {
+            "run_id": "round_live",
+            "site_id": "site_live",
+            "target_count": 6,
+            "target": 7,
+        },
+    }])
+    assert merged == payload
+
+
 def test_new_continuation_segment_does_not_reuse_previous_checkpoint():
     checkpoints = [
         {"task_index": 0, "stage": "advanced"},
@@ -429,6 +507,28 @@ class TestContinuationBoundary:
         ) == "completed"
         assert completion_can_continue(payload, exit_reason="max_iterations") is True
 
+    @pytest.mark.parametrize(
+        "stop_reason",
+        [None, "continuation_required", "worker_execution_boundary"],
+    )
+    def test_machine_boundary_marker_allows_missing_or_known_stop_reason(self, stop_reason):
+        payload = self._unfinished(
+            stop_reason=stop_reason,
+            segment_iteration_boundary=True,
+            continuation_terminal=False,
+            candidate_external_side_effect="none",
+        )
+        assert completion_can_continue(payload, exit_reason="completed") is True
+
+    def test_machine_boundary_marker_does_not_allow_arbitrary_completed_result(self):
+        payload = self._unfinished(
+            stop_reason="completed",
+            segment_iteration_boundary=True,
+            continuation_terminal=False,
+            candidate_external_side_effect="none",
+        )
+        assert completion_can_continue(payload, exit_reason="completed") is False
+
     def test_explicit_segment_boundary_with_zero_remaining_and_safe_result_continues(self):
         payload = self._unfinished(
             remaining=0,
@@ -770,6 +870,18 @@ class TestFailedSegmentRecovery:
             self._tool("skill_view"),
             self._tool("backlinkhub_advance_submission_round"),
             exit_reason="provider_json_decode_error",
+        )
+
+        assert failed_segment_can_continue(entry, self._progress()) is True
+
+        entry["tool_trace"].append(self._tool("terminal"))
+        assert failed_segment_can_continue(entry, self._progress()) is False
+
+    def test_recovers_api_connection_error_only_when_trace_is_safe(self):
+        entry = self._entry(
+            self._tool("skill_view"),
+            self._tool("backlinkhub_advance_submission_round"),
+            exit_reason="APIConnectionError",
         )
 
         assert failed_segment_can_continue(entry, self._progress()) is True
@@ -1312,7 +1424,7 @@ class TestDelegateTaskDispatch:
         assert results and results[0].get("schema_valid") is True
 
 
-def _run_auto_continuation_scenario(payloads, *, checkpoint_stage=None):
+def _run_auto_continuation_scenario(payloads, *, checkpoint_stage=None, tool_facts=None):
     children = []
     for index, payload in enumerate(payloads, start=1):
         if isinstance(payload, dict) and "_raw_child_response" in payload:
@@ -1392,6 +1504,11 @@ def _run_auto_continuation_scenario(payloads, *, checkpoint_stage=None):
         patch(
             "tools.delegation_live_log.get_manifest_checkpoints",
             return_value=([{"task_index": 0, "stage": checkpoint_stage}] if checkpoint_stage else []),
+        ),
+        patch(
+            "tools.delegation_live_log.get_manifest_tool_facts",
+            side_effect=tool_facts if callable(tool_facts) else None,
+            return_value=[] if callable(tool_facts) else (tool_facts or []),
         ),
         patch(
             "tools.async_delegation.dispatch_async_delegation_batch",
@@ -1736,6 +1853,7 @@ class TestBacklinkAutoContinuation:
                 "completed": False,
                 "failed": True,
                 "failure_reason": "server_error",
+                "exit_reason": "error",
                 "api_calls": 3,
                 "messages": messages,
             }
@@ -1765,6 +1883,49 @@ class TestBacklinkAutoContinuation:
         assert "run_id=round_test" in built_goals[2]
         assert combined["results"][0]["continuation_segments"] == 3
         assert combined["continuation_history"][1]["transport_recovery"] == "scheduled"
+
+    @staticmethod
+    def _live_advance_facts():
+        return [{
+            "backlinkhub_advance_submission_round": {
+                "run_id": "round_test",
+                "site_id": "site_thesitemath",
+                "work_item_id": "wri_live",
+                "platform_id": "platform_live",
+                "target_count": 6,
+                "site_progress": {
+                    "remaining": 6,
+                    "target_reached": False,
+                    "queue_exhausted": False,
+                },
+            }
+        }]
+
+    def test_transport_recovery_uses_live_identity_on_later_segment_with_counts(self):
+        terminal = _round_payload(
+            published=1, pending=5, remaining=0, target_reached=True,
+            stop_reason="target_reached", ego_cleanup="closed",
+            segment_iteration_boundary=False,
+        )
+        calls = 0
+        def facts(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return self._live_advance_facts() if calls <= 4 else []
+        _handle, combined, _dispatched, built_goals = _run_auto_continuation_scenario(
+            [
+                _round_payload(stop_reason="segment_iteration_boundary", segment_iteration_boundary=True),
+                self._transport_failure("backlinkhub_advance_submission_round"),
+                terminal,
+            ],
+            checkpoint_stage="browser_started",
+            tool_facts=facts,
+        )
+        assert len(built_goals) == 3
+        assert "run_id=round_test" in built_goals[2]
+        assert "continuation_error" not in combined
+        assert "outcome=failed_retryable" in built_goals[2]
+        assert "failure_reason=provider_unavailable_before_submission" in built_goals[2]
 
     def test_same_progress_gets_only_one_transport_recovery(self):
         failure = self._transport_failure("backlinkhub_advance_submission_round")

@@ -125,6 +125,16 @@ _TRANSPORT_RECOVERY_EXIT_REASONS = frozenset(
         "overloaded",
         "provider_timeout",
         "timeout",
+        # LiteLLM/OpenAI-compatible providers commonly surface a transient
+        # connection failure under this typed exception name.  The reason is
+        # normalized before this set is checked, so both ``APIConnectionError``
+        # and ``api_connection_error`` are covered without parsing prose.
+        "api_connection_error",
+        "apiconnection_error",
+        # ``_normalize_reason`` intentionally only splits lower-to-upper
+        # transitions, so the SDK's literal ``APIConnectionError`` becomes
+        # this compact form.
+        "apiconnectionerror",
         # Some provider SDKs expose an invalid response body as a raw
         # JSONDecodeError instead of their typed transport exception.  It is
         # recoverable only through the same trace-gated path below.
@@ -153,6 +163,7 @@ def merge_authoritative_tool_facts(
         return merged
     expected_run = str(merged.get("run_id") or "")
     expected_site = str(merged.get("site_id") or "")
+    expected_target = merged.get("target")
     direct_fields = {
         "remaining", "queue_exhausted", "target_reached", "target", "target_count", "daily_target",
     }
@@ -172,27 +183,65 @@ def merge_authoritative_tool_facts(
             fact = item.get(name)
             if isinstance(fact, dict):
                 ordered.append((name, fact))
+    has_record_fact = any(name == _TRACE_RECORD_TOOL for name, _fact in ordered)
+    preserve_terminal_progress = (
+        (merged.get("target_reached") is True or merged.get("queue_exhausted") is True)
+        and not has_record_fact
+    )
     for name, fact in ordered:
         if expected_run and str(fact.get("run_id") or "") != expected_run:
             continue
         if expected_site and str(fact.get("site_id") or "") != expected_site:
             continue
-        for key in direct_fields:
-            if key in fact:
-                merged[key] = fact[key]
-        progress = fact.get("site_progress")
-        if not isinstance(progress, dict):
-            progress = {}
-        for key in progress_fields:
-            if key in progress:
-                target_key = {
-        "pending_review": "pending",
-        "pending": "pending",
-        "submission_unconfirmed": "attempted_unconfirmed",
-        "attempted_unconfirmed": "attempted_unconfirmed",
-                    "daily_target": "target",
-                }.get(key, key)
-                merged[target_key] = progress[key]
+        fact_progress = fact.get("site_progress")
+        if not isinstance(fact_progress, dict):
+            fact_progress = {}
+        target_values = [
+            value
+            for value in (
+                fact.get("target_count"),
+                fact.get("daily_target"),
+                fact.get("target"),
+                fact_progress.get("target_count"),
+                fact_progress.get("daily_target"),
+                fact_progress.get("target"),
+            )
+            if value is not None
+        ]
+        if len({str(value) for value in target_values}) > 1:
+            continue
+        fact_target = target_values[0] if target_values else None
+        if expected_target is not None and fact_target is not None and str(fact_target) != str(expected_target):
+            continue
+        if not expected_run and fact.get("run_id"):
+            merged["run_id"] = fact["run_id"]
+            expected_run = str(fact["run_id"])
+        if not expected_site and fact.get("site_id"):
+            merged["site_id"] = fact["site_id"]
+            expected_site = str(fact["site_id"])
+        if expected_target is None and fact_target is not None:
+            merged["target"] = fact_target
+            expected_target = fact_target
+        if not merged.get("work_item_id") and fact.get("work_item_id"):
+            merged["work_item_id"] = fact["work_item_id"]
+        if not merged.get("platform_id") and fact.get("platform_id"):
+            merged["platform_id"] = fact["platform_id"]
+        if not preserve_terminal_progress:
+            for key in direct_fields:
+                if key in fact:
+                    merged[key] = fact[key]
+        progress = fact_progress
+        if not preserve_terminal_progress:
+            for key in progress_fields:
+                if key in progress:
+                    target_key = {
+                        "pending_review": "pending",
+                        "pending": "pending",
+                        "submission_unconfirmed": "attempted_unconfirmed",
+                        "attempted_unconfirmed": "attempted_unconfirmed",
+                        "daily_target": "target",
+                    }.get(key, key)
+                    merged[target_key] = progress[key]
     if (
         ordered
         and merged.get("remaining", 0) > 0
@@ -299,11 +348,32 @@ def _continuation_boundary_kind(
     if _candidate_page_failure_can_continue(data) and effective_exit in {"", "completed"}:
         return "candidate_page_failure"
 
-    # Only the machine boundary label is resumable. Historical localized
-    # reasons paired with the marker are ambiguous and fail closed.
+    # A machine boundary marker is authoritative when the optional stop reason
+    # is absent or one of the finite, recognized boundary labels. Arbitrary
+    # prose and the worker's max_iterations marker remain terminal.
     explicit_boundary = (
         data.get("segment_iteration_boundary") is True
-        and stop_reason == _EXPLICIT_SEGMENT_STOP_REASON
+        and data.get("continuation_terminal") is False
+        and data.get("candidate_external_side_effect") == "none"
+        and (
+            not stop_reason
+            or stop_reason == _EXPLICIT_SEGMENT_STOP_REASON
+            or stop_reason in _KNOWN_EARLY_STOP_REASONS
+            or reported_reason in _KNOWN_EARLY_STOP_REASONS
+        )
+    )
+    recorded_outcome_boundary = (
+        data.get("candidate_bound") is True
+        and data.get("candidate_external_side_effect") in {
+            "confirmed", "unconfirmed", "attempted_unconfirmed",
+        }
+        and data.get("candidate_checkpoint_stage") == "recorded"
+        and data.get("segment_iteration_boundary") is True
+        and data.get("continuation_terminal") is False
+        and data.get("stop_reason") == _EXPLICIT_SEGMENT_STOP_REASON
+        and any(data.get(field, 0) > 0 for field in (
+            "published", "pending", "attempted_unconfirmed", "failed_retryable", "failed_final",
+        ))
     )
     known_early_boundary = (
         stop_reason in _KNOWN_EARLY_STOP_REASONS
@@ -325,6 +395,8 @@ def _continuation_boundary_kind(
         return None
     if explicit_boundary:
         return "explicit"
+    if recorded_outcome_boundary:
+        return "recorded_outcome"
     if known_early_boundary:
         return "known_early"
     if safe_bound_candidate:

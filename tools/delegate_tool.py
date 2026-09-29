@@ -1823,7 +1823,14 @@ def delegate_task(
                 f"run_id={recovery.get('run_id')}; site_id={recovery.get('site_id')}; "
                 f"work_item_id={recovery.get('work_item_id')}; platform_id={recovery.get('platform_id')}."
             )
-            if stage in {"final_action_started", "record_started", "browser_started"}:
+            if recovery.get("safe_pre_submission_failure") is True:
+                action = (
+                    "当前候选只到 browser_started，且宿主确认没有外部副作用；首个业务调用必须对原 work_item_id "
+                    "调用 backlinkhub_record_submission_result，outcome=failed_retryable，"
+                    "failure_reason=provider_unavailable_before_submission，然后再 advance 领取下一候选；"
+                    "禁止再次浏览或提交该候选。"
+                )
+            elif stage in {"final_action_started", "record_started"}:
                 action = (
                     "先对原 work_item_id 调用 backlinkhub_record_submission_result，"
                     "outcome=attempted_unconfirmed，明确说明宿主在该候选执行中断，外部副作用无法确认；"
@@ -1991,6 +1998,45 @@ def delegate_task(
             except Exception:
                 logger.debug("Could not build host recovery request", exc_info=True)
                 return None
+
+        def _merge_transport_recovery(
+            result: Dict[str, Any], metadata: Dict[str, Any]
+        ) -> Dict[str, Any]:
+            """Attach live-state recovery even when progress metadata exists."""
+            entries = result.get("results") if isinstance(result, dict) else None
+            entry = (
+                entries[0]
+                if isinstance(entries, list)
+                and entries
+                and isinstance(entries[0], dict)
+                else {}
+            )
+            transport_reasons = {
+                "server_error",
+                "overloaded",
+                "provider_timeout",
+                "timeout",
+                "api_connection_error",
+                "apiconnection_error",
+                "apiconnectionerror",
+                "provider_json_decode_error",
+            }
+            exit_reason = str(entry.get("exit_reason") or "").strip().lower()
+            failure_reason = str(entry.get("failure_reason") or "").strip().lower()
+            if (
+                exit_reason not in transport_reasons
+                and failure_reason not in transport_reasons
+            ) or isinstance(metadata.get("pending_recovery_request"), dict):
+                return metadata
+            recovery = _recovery_request_from_live_state()
+            if not recovery:
+                return metadata
+            merged = dict(metadata)
+            if recovery.get("stage") == "browser_started":
+                recovery = dict(recovery)
+                recovery["safe_pre_submission_failure"] = True
+            merged["pending_recovery_request"] = recovery
+            return merged
         def _publish_authoritative_metadata(result: Dict[str, Any], metadata: Dict[str, Any]) -> None:
             """Keep private continuation state and returned progress identical."""
             private = result.get("_completion_metadata")
@@ -2180,15 +2226,7 @@ def delegate_task(
             _record_segment(combined)
             metadata = _single_completion_metadata(combined)
             metadata = _authoritative_metadata(metadata)
-            if not metadata:
-                first_entries = combined.get("results") if isinstance(combined, dict) else None
-                first_entry = first_entries[0] if isinstance(first_entries, list) and first_entries and isinstance(first_entries[0], dict) else {}
-                if str(first_entry.get("exit_reason") or "").strip().lower() in {
-                    "server_error", "overloaded", "provider_timeout", "timeout", "provider_json_decode_error",
-                }:
-                    recovery = _recovery_request_from_live_state()
-                    if recovery:
-                        metadata = {"pending_recovery_request": recovery}
+            metadata = _merge_transport_recovery(combined, metadata)
             checkpoint_stage = _latest_candidate_checkpoint()
             if metadata and checkpoint_stage:
                 metadata["candidate_checkpoint_stage"] = checkpoint_stage
@@ -2285,6 +2323,23 @@ def delegate_task(
                 _record_segment(combined)
                 metadata = _single_completion_metadata(combined)
                 metadata = _authoritative_metadata(metadata)
+                metadata = _merge_transport_recovery(combined, metadata)
+                if (
+                    isinstance(metadata.get("pending_recovery_request"), dict)
+                    and last_safe_metadata
+                ):
+                    # A transport-failed child cannot emit its structured
+                    # browser state. Carry forward only missing local state;
+                    # live recovery identity and authoritative progress remain
+                    # authoritative in ``metadata``.
+                    for key in (
+                        "ego_task_space_id",
+                        "ego_cleanup",
+                        "candidate_bound",
+                        "candidate_external_side_effect",
+                    ):
+                        if key not in metadata and key in last_safe_metadata:
+                            metadata[key] = last_safe_metadata[key]
                 checkpoint_stage = _latest_candidate_checkpoint()
                 if metadata and checkpoint_stage:
                     metadata["candidate_checkpoint_stage"] = checkpoint_stage
@@ -2373,6 +2428,14 @@ def delegate_task(
                             failed_entry, last_safe_metadata
                         )
                     if failed_segment_safe:
+                        live_recovery = _recovery_request_from_live_state()
+                        if (
+                            isinstance(live_recovery, dict)
+                            and live_recovery.get("stage") == "browser_started"
+                        ):
+                            live_recovery["safe_pre_submission_failure"] = True
+                            metadata = dict(metadata)
+                            metadata["pending_recovery_request"] = live_recovery
                         recovery_fingerprint = continuation_progress_fingerprint(
                             last_safe_metadata
                         )
@@ -2384,7 +2447,16 @@ def delegate_task(
                             transport_recovery_fingerprints.add(recovery_fingerprint)
                             if segment_history:
                                 segment_history[-1]["transport_recovery"] = "scheduled"
-                            metadata = dict(last_safe_metadata)
+                            # Preserve a live recovery request derived from the
+                            # failed segment.  Its identity/checkpoint is more
+                            # specific than the previous successful payload;
+                            # the progress fingerprint above still bounds it
+                            # to one retry for the same round progress.
+                            metadata = dict(
+                                metadata
+                                if isinstance(metadata.get("pending_recovery_request"), dict)
+                                else last_safe_metadata
+                            )
                             logger.info(
                                 "delegate_task scheduling one transport recovery: "
                                 "segment=%d exit_reason=%s",
@@ -2408,6 +2480,8 @@ def delegate_task(
                 # here instead of spinning up identical Luna/Ego segments.
                 fingerprint = continuation_progress_fingerprint(metadata)
                 if (
+                    not isinstance(metadata.get("pending_recovery_request"), dict)
+                    and
                     previous_fingerprint is not None
                     and fingerprint is not None
                     and fingerprint == previous_fingerprint

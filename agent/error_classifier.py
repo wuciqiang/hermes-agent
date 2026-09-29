@@ -580,6 +580,27 @@ def _by_transport(c: _Ctx) -> Optional[Verdict]:
     if c.error_type == "RuntimeError" and "consecutive stale attempts" in msg and "aborting this call" in msg:
         return _v(_R.timeout, **_ABORT_FALLBACK)
     transport = c.error_type in _TRANSPORT_ERROR_TYPES or isinstance(c.error, (TimeoutError, ConnectionError, OSError))
+    # SDK adapters commonly re-raise a connect/DNS error as a generic
+    # ``RuntimeError("Connection error.")``. Inspect the cause chain so it
+    # reaches the bounded transport fallback rail instead of ``unknown``.
+    if not transport:
+        current: BaseException | None = c.error
+        seen: set[int] = set()
+        for _ in range(5):
+            if current is None or id(current) in seen:
+                break
+            seen.add(id(current))
+            current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+            if current is None:
+                break
+            current_msg = str(current).lower()
+            if (
+                type(current).__name__ in _TRANSPORT_ERROR_TYPES
+                or isinstance(current, (TimeoutError, ConnectionError, OSError))
+                or any(pattern in current_msg for pattern in _CONNECTION_MESSAGE_PATTERNS + _TIMEOUT_MESSAGE_PATTERNS)
+            ):
+                transport = True
+                break
     return _V_TIMEOUT if transport else None
 
 

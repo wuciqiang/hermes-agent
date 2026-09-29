@@ -1398,6 +1398,20 @@ class TestConnectionMessagePatterns:
         assert result.retryable is True
         assert result.should_compress is False
 
+    def test_wrapped_dns_failure_is_timeout(self):
+        """A generic SDK wrapper must preserve the transport recovery rail."""
+        try:
+            try:
+                raise OSError(-3, "Temporary failure in name resolution")
+            except OSError as cause:
+                raise RuntimeError("Connection error.") from cause
+        except RuntimeError as error:
+            result = classify_api_error(error)
+
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+        assert result.should_compress is False
+
     def test_connect_failure_never_routes_to_compression_on_large_session(self):
         # A connection that was never established is not an overflow signal,
         # even when the session is huge (the disconnect+large-session
@@ -1636,5 +1650,3 @@ class TestServerInjectedParameterRejection:
         result = classify_api_error(e, provider="custom", model="m")
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
-
-

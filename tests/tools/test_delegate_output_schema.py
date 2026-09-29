@@ -717,6 +717,21 @@ class TestContinuationBoundary:
         payload.pop("candidate_checkpoint_stage")
         assert completion_can_continue(payload, exit_reason="completed") is False
 
+    def test_recorded_attempted_unconfirmed_unknown_side_effect_continues(self):
+        payload = self._unfinished(
+            candidate_bound=True,
+            candidate_external_side_effect="unknown",
+            candidate_checkpoint_stage="recorded",
+            segment_iteration_boundary=True,
+            continuation_terminal=False,
+            stop_reason="segment_iteration_boundary",
+            attempted_unconfirmed=1,
+        )
+        assert completion_can_continue(payload, exit_reason="completed") is True
+
+        payload.pop("candidate_checkpoint_stage")
+        assert completion_can_continue(payload, exit_reason="completed") is False
+
     def test_latest_real_boundary_ignores_historical_effect_after_record(self):
         payload = self._unfinished(
             site_id="site_thesitemath",

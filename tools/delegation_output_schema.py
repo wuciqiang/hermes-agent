@@ -354,7 +354,14 @@ def _continuation_boundary_kind(
     explicit_boundary = (
         data.get("segment_iteration_boundary") is True
         and data.get("continuation_terminal") is False
-        and data.get("candidate_external_side_effect") == "none"
+        and (
+            data.get("candidate_external_side_effect") == "none"
+            or (
+                data.get("candidate_external_side_effect") == "unknown"
+                and data.get("candidate_checkpoint_stage") == "recorded"
+                and data.get("attempted_unconfirmed", 0) > 0
+            )
+        )
         and (
             not stop_reason
             or stop_reason == _EXPLICIT_SEGMENT_STOP_REASON
@@ -513,10 +520,20 @@ def completion_can_continue(
             "published", "pending", "attempted_unconfirmed", "failed_retryable", "failed_final",
         ))
     )
+    recorded_attempted_unknown_boundary = (
+        data.get("candidate_bound") is True
+        and data.get("candidate_external_side_effect") == "unknown"
+        and data.get("candidate_checkpoint_stage") == "recorded"
+        and data.get("segment_iteration_boundary") is True
+        and data.get("continuation_terminal") is False
+        and data.get("stop_reason") == _EXPLICIT_SEGMENT_STOP_REASON
+        and data.get("attempted_unconfirmed", 0) > 0
+    )
     if (
         data.get("candidate_bound") is True
         and data.get("candidate_external_side_effect") != "none"
         and not recorded_confirmed_boundary
+        and not recorded_attempted_unknown_boundary
     ):
         return False
 

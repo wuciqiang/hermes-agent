@@ -382,7 +382,7 @@ def _cli_config_defaults():
     """Built-in defaults for every config key the CLI reads (the file overlays these)."""
     img = "nikolaik/python-nodejs:python3.11-nodejs20"
     return {
-        "model": {"default": "", "base_url": "", "provider": "auto"},
+        "model": {"default": "gpt-6.1-sol", "base_url": "", "provider": "auto"},
         "terminal": {
             "env_type": "local", "cwd": ".", "home_mode": "auto", "lifetime_seconds": 300,  # cwd "." -> os.getcwd()
             "docker_image": img, "docker_forward_env": [], "singularity_image": f"docker://{img}",
@@ -398,7 +398,7 @@ def _cli_config_defaults():
         "compression": {"enabled": True, "threshold": 0.50, "min_tail_user_messages": 1},
         "agent": {
             "max_turns": 500, "verbose": False, "system_prompt": "", "prefill_messages_file": "",  # max_turns shared with subagents
-            "reasoning_effort": "", "service_tier": "",
+            "reasoning_effort": "xhigh", "service_tier": "",
             "personalities": {},  # user overrides merged by name over hermes_cli.personality builtins
         },
         "display": {

@@ -1132,7 +1132,10 @@ class TestRunJobConfigEnvVarExpansion:
 
     def test_model_env_ref_in_config_yaml_is_expanded(self, tmp_path, monkeypatch):
         """${VAR} in config.yaml model: is expanded using env after .env is loaded."""
-        (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_MODEL}\n")
+        (tmp_path / "config.yaml").write_text(
+            "model: ${_HERMES_TEST_CRON_MODEL}\n"
+            "cron:\n  model: ${_HERMES_TEST_CRON_MODEL}\n"
+        )
         monkeypatch.setenv("_HERMES_TEST_CRON_MODEL", "gpt-4o-mini-cron-test")
 
         job = {"id": "env-job", "name": "env test", "prompt": "hi"}
@@ -1232,6 +1235,8 @@ class TestRunJobConfigEnvVarExpansion:
             "model:\n"
             "  default: gpt-5.6-sol\n"
             "  provider: openai-codex\n"
+            "cron:\n"
+            "  model: gpt-5.6-sol\n"
             "fallback_providers:\n"
             "  - provider: anthropic\n"
             "  - provider: openrouter\n"
@@ -1282,7 +1287,10 @@ class TestRunJobConfigEnvVarExpansion:
 
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
         """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""
-        (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_UNSET_VAR}\n")
+        (tmp_path / "config.yaml").write_text(
+            "model: ${_HERMES_TEST_CRON_UNSET_VAR}\n"
+            "cron:\n  model: ${_HERMES_TEST_CRON_UNSET_VAR}\n"
+        )
         monkeypatch.delenv("_HERMES_TEST_CRON_UNSET_VAR", raising=False)
 
         job = {"id": "unset-job", "name": "unset var test", "prompt": "hi"}
@@ -1351,8 +1359,8 @@ class TestRunJobModelResolution:
         assert mock_agent_cls.call_args.kwargs["model"] == "env-model"
 
 
-    def test_no_model_anywhere_fails_with_actionable_error(self, tmp_path, monkeypatch):
-        """All three sources empty → fail fast with a clear message, not an opaque 400."""
+    def test_no_model_anywhere_uses_cron_default(self, tmp_path, monkeypatch):
+        """An empty config uses the built-in cron model instead of reaching the provider empty."""
         (tmp_path / "config.yaml").write_text("")
         monkeypatch.delenv("HERMES_MODEL", raising=False)
 
@@ -1367,25 +1375,19 @@ class TestRunJobModelResolution:
              patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                    return_value=self._RUNTIME), \
              patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
             success, _, _, error = run_job(job)
 
-        assert success is False
-        assert error is not None
-        assert "no model configured" in error
-        # AIAgent must never be constructed with an empty model — that's
-        # precisely the bug we're guarding against.
-        mock_agent_cls.assert_not_called()
+        assert success is True
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["model"] == "gpt-6.1-sol"
 
 
-    def test_config_model_alias_key_resolves(self, tmp_path, monkeypatch):
-        """A ``model: {model: ...}`` alias key resolves like the CLI sibling.
-
-        ``hermes_cli/oneshot.py``, ``fallback_cmd.py`` and ``prompt_size.py``
-        all accept ``model.model`` as an alias for ``model.default``. The cron
-        resolver mirrors that so a config that works in the CLI also works in
-        cron.
-        """
-        (tmp_path / "config.yaml").write_text("model:\n  model: alias-key-model\n")
+    def test_explicit_cron_fleet_default_resolves(self, tmp_path, monkeypatch):
+        """An explicit cron fleet model controls unpinned job execution."""
+        (tmp_path / "config.yaml").write_text("cron:\n  model: alias-key-model\n")
         monkeypatch.delenv("HERMES_MODEL", raising=False)
 
         job = {"id": "alias-job", "name": "alias", "prompt": "hi", "model": None}

@@ -18,6 +18,7 @@ snapshot capture. They are load-bearing: without the guard, cases (b) call the
 agent and "succeed" instead of failing closed.
 """
 
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -143,17 +144,15 @@ class TestProviderDriftGuard:
         assert error is None
         assert agent_constructed is True
 
-    def test_missing_model_guides_to_user_owned_cli(self, tmp_path, monkeypatch):
-        """A missing-model failure cannot advertise agent-owned pinning."""
+    def test_missing_model_uses_builtin_cron_default(self, tmp_path, monkeypatch):
+        """An unpinned job uses the built-in cron model when no other source is set."""
         monkeypatch.delenv("HERMES_MODEL", raising=False)
         success, _output, _final_response, error, agent_constructed = \
             _run_with_current_provider(_base_job(), "openrouter", tmp_path)
 
-        assert success is False
-        assert agent_constructed is False
-        assert error is not None
-        assert "hermes cron edit pin-test --model <name>" in error
-        assert "cronjob action=update" not in error
+        assert success is True
+        assert agent_constructed is True
+        assert error is None
 
     def test_d_explicitly_pinned_runs_regardless_of_drift(self, tmp_path):
         """(d) Explicitly-pinned job (job["provider"] set) → runs regardless.
@@ -192,7 +191,7 @@ class TestCreateJobSnapshot:
         return jobs
 
     def test_unpinned_job_captures_snapshot(self, monkeypatch):
-        jobs = self._isolate_storage(monkeypatch)
+        jobs = TestCreateJobSnapshot._isolate_storage(monkeypatch)
 
         with patch(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -204,7 +203,7 @@ class TestCreateJobSnapshot:
         assert job["provider_snapshot"] == "openrouter"
 
     def test_pinned_job_skips_snapshot(self, monkeypatch):
-        jobs = self._isolate_storage(monkeypatch)
+        jobs = TestCreateJobSnapshot._isolate_storage(monkeypatch)
 
         resolver = MagicMock(return_value={"provider": "openrouter"})
         with patch("hermes_cli.runtime_provider.resolve_runtime_provider", resolver):
@@ -273,37 +272,32 @@ def _run_with_current_provider_and_model(
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}
         mock_agent_cls.return_value = mock_agent
-        success, output, final_response, error = run_job(job)
+        with patch.dict(os.environ, {"HERMES_MODEL": current_model}):
+            success, output, final_response, error = run_job(job)
         agent_constructed = mock_agent_cls.called
     return success, output, final_response, error, agent_constructed
 
 
 class TestModelDriftGuard:
-    """#44585 C1: model drift on the SAME provider must also fail closed —
-    the incident named a model (claude-fable-5), and an unpinned job reads
-    config.yaml model.default fresh every tick independently of provider."""
+    """Cron fleet defaults deliberately cover the model drift axis."""
 
-    def test_model_drift_same_provider_fails_closed(self, tmp_path):
-        # Provider unchanged (openrouter==openrouter), but the global default
-        # MODEL swapped to a premium model since creation → must fail closed.
+    def test_explicit_cron_model_is_exempt_from_model_drift_guard(self, tmp_path):
+        # An explicit cron fleet model is intentional, so an older snapshot does not block it.
         job = _base_job(
             provider_snapshot="openrouter",
             model_snapshot="llama-3.3-70b-instruct:free",
         )
         success, output, final_response, error, agent_constructed = \
             _run_with_current_provider_and_model(
-                job, "openrouter", "claude-fable-5", tmp_path
+                job, "openrouter", "claude-fable-5", tmp_path, cron_model="claude-fable-5"
             )
-        assert agent_constructed is False, "paid call must not be made on model drift"
-        assert success is False
-        blob = f"{error}\n{output}".lower()
-        assert "claude-fable-5" in blob
-        assert "llama-3.3-70b-instruct:free" in blob
-        assert "44585" in blob
+        # An explicit cron fleet model is intentional and therefore outside the drift axis.
+        assert agent_constructed is True
+        assert success is True
 
 
-    def test_finite_oneshot_model_drift_explains_that_recreation_is_required(self, tmp_path):
-        """A spent one-shot cannot be repaired in place after the guard fires."""
+    def test_finite_oneshot_uses_explicit_cron_model_without_drift_skip(self, tmp_path):
+        """A one-shot follows its explicit cron fleet model without a drift skip."""
         job = _base_job(
             provider_snapshot="openrouter",
             model_snapshot="old-model",
@@ -312,18 +306,30 @@ class TestModelDriftGuard:
         )
         success, _output, _final_response, error, agent_constructed = \
             _run_with_current_provider_and_model(
-                job, "openrouter", "new-model", tmp_path
+                job, "openrouter", "new-model", tmp_path, cron_model="new-model"
             )
 
-        assert success is False
-        assert agent_constructed is False
-        assert error is not None
-        assert "create a new one-shot job" in error.lower()
-        assert "cronjob action=update" not in error.lower()
+        assert success is True
+        assert agent_constructed is True
 
-        delivered = _summarize_cron_failure_for_delivery(job, error).lower()
-        assert "create a new one-shot job" in delivered
-        assert "cronjob action=update" not in delivered
+    def test_legacy_global_model_does_not_split_snapshot_and_fire_resolution(self, tmp_path, monkeypatch):
+        """An old model.default does not override the built-in cron model at either stage."""
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "config.yaml").write_text("model:\n  default: legacy-chat-model\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+        jobs = TestCreateJobSnapshot._isolate_storage(monkeypatch)
+        with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={"provider": "openrouter"}):
+            created = jobs.create_job(prompt="do a thing", schedule="every 1 hour")
+        assert created["model_snapshot"] == "gpt-6.1-sol"
+
+        from cron.scheduler import _load_cron_job_config
+        with patch("cron.scheduler._get_hermes_home", return_value=home):
+            resolved = _load_cron_job_config(
+                _base_job(model_snapshot=created["model_snapshot"]), "legacy-default", "legacy default"
+            )
+        assert resolved.model == "gpt-6.1-sol"
 
     def test_no_model_snapshot_backcompat(self, tmp_path):
         # Pre-existing job without model_snapshot → no model-drift skip.

@@ -19,7 +19,7 @@ def _aux(timeout, *, reasoning_effort=True, **extra):
 
 
 DEFAULT_CONFIG = {
-    "model": "",
+    "model": "gpt-6.1-sol",
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
@@ -47,6 +47,9 @@ DEFAULT_CONFIG = {
         "terminal_continue": True,
     },
     "agent": {
+        # Default reasoning depth for the primary agent; auxiliary and delegated tasks set theirs
+        # independently below.
+        "reasoning_effort": "xhigh",
         # Turn cap. null = unlimited (default; caps caused silent mid-task truncation). Positive int
         # caps; "none"/"unlimited"/"inf"/0/-1 also mean unlimited (resolve_turn_limit).
         "max_turns": None,
@@ -1640,8 +1643,12 @@ DEFAULT_CONFIG = {
         "model_drift_guard": True,
         # Default model for cron jobs (WHAT model runs). Fire-time resolution: per-job pin >
         # cron.model > model.default. When set, unpinned jobs follow it deliberately and the drift
-        # guard does not engage for the model axis. "" = fall through to model.default.
-        "model": "",
+        # guard does not engage for the model axis. Keep unattended jobs on the built-in cron
+        # model instead of inheriting the interactive chat model.
+        "model": "gpt-6.1-sol",
+        # Per-job reasoning_effort remains the highest-priority override; an explicit cron value
+        # takes precedence over global agent reasoning.
+        "reasoning_effort": "xhigh",
         # Inference provider paired with cron.model (NOT the scheduler provider below). "" = resolve
         # from global config.
         "model_provider": "",

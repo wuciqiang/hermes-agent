@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - non-Windows
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
@@ -1499,9 +1500,7 @@ def _resolve_default_model_snapshot() -> Optional[str]:
         from hermes_cli.config import _expand_env_vars, read_user_config_raw
 
         cfg_path = get_hermes_home() / "config.yaml"
-        if not cfg_path.exists():
-            return None
-        cfg = read_user_config_raw(cfg_path)
+        cfg = read_user_config_raw(cfg_path) if cfg_path.exists() else {}
         with contextlib.suppress(Exception):
             from hermes_cli import managed_scope
             cfg = managed_scope.apply_managed_overlay(cfg)
@@ -1511,10 +1510,10 @@ def _resolve_default_model_snapshot() -> Optional[str]:
             cron_model = cron_cfg.get("model")
             if isinstance(cron_model, str) and cron_model.strip():
                 return cron_model.strip()
-        model_cfg = cfg.get("model") or {}
-        if isinstance(model_cfg, dict):
-            model_cfg = model_cfg.get("default") or model_cfg.get("model")
-        return model_cfg.strip() or None if isinstance(model_cfg, str) else None
+        env_model = os.getenv("HERMES_MODEL", "").strip()
+        if env_model:
+            return env_model
+        return str((DEFAULT_CONFIG.get("cron") or {}).get("model") or "").strip() or None
     except Exception:
         return None
 

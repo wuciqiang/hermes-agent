@@ -110,6 +110,7 @@ class TestSchedulerJobReasoningPrecedence:
 
     CFG = {
         "model": {"default": "anthropic/claude-opus-4.5"},
+        "cron": {"reasoning_effort": ""},
         "agent": {
             "reasoning_effort": "low",
             "reasoning_overrides": {"anthropic/claude-opus-4.5": "xhigh"},
@@ -165,6 +166,15 @@ class TestSchedulerJobReasoningPrecedence:
                 "enabled": True,
                 "effort": "ultra",
             }
+
+    def test_missing_cron_effort_uses_xhigh_default(self):
+        from cron.scheduler import _resolve_job_reasoning_config
+
+        cfg = {"agent": {"reasoning_effort": "high", "reasoning_overrides": {"gpt-5": "xhigh"}}}
+        assert _resolve_job_reasoning_config({}, cfg, "gpt-5") == {
+            "enabled": True,
+            "effort": "xhigh",
+        }
 
 
 class TestCronjobToolReasoningEffort:

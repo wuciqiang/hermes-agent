@@ -40,6 +40,7 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     _expand_env_vars, cron_model_drift_axes, cron_model_drift_guard_enabled, load_config,
     resolve_cron_model_drift_defaults)
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
@@ -476,7 +477,20 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
             job.get("id", "?"),
             pinned,
             job.get("id", "?"))
-    return resolve_reasoning_config(cfg if isinstance(cfg, dict) else {}, str(model))
+    cfg = cfg if isinstance(cfg, dict) else {}
+    cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
+    cron_effort = cron_cfg.get("reasoning_effort") if "reasoning_effort" in cron_cfg else (
+        (DEFAULT_CONFIG.get("cron") or {}).get("reasoning_effort")
+    )
+    if cron_effort is not None and str(cron_effort).strip():
+        parsed = parse_reasoning_effort(cron_effort)
+        if parsed is not None:
+            return parsed
+        logger.warning(
+            "Invalid cron reasoning_effort %r — falling back to global config resolution",
+            cron_effort,
+        )
+    return resolve_reasoning_config(cfg, str(model))
 
 
 from cron.jobs import (
@@ -1372,9 +1386,12 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
                 from hermes_cli import managed_scope
                 _cfg = managed_scope.apply_managed_overlay(_cfg)
             _cfg = _expand_env_vars(_cfg)
+            _raw_cron_cfg_for_model = _cfg.get("cron") or {}
+            _cron_defaults = DEFAULT_CONFIG.get("cron") or {}
+            _cfg["cron"] = {**_cron_defaults, **(_cfg.get("cron") or {})}
             # Coerce null to {} so a falsy default never clobbers a resolved env value.
             _model_cfg = _cfg.get("model") or {}
-            _cron_cfg_for_model = _cfg.get("cron") or {}
+            _cron_cfg_for_model = _raw_cron_cfg_for_model
             _cron_default_model = ""
             if isinstance(_cron_cfg_for_model, dict):
                 _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()
@@ -1382,13 +1399,23 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
             if not job.get("model"):
                 if _cron_default_model:
                     model = _cron_default_model
-                else:
-                    # Shared with Desktop's impact summary so both compare against the same model.
-                    _, _global_model = resolve_cron_model_drift_defaults(_cfg)
-                    if _global_model:
-                        model = _global_model
+                elif not model:
+                    model = str((DEFAULT_CONFIG.get("cron") or {}).get("model") or "").strip()
+                    if not model:
+                        # Shared with Desktop's impact summary so both compare against the same model.
+                        _, _global_model = resolve_cron_model_drift_defaults(_cfg)
+                        if _global_model:
+                            model = _global_model
     except Exception as e:
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+
+    if not isinstance(_cfg.get("cron"), dict):
+        _cfg["cron"] = dict(DEFAULT_CONFIG.get("cron") or {})
+
+    # Apply the built-in cron default after explicit job/env/config sources. Fail fast only if
+    # that default is malformed, so an empty config still constructs the intended model.
+    if not (isinstance(model, str) and model.strip()):
+        model = str((DEFAULT_CONFIG.get("cron") or {}).get("model") or "").strip()
 
     # Fail fast: an empty model otherwise reaches the provider as an opaque 400.
     # See #23979.

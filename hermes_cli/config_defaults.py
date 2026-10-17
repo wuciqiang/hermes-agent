@@ -1251,12 +1251,11 @@ DEFAULT_CONFIG = {
         # lost). 0 disables the ceiling; the dynamic budget still applies.
         "max_summary_chars": 24000,
         # Wall-clock cap per ordinary child (seconds, floor 30). 0 = no timeout: ordinary children fail only
-        # from real errors (API, tools, iteration budget). BacklinkHub has its own finite profile cap below.
+        # from real errors (API, tools, iteration budget). BacklinkHub uses the profile key below.
         "child_timeout_seconds": 0,
-        # BacklinkHub single-site workers need a bounded return to the host-owned continuation/recovery loop.
-        # The runtime uses this profile-specific value before child_timeout_seconds; 900s leaves grace beyond
-        # the existing 600s provider request timeout. 0/negative/invalid values fall back to 900s.
-        "backlinkhub_child_timeout_seconds": 900,
+        # Provider/request timeouts and the stale monitor are the failure
+        # boundaries; 0 disables an extra wall-clock child cap.
+        "backlinkhub_child_timeout_seconds": 0,
         # Subagent effort: "ultra" | "max" | "xhigh" | "high" | "medium" | "low" | "minimal" |
         # "none" (empty = inherit)
         "reasoning_effort": "",

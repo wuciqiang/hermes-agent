@@ -604,7 +604,15 @@ def update_manifest_statuses(delegation_id: Optional[str],
                     task["status"] = r.get("status", task.get("status"))
                     if r.get("exit_reason"):
                         task["exit_reason"] = r["exit_reason"]
-            manifest["completed"] = time.strftime(_TIME_FMT)
+            tasks = manifest.get("tasks")
+            if isinstance(tasks, list) and tasks and all(
+                task.get("status") != "running"
+                for task in tasks
+                if isinstance(task, dict)
+            ):
+                manifest["status"] = "completed"
+                manifest["completed"] = time.strftime(_TIME_FMT)
+            manifest["updated"] = time.strftime(_TIME_FMT)
             _dump_json(mp, manifest)
 
 

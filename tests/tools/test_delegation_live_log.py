@@ -406,6 +406,27 @@ def test_manifest_model_provider_are_optional_and_default_none():
     assert manifest["provider"] is None
 
 
+def test_manifest_marks_batch_completed_after_all_task_statuses_update():
+    delegation_id, _writers, _paths = create_live_transcripts(
+        [{"goal": "task 1"}, {"goal": "task 2"}]
+    )
+    update_manifest_statuses(
+        delegation_id,
+        [
+            {"task_index": 0, "status": "completed", "exit_reason": "completed"},
+            {"task_index": 1, "status": "error", "exit_reason": "failed"},
+        ],
+    )
+    manifest = json.loads(
+        (live_transcript_root() / delegation_id / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["status"] == "completed"
+    assert manifest["completed"]
+    assert manifest["updated"]
+
+
 def test_no_file_in_the_dispatch_directory_carries_the_raw_key():
     """Whole-directory sweep: every artefact dispatch writes is covered."""
     delegation_id, _writers, _paths = create_live_transcripts(

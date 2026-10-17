@@ -85,14 +85,28 @@ def _error_text(error: Any) -> str:
     return " ".join(str(part) for part in parts if part is not None).lower()
 
 
+def _is_zai_coding_endpoint(base_url: str | None) -> bool:
+    """Recognize the Z.AI/Zhipu Coding Plan OpenAI-compatible endpoints."""
+    endpoint = (base_url or "").lower()
+    return (
+        ("api.z.ai" in endpoint or "open.bigmodel.cn" in endpoint)
+        and "/paas/v4" in endpoint
+    )
+
+
 def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
-    """True only for the narrow Z.AI Coding Plan overload shape (429 + code
-    1305 / "temporarily overloaded"), so ordinary quota 429s still fail fast."""
+    """True only for the narrow Z.AI Coding Plan overload shape.
+
+    Coding Plan currently serves GLM-5.2 and GLM-5.3 variants from both the
+    ``api.z.ai`` and ``open.bigmodel.cn`` endpoint forms.  Quota code 1308 is
+    deliberately excluded: its long usage window must not inherit this retry
+    schedule.
+    """
     text = _error_text(error)
     return (
         getattr(error, "status_code", None) == 429
-        and "api.z.ai/api/coding/paas/v4" in (base_url or "").lower()
-        and "glm-5.2" in (model or "").lower()
+        and _is_zai_coding_endpoint(base_url)
+        and any(version in (model or "").lower() for version in ("glm-5.2", "glm-5.3", "glm-5.3-flash"))
         and ("1305" in text or "temporarily overloaded" in text)
     )
 

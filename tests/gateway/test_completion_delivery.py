@@ -169,17 +169,23 @@ def test_recovery_dispatcher_builds_parent_on_cold_cache(monkeypatch):
     runner._agent_cache = {}
     runner._agent_cache_lock = None
     parent = MagicMock()
+    parent.session_id = "session-original"
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={"ended_at": None, "end_reason": None}),
+    )
+    runner.session_store.lookup_by_session_key = lambda _key: SimpleNamespace(session_id="session-original")
     source = SimpleNamespace(
         platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", thread_id=None,
         user_id="u", user_id_alt="", user_name="user", chat_name="",
     )
     runner._build_process_event_source = lambda _evt: source
-    runner._build_recovery_parent_agent = lambda _source, _key: parent
+    runner._build_recovery_parent_agent = lambda _source, _key, _session_id: parent
     monkeypatch.setattr("tools.async_delegation.claim_recovery_continuation", lambda *_: True)
     monkeypatch.setattr("tools.async_delegation.release_recovery_continuation", lambda *_: True)
     dispatch = MagicMock(return_value=json.dumps({"status": "dispatched"}))
     monkeypatch.setattr("tools.delegate_tool.delegate_task", dispatch)
     event = _recovery_event()
+    event["parent_session_id"] = "session-original"
     event["recovery_continuation"].update({
         "run_id": "run-1", "site_id": "site-1", "work_item_id": "item-1",
         "kind": "attempted_unconfirmed",
@@ -190,6 +196,41 @@ def test_recovery_dispatcher_builds_parent_on_cold_cache(monkeypatch):
     context = dispatch.call_args.kwargs["context"]
     assert "run-1" in context and "site-1" in context and "item-1" in context
     assert "attempted_unconfirmed" in context
+
+
+def test_recovery_marker_without_durable_parent_identity_is_consumed_without_route_reuse(monkeypatch):
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={"ended_at": None, "end_reason": None}),
+    )
+    runner.session_store.lookup_by_session_key = lambda _key: SimpleNamespace(session_id="new-session")
+    monkeypatch.setattr("tools.async_delegation.claim_recovery_continuation", lambda *_: True)
+    monkeypatch.setattr("tools.async_delegation.claim_completion_delivery", lambda *_: False)
+    dispatch = MagicMock()
+    monkeypatch.setattr("tools.delegate_tool.delegate_task", dispatch)
+
+    assert asyncio.run(runner._dispatch_recovery_continuation(_recovery_event())) is True
+    dispatch.assert_not_called()
+
+
+def test_backlinkhub_pause_notice_explains_user_action():
+    event = _async_event("backlink-paused")
+    result = {
+        "site_id": "site_math",
+        "status": "completed",
+        "stop_reason": "task_space_unavailable",
+        "published": 2,
+        "remaining": 3,
+    }
+
+    text = GatewayRunner._backlinkhub_progress_text(event, result)
+
+    assert text == (
+        "BacklinkHub 站点 site_math；状态：已暂停；已计入：2；剩余：3；"
+        "原因：浏览器任务空间不可用，需要用户确认后才能继续"
+    )
 
 
 def test_recovery_claim_race_requeues_active_claim(monkeypatch):
@@ -234,7 +275,9 @@ def test_backlinkhub_progress_notice_is_plain_text_and_deduplicated(monkeypatch)
     adapter.send.assert_awaited_once()
     args, kwargs = adapter.send.await_args
     assert args == ("chat-1", "BacklinkHub 站点 site_math；状态：completed；已计入：2；剩余：3")
-    assert kwargs["metadata"] == {"thread_id": "topic-1"}
+    assert kwargs["metadata"]["thread_id"] == "topic-1"
+    assert kwargs["metadata"]["_interim_send"] is True
+    assert kwargs["metadata"]["idempotency_key"].startswith("backlinkhub:completion_progress:")
 
 
 def test_feishu_thread_metadata_uses_reply_anchor_without_thread_id():
@@ -303,7 +346,7 @@ def test_backlinkhub_progress_notice_failure_does_not_raise(caplog, monkeypatch)
     assert "BacklinkHub progress notice failed" in caplog.text
 
 
-def test_backlinkhub_progress_notice_does_not_fallback_to_top_level_on_rejection(caplog):
+def test_backlinkhub_progress_notice_retries_without_thread_on_feishu_field_error(caplog):
     adapter = SimpleNamespace(send=AsyncMock(side_effect=[
         SimpleNamespace(success=False, error="99992402"),
         SimpleNamespace(success=True),
@@ -321,8 +364,15 @@ def test_backlinkhub_progress_notice_does_not_fallback_to_top_level_on_rejection
         await asyncio.gather(*list(runner._background_tasks))
 
     asyncio.run(exercise())
-    adapter.send.assert_awaited_once()
-    assert adapter.send.await_args.kwargs["metadata"] == {"thread_id": "topic-1", "scope_id": "tenant-1"}
+    assert adapter.send.await_count == 2
+    first_metadata = adapter.send.await_args_list[0].kwargs["metadata"]
+    fallback_metadata = adapter.send.await_args_list[1].kwargs["metadata"]
+    assert first_metadata["thread_id"] == "topic-1"
+    assert fallback_metadata.get("thread_id") is None
+    assert first_metadata["scope_id"] == fallback_metadata["scope_id"] == "tenant-1"
+    assert first_metadata["_interim_send"] is fallback_metadata["_interim_send"] is True
+    assert first_metadata["idempotency_key"] == fallback_metadata["idempotency_key"]
+    assert first_metadata["idempotency_key"].startswith("backlinkhub:completion_progress:")
     assert "retrying without thread_id" not in caplog.text
 
 

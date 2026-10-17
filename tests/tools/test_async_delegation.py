@@ -17,6 +17,7 @@ import time
 import pytest
 
 from tools import async_delegation as ad
+from tools import delegate_tool as delegate_tool_module
 from tools.process_registry import process_registry
 from tools.process_registry_notifications import format_process_notification
 
@@ -65,6 +66,33 @@ def _drain_for(delegation_id, timeout=5.0):
             continue
         time.sleep(0.02)
     return None
+
+
+def test_batch_dispatch_persists_captured_routing_origin(tmp_path, monkeypatch):
+    """The parent snapshot survives child construction before durable dispatch."""
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    handle = ad.dispatch_async_delegation_batch(
+        delegation_id="routing-anchor",
+        goals=["child"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="parent-session",
+        runner=lambda: {"results": [], "total_duration_seconds": 0},
+        max_async_children=1,
+        routing_origin={"platform": "feishu", "thread_id": "topic-7", "message_id": "msg-9"},
+    )
+    assert handle["status"] == "dispatched"
+    with ad._connect() as conn:
+        payload = json.loads(
+            conn.execute(
+                "SELECT task_json FROM async_delegations WHERE delegation_id=?",
+                ("routing-anchor",),
+            ).fetchone()[0]
+        )
+    assert payload["thread_id"] == "topic-7"
+    assert payload["message_id"] == "msg-9"
 
 
 def test_schema_init_preserves_shared_state_db_journal_mode(tmp_path):
@@ -219,6 +247,19 @@ def test_backlinkhub_recovery_request_is_checkpoint_gated(checkpoints, kind, sta
         "dedupe_before_retry": kind == "attempted_unconfirmed",
         "auto_submit": False,
     }
+
+
+def test_backlinkhub_recovery_platform_id_prompt_value_is_pure_id():
+    assert delegate_tool_module._normalize_backlinkhub_platform_id(
+        "plf_runtime_f0c5e4059711e79674b4de915be3a9a9,"
+    ) == "plf_runtime_f0c5e4059711e79674b4de915be3a9a9"
+    assert delegate_tool_module._normalize_backlinkhub_platform_id("plf_bad$") == "plf_bad$"
+    assert delegate_tool_module._normalize_backlinkhub_site_id(
+        "site_runtime,"
+    ) == "site_runtime"
+    assert delegate_tool_module._normalize_backlinkhub_site_id(
+        "https://one.example/,"
+    ) == "https://one.example/,"
 
 
 def test_recovery_request_fails_closed_for_ordinary_delegation_or_unknown_side_effect():

@@ -1429,7 +1429,11 @@ def _compression_codex_settings(cfg: Dict[str, Any]) -> tuple[str, bool, Optiona
 
 def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     """Parse the ``compression`` section. Defaults here MUST match DEFAULT_CONFIG."""
-    cfg = _cfg_dict(_agent_cfg, "compression")
+    cfg = dict(_cfg_dict(_agent_cfg, "compression"))
+    if getattr(agent, "platform", None) == "cron":
+        cron_compression = _cfg_dict(_agent_cfg, "cron").get("compression")
+        if isinstance(cron_compression, dict):
+            cfg.update(cron_compression)
     threshold, autoraise_notice_enabled = _compression_threshold(agent, cfg)
     # Plain int()/float() coercions raise on garbage; evaluated up front, in config order.
     target_ratio = float(cfg.get("target_ratio", 0.20))

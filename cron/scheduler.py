@@ -1369,10 +1369,12 @@ class _CronJobConfig:
 
 
 def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConfig:
-    """Load config.yaml and resolve the run's model: per-job override > cron.model (fleet default) >
-    HERMES_MODEL > config ``model:``. Re-read every tick (no cache) so ``hermes cron edit --model``
-    applies next tick. An axis resolved from cron.model/model_provider is explicit (no drift guard)."""
-    model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+    """Load config.yaml and resolve the run's model. Per-job override, non-empty ``cron.model``,
+    and the legacy env/built-in paths retain their precedence. When ``cron.model`` is explicitly
+    present but empty, an unpinned job follows the current global ``model.default`` dynamically.
+    Re-read every tick (no cache); an axis resolved from cron.model/model_provider is explicit."""
+    env_model = os.getenv("HERMES_MODEL") or ""
+    model = job.get("model") or env_model
     _cron_default_provider = ""
     _cfg: dict = {}
     _model_cfg: Any = {}
@@ -1393,19 +1395,20 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
             _model_cfg = _cfg.get("model") or {}
             _cron_cfg_for_model = _raw_cron_cfg_for_model
             _cron_default_model = ""
+            _cron_model_key_present = isinstance(_cron_cfg_for_model, dict) and "model" in _cron_cfg_for_model
             if isinstance(_cron_cfg_for_model, dict):
                 _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()
                 _cron_default_provider = str(_cron_cfg_for_model.get("model_provider") or "").strip()
             if not job.get("model"):
                 if _cron_default_model:
                     model = _cron_default_model
+                elif _cron_model_key_present:
+                    # Shared with Desktop's impact summary so both compare against the same model.
+                    # Explicit empty cron.model opts into global default inheritance ahead of env.
+                    _, _global_model = resolve_cron_model_drift_defaults(_cfg)
+                    model = _global_model or env_model
                 elif not model:
                     model = str((DEFAULT_CONFIG.get("cron") or {}).get("model") or "").strip()
-                    if not model:
-                        # Shared with Desktop's impact summary so both compare against the same model.
-                        _, _global_model = resolve_cron_model_drift_defaults(_cfg)
-                        if _global_model:
-                            model = _global_model
     except Exception as e:
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 

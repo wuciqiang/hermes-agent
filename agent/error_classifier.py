@@ -137,6 +137,15 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = (
     "wait", "requests remaining", "periodic", "window", "per minute", "per second",
 )
 
+# Z.AI/Zhipu Coding Plan uses 1308 for a long usage/quota wall.  A 1308 that
+# explicitly names a retry/reset window remains an ordinary transient 429.
+_ZAI_QUOTA_1308_PATTERNS = (
+    "quota", "usage", "5-hour", "5 hour", "5h", "window exhausted", "exhausted",
+)
+_ZAI_QUOTA_1308_TRANSIENT_SIGNALS = (
+    "try again", "retry", "reset", "available in", "wait ", "retry-after",
+)
+
 # 413 detected from message text (proxies embed the status or re-wrap
 # Anthropic's "request_too_large" type without one).
 _PAYLOAD_TOO_LARGE_PATTERNS = (
@@ -336,6 +345,7 @@ _ABORT_FALLBACK = {"retryable": False, "should_fallback": True}
 _R = FailoverReason
 
 _V_BILLING = _v(_R.billing, retryable=False, **_ROTATE_FALLBACK)
+_V_PROVIDER_QUOTA = _v(_R.billing, retryable=False, should_fallback=True)
 _V_RATE_LIMIT = _v(_R.rate_limit, **_ROTATE_FALLBACK)
 _V_AUTH_ROTATE = _v(_R.auth, retryable=False, **_ROTATE_FALLBACK)
 _V_AUTH_FALLBACK = _v(_R.auth, **_ABORT_FALLBACK)
@@ -344,6 +354,7 @@ _V_CONTENT_BLOCKED = _v(_R.content_policy_blocked, **_ABORT_FALLBACK)
 _V_FORMAT_ERROR = _v(_R.format_error, **_ABORT_FALLBACK)
 _V_POLICY_BLOCKED = _v(_R.provider_policy_blocked, retryable=False)
 _V_SSL_CERT = _v(_R.ssl_cert_verification, retryable=False)
+_V_CLOUDFLARE_TIMEOUT = _v(_R.timeout, retryable=False, should_fallback=True)
 _V_CONTEXT_OVERFLOW = _v(_R.context_overflow, should_compress=True)
 _V_PAYLOAD_TOO_LARGE = _v(_R.payload_too_large, should_compress=True)
 _V_OVERLOADED, _V_SERVER_ERROR, _V_TIMEOUT, _V_UNKNOWN = map(_v, (_R.overloaded, _R.server_error, _R.timeout, _R.unknown))
@@ -360,6 +371,38 @@ def _billing_hints(error_msg: str) -> Verdict:
     if any(p in error_msg for p in _UNVERIFIED_BILLING_PATTERNS):
         ctx = {"billing_unverified": True, "possible_content_filter": True}
     return {**_V_BILLING, "error_context": ctx}
+
+
+def _zai_quota_1308_verdict(c: _Ctx) -> Verdict:
+    """Classify a confirmed GLM 1308 usage wall without rotating credentials."""
+    payload = _error_obj(c.body)
+    context: Dict[str, Any] = {"code": c.code, "quota_wall": True}
+    message = str(payload.get("message") or c.msg).strip()
+    if message:
+        context["message"] = message[:500]
+    for source in (c.body, payload):
+        for field in _RESET_FIELDS:
+            value = source.get(field) if isinstance(source, dict) else None
+            if value not in (None, ""):
+                context[field] = value
+    if c.headers and hasattr(c.headers, "get"):
+        for field in _RESET_HEADERS:
+            value = c.headers.get(field)
+            if value not in (None, ""):
+                context[field] = value
+    return {**_V_PROVIDER_QUOTA, "error_context": context}
+
+
+def _has_zai_1308_transient_signal(c: _Ctx) -> bool:
+    """Require an explicit reset/retry hint for a 1308 transient verdict."""
+    if any(p in c.msg for p in _ZAI_QUOTA_1308_TRANSIENT_SIGNALS):
+        return True
+    payloads = [p for p in (c.body, _error_obj(c.body)) if isinstance(p, dict)]
+    return bool(
+        any(payload.get(field) not in (None, "") for payload in payloads for field in _RESET_FIELDS)
+        or any(c.headers.get(field) not in (None, "") for field in _RESET_HEADERS)
+        if c.headers and hasattr(c.headers, "get") else False
+    )
 
 
 def _first_match(error_msg: str, rules: Sequence[tuple[Sequence[str], Any]]) -> Optional[Verdict]:
@@ -663,6 +706,10 @@ def _status_404(c: _Ctx) -> Verdict:
 def _status_429(c: _Ctx) -> Verdict:
     # Z.AI/Zhipu reuse 429 for server-wide overload: back off on the same
     # key instead of burning the pool (#14038).
+    if c.code == "1308" and any(p in c.msg for p in _ZAI_QUOTA_1308_PATTERNS):
+        if not _has_zai_1308_transient_signal(c):
+            return _zai_quota_1308_verdict(c)
+        return _V_RATE_LIMIT
     if any(p in c.msg for p in _OVERLOADED_PATTERNS):
         return _V_OVERLOADED
     # OpenRouter-wrapped upstream 429: the key is healthy — fall back, don't bench.
@@ -755,6 +802,7 @@ _STATUS_HANDLERS: Dict[int, Callable[[_Ctx], Verdict]] = {
     403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
     429: _status_429, 500: _status_5xx, 502: _status_5xx,
     503: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+    524: lambda c: _V_CLOUDFLARE_TIMEOUT,
     529: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
 }
 

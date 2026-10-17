@@ -147,6 +147,51 @@ _TRACE_ADVANCE_TOOL = "backlinkhub_advance_submission_round"
 _TRACE_RECORD_TOOL = "backlinkhub_record_submission_result"
 _TRACE_TERMINAL_TOOLS = frozenset({"terminal", "terminal_exec"})
 
+def backlinkhub_business_status(payload: Any) -> Optional[str]:
+    """Derive the business outcome from BacklinkHub facts only.
+
+    ``status`` describes the child lifecycle and must never be used as a
+    proxy for a submission outcome.  This helper intentionally ignores a
+    model-authored ``business_status`` value; callers should invoke it after
+    authoritative tool facts have been merged into the payload.
+    """
+    data = payload if isinstance(payload, dict) else {}
+    if data.get("skipped") is True:
+        return "skipped"
+    if data.get("failed_final", 0) > 0:
+        return "failed_final"
+    if data.get("failed_retryable", 0) > 0:
+        return "failed_retryable"
+    if data.get("attempted_unconfirmed", 0) > 0 or data.get("candidate_external_side_effect") in {
+        "unknown", "unconfirmed", "attempted_unconfirmed",
+    }:
+        return "submission_unconfirmed"
+    cleanup = _normalize_reason(data.get("ego_cleanup"))
+    cleanup_confirmed = cleanup in {"closed", "not_created"}
+    if cleanup_confirmed and (
+        data.get("target_reached") is True or (
+            data.get("queue_exhausted") is True and data.get("remaining", 0) == 0
+        )
+    ):
+        return "completed"
+    if data.get("pending", 0) > 0 or data.get("published", 0) > 0:
+        return "pending_review"
+    # A completed delegation with no published/confirmed fact is still an
+    # unresolved business result. Keep it explicitly pending for operators.
+    return "pending"
+
+
+def add_backlinkhub_statuses(
+    payload: Dict[str, Any], *, delegation_status: Any = None,
+) -> Dict[str, Any]:
+    """Add independent lifecycle/business statuses to a BacklinkHub payload."""
+    result = dict(payload) if isinstance(payload, dict) else {}
+    result["delegation_status"] = str(
+        delegation_status or result.get("delegation_status") or result.get("status") or "completed"
+    )
+    result["business_status"] = backlinkhub_business_status(result)
+    return result
+
 
 def merge_authoritative_tool_facts(
     payload: Dict[str, Any], tool_facts: Any
@@ -184,6 +229,7 @@ def merge_authoritative_tool_facts(
             if isinstance(fact, dict):
                 ordered.append((name, fact))
     has_record_fact = any(name == _TRACE_RECORD_TOOL for name, _fact in ordered)
+    applied_authoritative = False
     preserve_terminal_progress = (
         (merged.get("target_reached") is True or merged.get("queue_exhausted") is True)
         and not has_record_fact
@@ -213,6 +259,7 @@ def merge_authoritative_tool_facts(
         fact_target = target_values[0] if target_values else None
         if expected_target is not None and fact_target is not None and str(fact_target) != str(expected_target):
             continue
+        applied_authoritative = True
         if not expected_run and fact.get("run_id"):
             merged["run_id"] = fact["run_id"]
             expected_run = str(fact["run_id"])
@@ -251,6 +298,11 @@ def merge_authoritative_tool_facts(
         and merged.get("candidate_external_side_effect") in {None, "none", "confirmed"}
     ):
         merged["authoritative_pending_work"] = True
+    if applied_authoritative:
+        # This function is only used for the structured BacklinkHub path. The
+        # lifecycle remains separate from the business outcome, and the latter
+        # is recalculated after the tool facts above have won over model text.
+        merged = add_backlinkhub_statuses(merged)
     return merged
 
 

@@ -951,6 +951,7 @@ def _dispatch(
     tool_profile: Optional[str] = None,
     auto_continue: bool = False,
     output_schema: Optional[Dict[str, Any]] = None,
+    routing_origin: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
@@ -968,7 +969,7 @@ def _dispatch(
         "context": context, "toolsets": list(toolsets) if toolsets else None, "role": role, "model": model,
         "session_key": session_key, "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id, "parent_session_id": parent_session_id,
-        **_capture_routing_origin(),
+        **(routing_origin if routing_origin is not None else _capture_routing_origin()),
         "status": "running", "dispatched_at": dispatched_at, "completed_at": None,
         "interrupt_fn": interrupt_fn, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
         "slot_key": slot_key or delegation_id,
@@ -1071,6 +1072,7 @@ def dispatch_async_delegation_batch(
     live_delegation_id: Optional[str] = None,
     tool_profile: Optional[str] = None, auto_continue: bool = False,
     output_schema: Optional[Dict[str, Any]] = None,
+    routing_origin: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -1092,6 +1094,7 @@ def dispatch_async_delegation_batch(
         live_delegation_id=live_delegation_id,
         tool_profile=tool_profile, auto_continue=auto_continue,
         output_schema=output_schema,
+        routing_origin=routing_origin,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "

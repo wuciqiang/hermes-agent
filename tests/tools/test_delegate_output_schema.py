@@ -13,6 +13,7 @@ ONLY, zero code/prompt text copied (proprietary).
 """
 
 import json
+import subprocess
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -41,7 +42,42 @@ from tools.delegation_output_schema import (
     normalize_completion_payload,
     validate_output,
     merge_authoritative_tool_facts,
+    add_backlinkhub_statuses,
 )
+
+
+def test_backlinkhub_business_status_does_not_follow_completed_delegation():
+    payload = _round_payload(
+        published=0, pending=0, attempted_unconfirmed=0,
+        failed_retryable=0, failed_final=0, remaining=1,
+        target_reached=False, queue_exhausted=False,
+    )
+    statuses = add_backlinkhub_statuses(payload, delegation_status="completed")
+    assert statuses["delegation_status"] == "completed"
+    assert statuses["business_status"] == "pending"
+
+
+@pytest.mark.parametrize("cleanup, expected", (("control_confirmation_required", "pending_review"), ("closed", "completed")))
+def test_backlinkhub_target_reached_requires_confirmed_ego_cleanup(cleanup, expected):
+    statuses = add_backlinkhub_statuses(_round_payload(
+        published=1, pending=0, failed_retryable=0, failed_final=0,
+        remaining=0, target_reached=True, queue_exhausted=True,
+        ego_cleanup=cleanup,
+    ))
+    assert statuses["business_status"] == expected
+
+
+def test_authoritative_backlinkhub_failure_is_not_delegation_timeout():
+    merged = merge_authoritative_tool_facts(_round_payload(
+        published=0, pending=0, failed_retryable=0, failed_final=0,
+    ), [{
+        "backlinkhub_record_submission_result": {
+            "run_id": "round_test", "site_id": "site_thesitemath",
+            "site_progress": {"failed_retryable": 1, "remaining": 1},
+        },
+    }])
+    assert merged["business_status"] == "failed_retryable"
+    assert merged.get("delegation_status", "completed") != "timeout"
 
 
 def test_authoritative_progress_continues_despite_model_stop_wording():
@@ -955,6 +991,57 @@ class TestFailedSegmentRecovery:
 
 
 class TestEmptyEgoCleanup:
+    @pytest.mark.parametrize(
+        ("ownership", "tabs", "should_close"),
+        [
+            ("agent", [{"url": "chrome-error://chromewebdata/"}], True),
+            ("agent", [{"url": "about:blank"}], True),
+            ("agent", [{"url": "https://submit.example/"}], False),
+            ("agent", [{"url": "chrome-error://chromewebdata/"}, {"url": "https://submit.example/"}], False),
+            ("user", [{"url": "chrome-error://chromewebdata/"}], False),
+            ("unknown", [{"url": "about:blank"}], False),
+            ("agent", [{"url": "file:///unknown-origin"}], False),
+        ],
+    )
+    def test_captured_cleanup_script_enforces_ownership_and_invalid_page_contract(
+        self, ownership, tabs, should_close
+    ):
+        scenario = json.dumps({"ownership": ownership, "tabs": tabs})
+        real_run = subprocess.run
+        observed = {}
+
+        def run_node(*args, **kwargs):
+            script = kwargs["input"]
+            node_input = f"""
+const scenario = {scenario}
+let closeCount = 0
+const cliLog = value => process.stderr.write(String(value) + '\\n')
+const listTaskSpaces = async () => [{{id: 6, ownership: scenario.ownership}}]
+const useOrCreateTaskSpace = async () => {{}}
+const listTabs = async () => scenario.tabs
+const completeTaskSpace = async () => {{ closeCount += 1; return {{done: true}} }}
+{script}
+setTimeout(() => process.stdout.write(JSON.stringify({{closeCount}}) + '\\n'), 25)
+"""
+            completed = real_run(
+                ["node", "-e", node_input],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            observed["stdout"] = completed.stdout
+            return completed
+
+        with (
+            patch("tools.delegate_tool.shutil.which", return_value="/bin/ego-browser"),
+            patch("tools.delegate_tool.subprocess.run", side_effect=run_node),
+        ):
+            result = _cleanup_empty_agent_ego_space(6)
+
+        assert result["closed"] is should_close
+        assert '"closeCount":' + ("1" if should_close else "0") in observed["stdout"]
+
     def test_uses_official_cli_and_returns_confirmed_close(self):
         completed = MagicMock(
             returncode=0,
@@ -974,6 +1061,10 @@ class TestEmptyEgoCleanup:
         assert "space.ownership !== 'agent'" in script
         assert "tabs.every" in script
         assert "'about:blank'" in script
+        assert "chrome-error://" in script
+        assert "chrome://error" in script
+        assert "active_or_unknown_tabs" in script
+        assert "(async () =>" in script
         assert "completeTaskSpace(id, {keep: false})" in script
 
     def test_invalid_id_never_starts_ego(self):
@@ -2005,6 +2096,132 @@ class TestBacklinkAutoContinuation:
             "reason": "closed",
         }
         assert combined["continuation_last_progress"]["ego_cleanup"] == "closed"
+
+    @pytest.mark.parametrize("failure_reason", ["timeout", "provider_timeout"])
+    def test_timeout_is_terminal_and_does_not_create_continuation_child(
+        self, failure_reason
+    ):
+        failure = {
+            "_raw_child_response": {
+                "final_response": "worker timed out",
+                "completed": False,
+                "failed": True,
+                "failure_reason": failure_reason,
+                "exit_reason": "error",
+                "messages": [],
+            }
+        }
+        _handle, combined, _dispatched, built_goals = _run_auto_continuation_scenario(
+            [_round_payload(), failure]
+        )
+
+        assert len(built_goals) == 2
+        assert combined["continuation_terminal"] is True
+        assert combined["continuation_stop_kind"] == "timeout"
+        assert combined["results"][0]["continuation_stop_kind"] == "timeout"
+        assert combined["continuation_last_progress"]["run_id"] == "round_test"
+        assert combined["continuation_last_progress"]["site_id"] == "site_thesitemath"
+
+    @pytest.mark.parametrize("failure_reason", ["timeout", "provider_timeout"])
+    def test_initial_timeout_without_structured_metadata_is_terminal(
+        self, failure_reason
+    ):
+        failure = {
+            "_raw_child_response": {
+                "final_response": "worker timed out before structured output",
+                "completed": False,
+                "failed": True,
+                "failure_reason": failure_reason,
+                "exit_reason": "error",
+                "messages": [],
+            }
+        }
+        _handle, combined, _dispatched, built_goals = _run_auto_continuation_scenario(
+            [failure]
+        )
+
+        assert built_goals and len(built_goals) == 1
+        assert combined["continuation_terminal"] is True
+        assert combined["continuation_stop_kind"] == "timeout"
+        assert combined["results"][0]["continuation_stop_kind"] == "timeout"
+        metadata = combined["_completion_metadata"][0]
+        assert metadata["exit_reason"] == failure_reason
+        assert metadata["stop_reason"] == "timeout"
+
+    @pytest.mark.parametrize(
+        "checkpoint_stage", ["recorded", "advanced", "browser_started", "final_action_started"]
+    )
+    @pytest.mark.parametrize("failure_reason", ["timeout", "provider_timeout"])
+    def test_timeout_resumes_only_from_authoritative_safe_checkpoint(
+        self, checkpoint_stage, failure_reason
+    ):
+        failure = {
+            "_raw_child_response": {
+                "final_response": "worker timed out",
+                "completed": False,
+                "failed": True,
+                "failure_reason": failure_reason,
+                "exit_reason": "error",
+                "messages": [],
+            }
+        }
+        advance_fact = {
+            "backlinkhub_advance_submission_round": {
+                "run_id": "round_test",
+                "site_id": "site_thesitemath",
+                "work_item_id": "item_timeout",
+                "platform_id": "platform_test",
+                "target_count": 6,
+                "site_progress": {
+                    "remaining": 5,
+                    "target_reached": False,
+                    "queue_exhausted": False,
+                },
+            }
+        }
+        terminal = _round_payload(
+            published=6,
+            pending=0,
+            failed_retryable=2,
+            failed_final=3,
+            remaining=0,
+            queue_exhausted=True,
+            target_reached=True,
+            stop_reason="target_reached",
+            segment_iteration_boundary=False,
+            candidate_bound=False,
+            ego_cleanup="closed",
+        )
+        _handle, combined, _dispatched, built_goals = _run_auto_continuation_scenario(
+            [_round_payload(candidate_bound=True), failure, terminal],
+            checkpoint_stage=checkpoint_stage,
+            tool_facts=[advance_fact],
+        )
+        if checkpoint_stage == "final_action_started":
+            assert len(built_goals) == 1
+            assert combined["continuation_terminal"] is True
+            assert combined["continuation_stop_kind"] == "timeout"
+            assert combined["results"][0]["continuation_stop_kind"] == "timeout"
+            return
+        if checkpoint_stage == "advanced":
+            # ``advanced`` only claims a candidate, while a timeout after the
+            # final action leaves its side effect unknown.  Neither boundary
+            # permits fabricated recovery work.
+            assert len(built_goals) == 2
+            assert combined["continuation_terminal"] is True
+            assert combined["continuation_stop_kind"] == "timeout"
+            assert combined["results"][0]["continuation_stop_kind"] == "timeout"
+            return
+
+        assert len(built_goals) == 3
+        assert "run_id=round_test" in built_goals[2]
+        if checkpoint_stage == "recorded":
+            assert "advance 领取下一候选" in built_goals[2]
+        elif checkpoint_stage == "browser_started":
+            assert "outcome=failed_retryable" in built_goals[2]
+        else:
+            assert "当前候选只完成 advance" in built_goals[2]
+        assert combined["results"][0]["status"] == "completed"
 
     def test_safe_completed_candidate_handoff_continues_same_round(self):
         candidate_handoff = _round_payload(

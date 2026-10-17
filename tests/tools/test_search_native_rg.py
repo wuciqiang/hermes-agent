@@ -112,3 +112,12 @@ def test_kill_switch_routes_search_back_to_the_shell(tree, ops_factory, monkeypa
     assert result.total_count == 4
     assert any(c.startswith("test -e") for c in calls)
     assert any("pipefail" in c and "rg" in c for c in calls)
+
+
+def test_native_search_ignores_login_shell_diagnostic_before_rg_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    (tmp_path / "wanted.txt").write_text("needle\n")
+    result = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path))).search(
+        pattern="*.txt", path=str(tmp_path), target="files")
+    assert result.error is None
+    assert result.files == [str(tmp_path / "wanted.txt")]

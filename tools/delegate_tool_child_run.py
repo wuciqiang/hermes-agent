@@ -668,7 +668,12 @@ class _ChildRun:
         profile = getattr(child, "_delegate_tool_profile", None)
         # Preserve the no-argument seam used by ordinary delegation callers
         # and tests; only a named profile needs the profile-aware resolver.
-        child_timeout = _get_child_timeout(profile) if profile else _get_child_timeout()
+        # Test doubles and partially initialized child agents can expose a
+        # truthy MagicMock/other object here. Only an explicit non-empty
+        # profile name selects profile-aware timeout configuration; ordinary
+        # children keep the zero-argument resolver seam.
+        profile_name = profile.strip() if isinstance(profile, str) else ""
+        child_timeout = _get_child_timeout(profile_name) if profile_name else _get_child_timeout()
         executor = DaemonThreadPoolExecutor(
             max_workers=1, initializer=_set_subagent_approval_cb, initargs=(_get_subagent_approval_callback(),),
         )

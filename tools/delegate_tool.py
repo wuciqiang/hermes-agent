@@ -27,16 +27,42 @@ tool calls or reasoning.
 
 import logging
 import re
+import time
+from typing import Any, Dict, List, Optional
+
+from tools.delegate_tool_backlinkhub import prepare_dispatch_identity
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_backlinkhub_platform_id(value: object) -> str:
+    """Keep recovery prompts from teaching a model to pass sentence punctuation."""
+
+    result = str(value or "").strip()
+    candidate = result.rstrip(",.;:")
+    if candidate and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", candidate):
+        return candidate
+    return result
+
+
+def _normalize_backlinkhub_site_id(value: object) -> str:
+    """Keep recovery prompts from passing punctuation on strict site IDs."""
+
+    result = str(value or "").strip()
+    if "://" in result:
+        return result
+    candidate = result.rstrip(",.;:")
+    if candidate and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", candidate):
+        return candidate
+    return result
+
+
 DEFAULT_CHILD_TIMEOUT = None
 import os
 import shutil
 import subprocess
 import threading
-import time
 import weakref
-from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS, validate_toolset
 from agent.interrupt_compat import request_hard_interrupt
@@ -58,6 +84,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _resolve_child_runtime, _resolve_delegation_credentials,
     _subagent_auto_approve, _subagent_auto_deny,
 )
+from tools.delegate_tool_routing import resolve_profile_route
 from tools.delegate_tool_dispatch import (
     _Batch,
     _announce_batch,
@@ -125,6 +152,8 @@ _CONTINUATION_RESULT_FIELDS = (
     "segment_iteration_boundary",
     "candidate_bound",
     "candidate_external_side_effect",
+    "delegation_status",
+    "business_status",
 )
 
 
@@ -149,6 +178,7 @@ def _validated_completion_metadata(
         from tools.delegation_output_schema import (
             extract_json_candidate,
             normalize_completion_payload,
+            add_backlinkhub_statuses,
         )
 
         payload = json.loads(extract_json_candidate(summary or ""))
@@ -171,6 +201,8 @@ def _validated_completion_metadata(
     for key in _CONTINUATION_RESULT_FIELDS:
         if key in payload:
             metadata[key] = payload[key]
+    if payload.get("site_id"):
+        metadata.update(add_backlinkhub_statuses(metadata, delegation_status=exit_reason))
     return metadata
 
 
@@ -201,24 +233,32 @@ def _cleanup_empty_agent_ego_space(space_id: Any) -> Dict[str, Any]:
         return {"closed": False, "reason": "ego_browser_unavailable"}
 
     script = f"""
-const id = {space_id}
-const spaces = await listTaskSpaces()
-const space = spaces.find(item => Number(item.id) === id)
-if (!space) {{
-  cliLog(JSON.stringify({{closed: false, reason: 'space_not_found'}}))
-}} else if (space.ownership !== 'agent') {{
-  cliLog(JSON.stringify({{closed: false, reason: 'ownership_not_agent', ownership: space.ownership}}))
-}} else {{
-  await useOrCreateTaskSpace(id)
-  const tabs = await listTabs()
-  const onlyBlank = tabs.length > 0 && tabs.every(tab => String(tab.url || '') === 'about:blank')
-  if (!onlyBlank) {{
-    cliLog(JSON.stringify({{closed: false, reason: 'nonblank_or_unknown_tabs', tabCount: tabs.length}}))
+(async () => {{
+  const id = {space_id}
+  const spaces = await listTaskSpaces()
+  const space = spaces.find(item => Number(item.id) === id)
+  if (!space) {{
+    cliLog(JSON.stringify({{closed: false, reason: 'space_not_found'}}))
+  }} else if (space.ownership !== 'agent') {{
+    cliLog(JSON.stringify({{closed: false, reason: 'ownership_not_agent', ownership: space.ownership}}))
   }} else {{
-    const result = await completeTaskSpace(id, {{keep: false}})
-    cliLog(JSON.stringify({{closed: result?.done === true, reason: result?.done === true ? 'closed' : 'cleanup_not_confirmed'}}))
+    await useOrCreateTaskSpace(id)
+    const tabs = await listTabs()
+    const invalidPage = url => {{
+      const value = String(url || '')
+      return value === 'about:blank'
+        || value.startsWith('chrome-error://')
+        || value.startsWith('chrome://error')
+    }}
+    const onlyInvalidPages = tabs.length > 0 && tabs.every(tab => invalidPage(tab.url))
+    if (!onlyInvalidPages) {{
+      cliLog(JSON.stringify({{closed: false, reason: 'active_or_unknown_tabs', tabCount: tabs.length}}))
+    }} else {{
+      const result = await completeTaskSpace(id, {{keep: false}})
+      cliLog(JSON.stringify({{closed: result?.done === true, reason: result?.done === true ? 'closed_invalid_agent_space' : 'cleanup_not_confirmed'}}))
+    }}
   }}
-}}
+}})().catch(error => cliLog(JSON.stringify({{closed: false, reason: 'cleanup_failed', error: String(error)}})))
 """.strip()
     try:
         completed = subprocess.run(
@@ -237,7 +277,13 @@ if (!space) {{
             "reason": "cleanup_command_failed",
             "error": (completed.stderr or completed.stdout or "")[-500:],
         }
-    for line in reversed((completed.stdout or "").splitlines()):
+    # ego-browser's cliLog is diagnostic output and may be routed to stderr
+    # even when the node script exits successfully. Parse both streams so a
+    # structured cleanup refusal is never downgraded to an unreadable result.
+    output = "\n".join(
+        stream for stream in (completed.stdout or "", completed.stderr or "") if stream
+    )
+    for line in reversed(output.splitlines()):
         try:
             result = json.loads(line)
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -1281,6 +1327,7 @@ def _run_single_child(
                 child_progress_cb._flush()
         duration = run.elapsed()
         entry = _build_result_entry(child, result or {}, task_index, run.elapsed(), schema)
+        metadata: Dict[str, Any] = {}
         if entry.get("status") == "failed":
             classified_reason = (result or {}).get("failure_reason")
             if classified_reason and schema.valid is not None:
@@ -1292,9 +1339,33 @@ def _run_single_child(
                 exit_reason=(result or {}).get("failure_reason") or entry["exit_reason"],
             )
             if metadata:
+                if getattr(child, "_delegate_tool_profile", None) == "backlinkhub":
+                    from tools.delegation_output_schema import add_backlinkhub_statuses
+                    metadata = add_backlinkhub_statuses(
+                        metadata, delegation_status=entry.get("status")
+                    )
+                    entry.update({
+                        "delegation_status": metadata["delegation_status"],
+                        "business_status": metadata["business_status"],
+                    })
                 entry["_completion_metadata"] = metadata
                 entry["exit_reason"] = metadata.get("exit_reason", entry["exit_reason"])
                 entry["truncated"] = entry["exit_reason"] == "max_iterations"
+        if getattr(child, "_delegate_tool_profile", None) == "backlinkhub":
+            from tools.delegation_output_schema import add_backlinkhub_statuses
+            backlink_metadata = (
+                dict(metadata) if isinstance(metadata, dict) else {}
+            )
+            backlink_metadata = add_backlinkhub_statuses(
+                backlink_metadata, delegation_status=entry.get("status")
+            )
+            entry.update({
+                "delegation_status": backlink_metadata["delegation_status"],
+                "business_status": backlink_metadata["business_status"],
+            })
+            if isinstance(metadata, dict) and metadata:
+                metadata.update(backlink_metadata)
+                entry["_completion_metadata"] = metadata
         run.append_sibling_write_reminder(entry)
         run.account_background_processes(entry)
         run.emit_complete(result or {}, entry, duration)
@@ -1374,7 +1445,9 @@ def delegate_task(
     # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
-    routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
+    routing_cfg = credentials_cfg
+    if routing_cfg is None:
+        routing_cfg = resolve_profile_route(cfg, tool_profile) or cfg
     try:
         creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
@@ -1387,6 +1460,11 @@ def delegate_task(
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if err:
         return tool_error(err)
+    backlinkhub_run_ids: List[str] = []
+    if tool_profile == "backlinkhub":
+        task_list, backlinkhub_run_ids, context = prepare_dispatch_identity(
+            task_list, context
+        )
     n_tasks = len(task_list)
 
     overall_start = time.monotonic()
@@ -1432,7 +1510,13 @@ def delegate_task(
     # request-scoped chat_id binding (the raw X-Hermes-Session-Id on
     # api_server) is untouched by child construction, so read it here and
     # thread it through the dispatch.
-    from tools.async_delegation import _current_origin_session_id
+    from tools.async_delegation import _capture_routing_origin, _current_origin_session_id
+
+    # Capture all platform routing fields before child construction. Child
+    # AIAgent initialization replaces the session ContextVar, so reading this
+    # inside async_delegation._dispatch can persist the child's empty/foreign
+    # thread and message identifiers instead of the originating request.
+    _routing_origin = _capture_routing_origin()
 
     _origin_wake_sid = _current_origin_session_id()
     try:
@@ -1459,6 +1543,7 @@ def delegate_task(
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
+        routing_origin=_routing_origin,
     )
     # The legacy continuation loop below is intentionally reached only for the
     # BacklinkHub schema path; ordinary delegation stays on the vendor batch
@@ -1823,10 +1908,14 @@ def delegate_task(
         """Build a compact next-segment prompt without replaying history."""
         recovery = metadata.get("pending_recovery_request")
         if isinstance(recovery, dict):
+            platform_id = _normalize_backlinkhub_platform_id(
+                recovery.get("platform_id")
+            )
+            site_id = _normalize_backlinkhub_site_id(recovery.get("site_id"))
             stage = str(recovery.get("stage") or "").strip().lower()
             identity = (
-                f"run_id={recovery.get('run_id')}; site_id={recovery.get('site_id')}; "
-                f"work_item_id={recovery.get('work_item_id')}; platform_id={recovery.get('platform_id')}."
+                f"run_id={recovery.get('run_id')}; site_id={site_id}; "
+                f"work_item_id={recovery.get('work_item_id')}; platform_id={platform_id}."
             )
             if recovery.get("safe_pre_submission_failure") is True:
                 action = (
@@ -1848,6 +1937,7 @@ def delegate_task(
             return (
                 "恢复 BacklinkHub 同一轮次，不创建新 run；只处理 host recovery request 指定身份。"
                 f"{identity} 当前阶段={stage}。{action} "
+                "site_id 和 platform_id 必须传纯 ID，不带句末逗号、句号、分号或冒号；URL/domain 保持原样。"
                 "不要重复最终点击；若无法确认原 work item 或发现用户控制/歧义，立即停止并返回。"
             )
         site_id = str(metadata.get("site_id") or "")
@@ -2019,8 +2109,6 @@ def delegate_task(
             transport_reasons = {
                 "server_error",
                 "overloaded",
-                "provider_timeout",
-                "timeout",
                 "api_connection_error",
                 "apiconnection_error",
                 "apiconnectionerror",
@@ -2047,14 +2135,111 @@ def delegate_task(
             private = result.get("_completion_metadata")
             if isinstance(private, list) and private and isinstance(private[0], dict):
                 private[0].update(metadata)
+            else:
+                result["_completion_metadata"] = [dict(metadata)]
             entries = result.get("results")
             if isinstance(entries, list) and entries and isinstance(entries[0], dict):
                 public_fields = {
                     "run_id", "site_id", "target", "published", "pending",
                     "attempted_unconfirmed", "failed_retryable", "failed_final",
                     "remaining", "queue_exhausted", "target_reached",
+                    "stop_reason", "continuation_terminal", "continuation_stop_kind",
+                    "ego_task_space_id", "ego_cleanup", "candidate_bound",
+                    "candidate_external_side_effect",
+                    "delegation_status", "business_status",
                 }
                 entries[0].update({key: metadata[key] for key in public_fields if key in metadata})
+
+        def _terminalize_unstructured_timeout(
+            result: Dict[str, Any], metadata: Dict[str, Any]
+        ) -> Dict[str, Any]:
+            """Recover only from a timeout with an authoritative safe boundary."""
+            entries = result.get("results") if isinstance(result, dict) else None
+            entry = (
+                entries[0]
+                if isinstance(entries, list)
+                and entries
+                and isinstance(entries[0], dict)
+                else {}
+            )
+            status = str(entry.get("status") or "").strip().lower()
+            exit_reason = str(entry.get("exit_reason") or "").strip().lower()
+            failure_reason = str(entry.get("failure_reason") or "").strip().lower()
+            reason = (
+                failure_reason
+                if failure_reason in {"timeout", "provider_timeout"}
+                else status
+                if status in {"timeout", "provider_timeout"}
+                else exit_reason
+            )
+            if reason not in {"timeout", "provider_timeout"}:
+                return metadata
+            terminal = dict(metadata or last_safe_metadata)
+            recovery = _recovery_request_from_live_state() or {}
+            stage = str(recovery.get("stage") or "").strip().lower()
+            side_effect = terminal.get("candidate_external_side_effect")
+            # A timeout after ``advanced`` only proves that a candidate was
+            # claimed.  It does not prove that the browser reached a safe
+            # pre-submission boundary, so do not manufacture a retryable
+            # failure or continue from that checkpoint.  ``browser_started``
+            # is safe only when the live facts still prove no side effect;
+            # ``recorded`` is safe because the durable outcome already exists.
+            safe_checkpoint = stage == "browser_started" and side_effect in {None, "none"}
+            safe_pre_submission = stage == "browser_started" and side_effect in {None, "none"}
+            safe_recorded = stage == "recorded"
+            if safe_checkpoint or safe_recorded:
+                terminal.update({
+                    key: recovery[key]
+                    for key in ("run_id", "site_id", "target", "work_item_id", "platform_id")
+                    if recovery.get(key) is not None
+                })
+                terminal.update({
+                    "schema_valid": True,
+                    "candidate_checkpoint_stage": stage,
+                    "pending_recovery_request": recovery,
+                    "segment_iteration_boundary": True,
+                    "continuation_terminal": False,
+                    "continuation_stop_kind": None,
+                    "stop_reason": "segment_iteration_boundary",
+                    "ego_cleanup": terminal.get("ego_cleanup") or "preserved_for_continuation",
+                })
+                if safe_pre_submission:
+                    recovery = dict(recovery)
+                    recovery["safe_pre_submission_failure"] = True
+                    terminal["pending_recovery_request"] = recovery
+                result["continuation_stop_reason"] = "timeout_recovery"
+                result["continuation_terminal"] = False
+                result["continuation_stop_kind"] = None
+                _publish_authoritative_metadata(result, terminal)
+                return terminal
+            if not terminal:
+                terminal.update({
+                    key: recovery[key]
+                    for key in ("run_id", "site_id", "target")
+                    if recovery.get(key) is not None
+                })
+            terminal.update({
+                "schema_valid": False,
+                "exit_reason": reason,
+                "delegation_status": "timeout",
+                "failure_reason": failure_reason or reason,
+                "stop_reason": "timeout",
+                "continuation_terminal": True,
+                "continuation_stop_kind": "timeout",
+                "segment_iteration_boundary": False,
+                "ego_cleanup": "preserved_for_continuation",
+            })
+            if terminal.get("candidate_external_side_effect") == "none":
+                terminal["candidate_external_side_effect"] = "unknown"
+            from tools.delegation_output_schema import add_backlinkhub_statuses
+            terminal = add_backlinkhub_statuses(terminal, delegation_status="timeout")
+            terminal.pop("pending_recovery_request", None)
+            terminal.pop("authoritative_pending_work", None)
+            result["continuation_stop_reason"] = "timeout"
+            result["continuation_terminal"] = True
+            result["continuation_stop_kind"] = "timeout"
+            _publish_authoritative_metadata(result, terminal)
+            return terminal
 
         def _mark_hard_stop(result: Dict[str, Any], metadata: Dict[str, Any]) -> None:
             """Expose a managed page/TaskSpace stop without changing progress.
@@ -2115,6 +2300,8 @@ def delegate_task(
                 entries[0]["ego_cleanup"] = "preserved_for_continuation"
 
         def _continuation_decision(metadata: Dict[str, Any]) -> bool:
+            if metadata.get("continuation_terminal") is True:
+                return False
             if isinstance(metadata.get("pending_recovery_request"), dict):
                 return True
             if metadata.get("authoritative_pending_work") is True:
@@ -2232,7 +2419,32 @@ def delegate_task(
             metadata = _single_completion_metadata(combined)
             metadata = _authoritative_metadata(metadata)
             metadata = _merge_transport_recovery(combined, metadata)
+            metadata = _terminalize_unstructured_timeout(combined, metadata)
             checkpoint_stage = _latest_candidate_checkpoint()
+            if (
+                checkpoint_stage in {"final_action_started", "record_started"}
+                and metadata.get("candidate_external_side_effect") == "none"
+            ):
+                # The durable checkpoint outranks a stale structured payload:
+                # once the final action started, a child timeout cannot prove
+                # that no external side effect occurred.  Stop the host
+                # continuation before it can issue another ADVANCE.
+                metadata["candidate_external_side_effect"] = "unknown"
+                metadata.update({
+                    "schema_valid": False,
+                    "exit_reason": "timeout",
+                    "failure_reason": "timeout",
+                    "stop_reason": "timeout",
+                    "continuation_terminal": True,
+                    "continuation_stop_kind": "timeout",
+                    "segment_iteration_boundary": False,
+                    "ego_cleanup": metadata.get("ego_cleanup") or "preserved_for_continuation",
+                })
+                combined.update({
+                    "continuation_stop_reason": "timeout",
+                    "continuation_terminal": True,
+                    "continuation_stop_kind": "timeout",
+                })
             if metadata and checkpoint_stage:
                 metadata["candidate_checkpoint_stage"] = checkpoint_stage
             if metadata:
@@ -2329,6 +2541,8 @@ def delegate_task(
                 metadata = _single_completion_metadata(combined)
                 metadata = _authoritative_metadata(metadata)
                 metadata = _merge_transport_recovery(combined, metadata)
+                metadata = _terminalize_unstructured_timeout(combined, metadata)
+                checkpoint_stage = _latest_candidate_checkpoint()
                 if (
                     isinstance(metadata.get("pending_recovery_request"), dict)
                     and last_safe_metadata
@@ -2345,7 +2559,11 @@ def delegate_task(
                     ):
                         if key not in metadata and key in last_safe_metadata:
                             metadata[key] = last_safe_metadata[key]
-                checkpoint_stage = _latest_candidate_checkpoint()
+                if (
+                    checkpoint_stage in {"final_action_started", "record_started", "recorded"}
+                    and metadata.get("candidate_external_side_effect") == "none"
+                ):
+                    metadata["candidate_external_side_effect"] = "unknown"
                 if metadata and checkpoint_stage:
                     metadata["candidate_checkpoint_stage"] = checkpoint_stage
                 if metadata:
@@ -2432,6 +2650,11 @@ def delegate_task(
                         failed_segment_safe = failed_segment_can_continue(
                             failed_entry, last_safe_metadata
                         )
+                    failure_reason = str(
+                        failed_entry.get("failure_reason")
+                        or failed_entry.get("exit_reason")
+                        or ""
+                    ).strip().lower()
                     if failed_segment_safe:
                         live_recovery = _recovery_request_from_live_state()
                         if (
@@ -2479,6 +2702,43 @@ def delegate_task(
                             "delegate_task transport recovery exhausted at segment=%d",
                             len(segment_history),
                         )
+                    if not failed_segment_safe or transport_recovery_exhausted:
+                        recovery = _recovery_request_from_live_state() or {}
+                        terminal_metadata = dict(last_safe_metadata)
+                        if not terminal_metadata:
+                            terminal_metadata = {
+                                key: recovery[key]
+                                for key in ("run_id", "site_id", "target")
+                                if recovery.get(key) is not None
+                            }
+                        stop_kind = (
+                            "timeout"
+                            if failure_reason in {"timeout", "provider_timeout"}
+                            else (
+                                "transport_recovery_exhausted"
+                                if transport_recovery_exhausted
+                                else "transport_failure"
+                            )
+                        )
+                        terminal_metadata.update({
+                            "schema_valid": False,
+                            "exit_reason": failure_reason or "transport_failure",
+                            "delegation_status": "failed",
+                            "stop_reason": stop_kind,
+                            "continuation_terminal": True,
+                            "continuation_stop_kind": stop_kind,
+                            "segment_iteration_boundary": False,
+                            "ego_cleanup": "preserved_for_continuation",
+                        })
+                        from tools.delegation_output_schema import add_backlinkhub_statuses
+                        terminal_metadata = add_backlinkhub_statuses(
+                            terminal_metadata, delegation_status="failed"
+                        )
+                        last_safe_metadata = terminal_metadata
+                        combined["continuation_stop_reason"] = stop_kind
+                        combined["continuation_terminal"] = True
+                        combined["continuation_stop_kind"] = stop_kind
+                        _publish_authoritative_metadata(combined, terminal_metadata)
 
                 # A repeated account fingerprint means the child neither
                 # recorded a candidate outcome nor advanced the queue. Stop
@@ -2510,8 +2770,11 @@ def delegate_task(
                     )
             _clear_active_child_refs()
 
+        terminal_stop = combined.get("continuation_stop_kind")
         if (
-            transport_recovery_exhausted
+            (transport_recovery_exhausted or terminal_stop in {
+                "timeout", "transport_failure", "transport_recovery_exhausted",
+            })
             and last_safe_metadata.get("candidate_external_side_effect") == "none"
         ):
             cleanup_result = _cleanup_empty_agent_ego_space(
@@ -2520,6 +2783,7 @@ def delegate_task(
             combined["ego_recovery_cleanup"] = cleanup_result
             if cleanup_result.get("closed") is True:
                 last_safe_metadata["ego_cleanup"] = "closed"
+                _publish_authoritative_metadata(combined, last_safe_metadata)
 
         entries = combined.get("results") if isinstance(combined, dict) else None
         if isinstance(entries, list) and entries and isinstance(entries[0], dict):
@@ -2536,7 +2800,11 @@ def delegate_task(
             )
             final_entry["cumulative_reasoning_tokens"] = cumulative_reasoning
             combined["continuation_history"] = segment_history
-        if last_safe_metadata and not _single_completion_metadata(combined):
+        if last_safe_metadata and (
+            not _single_completion_metadata(combined)
+            or transport_recovery_exhausted
+            or combined.get("continuation_terminal") is True
+        ):
             combined["continuation_last_progress"] = last_safe_metadata
         if live_deleg_id:
             update_manifest_statuses(live_deleg_id, entries or [])
@@ -2741,6 +3009,7 @@ def delegate_task(
             tool_profile=tool_profile,
             auto_continue=_auto_continue_enabled,
             output_schema=task_schemas[0] if len(task_schemas) == 1 else None,
+            routing_origin=_routing_origin,
         )
 
         if dispatch.get("status") == "dispatched":
@@ -2765,6 +3034,8 @@ def delegate_task(
                 "goals": _goals,
                 "note": note,
             }
+            if backlinkhub_run_ids:
+                payload["backlinkhub_run_ids"] = list(backlinkhub_run_ids)
             _sids = [
                 getattr(_c, "_subagent_id", None) for _c in _child_agents
             ]

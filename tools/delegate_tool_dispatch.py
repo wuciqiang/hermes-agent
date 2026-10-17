@@ -72,6 +72,7 @@ class _Batch:
     origin_owner_transport: Any
     origin_owner_session_record: Any
     overall_start: float
+    routing_origin: Optional[Dict[str, Any]] = None
     child_capacity: Optional[_ChildCapacity] = None
     on_child_start: Optional[Callable[[], None]] = None
     # Set on per-group units carved out by ``_dispatch_background``; None for the whole batch / ungrouped units.
@@ -460,6 +461,7 @@ def _dispatch_background(batch: _Batch) -> str:
     routing = dict(
         session_key=session_key, origin_ui_session_id=origin_ui_session_id, origin_session_id=wake_sid,
         parent_session_id=getattr(parent_agent, "session_id", None), max_async_children=_get_max_async_children(),
+        routing_origin=batch.routing_origin,
     )
 
     units = _units_of(batch)

@@ -169,6 +169,30 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     assert long_waits == [30.0, 60.0, 90.0, 120.0]
 
 
+def test_zai_glm_53_flash_overload_matches_coding_plan_endpoints():
+    for endpoint in (
+        "https://api.z.ai/api/coding/paas/v4",
+        "https://open.bigmodel.cn/api/paas/v4",
+    ):
+        assert is_zai_coding_overload_error(
+            base_url=endpoint,
+            model="glm-5.3-flash",
+            error=_zai_overload_error(),
+        )
+
+
+def test_zai_1308_is_not_an_overload():
+    error = SimpleNamespace(
+        status_code=429,
+        body={"error": {"code": "1308", "message": "5-hour usage quota exhausted"}},
+    )
+    assert not is_zai_coding_overload_error(
+        base_url="https://open.bigmodel.cn/api/paas/v4",
+        model="glm-5.3-flash",
+        error=error,
+    )
+
+
 # ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser
 # ---------------------------------------------------------------------------

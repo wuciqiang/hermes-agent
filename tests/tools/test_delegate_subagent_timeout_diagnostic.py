@@ -173,16 +173,16 @@ class TestDumpSubagentTimeoutDiagnostic:
         assert result is None or Path(result).exists()
 
 
-def test_backlinkhub_timeout_has_finite_profile_default(monkeypatch):
+def test_backlinkhub_timeout_defaults_to_no_extra_wall_clock_cap(monkeypatch):
     from tools import delegate_tool
     from tools.delegate_tool_config import _get_child_timeout
 
     monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
     assert _get_child_timeout() is None
-    assert _get_child_timeout("backlinkhub") == 900.0
+    assert _get_child_timeout("backlinkhub") is None
 
 
-def test_backlinkhub_timeout_accepts_positive_config_and_nonpositive_uses_default(monkeypatch):
+def test_backlinkhub_timeout_accepts_positive_config_and_nonpositive_disables(monkeypatch):
     from tools import delegate_tool
     from tools.delegate_tool_config import _get_child_timeout
 
@@ -191,7 +191,7 @@ def test_backlinkhub_timeout_accepts_positive_config_and_nonpositive_uses_defaul
     assert _get_child_timeout("backlinkhub") == 45.0
 
     config["backlinkhub_child_timeout_seconds"] = 0
-    assert _get_child_timeout("backlinkhub") == 900.0
+    assert _get_child_timeout("backlinkhub") is None
 
     config.clear()
     config["child_timeout_seconds"] = 600

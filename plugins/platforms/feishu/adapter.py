@@ -3626,6 +3626,15 @@ class FeishuAdapter(BasePlatformAdapter):
         self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
     ) -> Any:
         effective_reply_to = reply_to
+        stable_uuid = (metadata or {}).get("idempotency_key")
+        if stable_uuid:
+            stable_uuid = str(stable_uuid).strip()[:64]
+            # A long message is split before reaching this method.  Bind each chunk
+            # to its payload so chunks never reuse one Feishu uuid, while retries
+            # of the same chunk retain the same uuid.
+            if len(payload) > self.MAX_MESSAGE_LENGTH:
+                stable_uuid = f"{stable_uuid}:{hashlib.sha256(payload.encode()).hexdigest()[:12]}"
+        message_uuid = stable_uuid or str(uuid.uuid4())
         if not effective_reply_to and metadata:
             effective_reply_to = metadata.get("reply_to_message_id")
         # Top-level messages follow the operator setting and create a Feishu
@@ -3640,7 +3649,7 @@ class FeishuAdapter(BasePlatformAdapter):
             effective_reply_to = (metadata or {}).get("reply_to_message_id")
         if effective_reply_to:
             body = self._build_reply_message_body(
-                content=payload, msg_type=msg_type, reply_in_thread=reply_in_thread, uuid_value=str(uuid.uuid4()),
+                content=payload, msg_type=msg_type, reply_in_thread=reply_in_thread, uuid_value=message_uuid,
             )
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
@@ -3652,7 +3661,7 @@ class FeishuAdapter(BasePlatformAdapter):
         else:
             receive_id, receive_id_type = chat_id, "open_id" if chat_id.startswith("ou_") else "chat_id"
         body = self._build_create_message_body(
-            receive_id=receive_id, msg_type=msg_type, content=payload, uuid_value=str(uuid.uuid4()),
+            receive_id=receive_id, msg_type=msg_type, content=payload, uuid_value=message_uuid,
         )
         request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)

@@ -375,7 +375,10 @@ def test_off_path_windows_rg_miss_is_reprobed_then_success_is_cached(
     expected = str(candidate).replace("\\", "/")
     assert ops._resolve_command("rg") == expected
     assert ops._resolve_command("rg") == expected
-    assert probes == ["command -v rg 2>/dev/null", "command -v rg 2>/dev/null"]
+    expected_probe = ("command -v rg 2>/dev/null | { while IFS= read -r line; do "
+                      "printf '%s%s\\n' '__HERMES_RG_RESOLVED__' \"$line\"; done; "
+                      "printf '%s\\n' '__HERMES_RG_RESOLVED__'; }")
+    assert probes == [expected_probe, expected_probe]
 
 
 def test_remote_resolution_never_probes_controller_host_paths(tmp_path, monkeypatch):
@@ -391,7 +394,11 @@ def test_remote_resolution_never_probes_controller_host_paths(tmp_path, monkeypa
     ops = ShellFileOperations(env)
 
     assert ops._resolve_command("rg") is None
-    assert env.commands == ["command -v rg 2>/dev/null"]
+    assert env.commands == [
+        "command -v rg 2>/dev/null | { while IFS= read -r line; do "
+        "printf '%s%s\\n' '__HERMES_RG_RESOLVED__' \"$line\"; done; "
+        "printf '%s\\n' '__HERMES_RG_RESOLVED__'; }"
+    ]
     assert str(tmp_path) not in env.commands[0]
 
 

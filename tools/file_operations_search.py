@@ -122,6 +122,12 @@ def _search_stdout_and_limit(result: ExecuteResult) -> tuple[str, Optional[str]]
 # (match/count), ``-`` (context), or nothing (files_only); tool diagnostics
 # ("rg: ...", indented carets) never match.
 _SEARCH_OUTPUT_RE = re.compile(r'^([A-Za-z]:)?[^\s:][^\n]*?[:\-]\d|^[^\s:][^\s]*$')
+_SHELL_LOCALE_WARNING_RE = re.compile(r"(?:^|/)bash: warning: setlocale(?:\(|:)")
+
+
+def _is_shell_locale_warning(line: str) -> bool:
+    """Recognize login-shell locale warnings, including absolute bash paths."""
+    return bool(_SHELL_LOCALE_WARNING_RE.search(line))
 
 
 def _split_tool_diagnostics(output: str) -> tuple[str, str]:
@@ -135,7 +141,7 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
         if not line.strip():
             continue
         # Prefix check first: a match path can contain "-<digit>" (".../pytest-686/...").
-        if line.lstrip().startswith(("rg: ", "grep: ")):
+        if line.lstrip().startswith(("rg: ", "grep: ")) or _is_shell_locale_warning(line):
             diagnostics.append(line)
         elif line == "--" or _SEARCH_OUTPUT_RE.match(line):
             payload.append(line)
@@ -207,7 +213,10 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
     if result.exit_code == 2 and not payload.strip():
         error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
         return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
-    lines = [ln for ln in payload.strip().split('\n') if ln]
+    lines = [
+        ln for ln in payload.strip().split('\n')
+        if ln and not _is_shell_locale_warning(ln)
+    ]
     if output_mode == "files_only":
         return SearchResult(
             files=lines[offset:offset + limit], total_count=len(lines),
@@ -252,6 +261,29 @@ def _posix_roots(roots: List[str]) -> bool:
         not re.match(r"^[A-Za-z]:[\\/]", root) and "\\" not in root for root in roots)
 
 
+def _parse_rg_resolution_output(output: str) -> Optional[str]:
+    """Extract the executable line from ``command -v rg`` output.
+
+    Login-shell startup diagnostics may be merged into the command output.
+    The production probe prefixes each ``command -v`` stdout line with a marker
+    inside the pipeline, so shell startup noise outside that pipeline is ignored.
+    The unmarked path parser preserves compatibility with older backend fakes.
+    """
+    marker = "__HERMES_RG_RESOLVED__"
+    marked = [line[len(marker):].strip() for line in output.splitlines() if line.startswith(marker)]
+    candidates = marked if marker in output else [line.strip() for line in output.splitlines() if line.strip()]
+    for candidate in candidates:
+        if candidate in {"yes", "rg"}:
+            return candidate
+        is_path = candidate.startswith(("/", "./", "../")) or bool(re.match(r"^[A-Za-z]:[\\/]", candidate))
+        marked_relative = marker in output and bool(
+            re.search(r"(?:^|[/\\])rg(?:\.exe)?$", candidate, re.IGNORECASE))
+        if (is_path or marked_relative) and re.search(
+                r"(?:^|[/\\])rg(?:\.exe)?$", candidate, re.IGNORECASE):
+            return candidate
+    return None
+
+
 class SearchMixin:
     """File-name and content search via rg with find/grep fallbacks. Requires
     ``_exec``, ``_has_command``, ``_expand_path``, ``_escape_shell_arg``,
@@ -270,13 +302,18 @@ class SearchMixin:
         cached = self._rg_resolution_cache.get(cmd)
         if cached:
             return cached
-        result = self._exec("command -v rg 2>/dev/null")
+        result = self._exec(
+            "command -v rg 2>/dev/null | { while IFS= read -r line; do "
+            "printf '%s%s\\n' '__HERMES_RG_RESOLVED__' \"$line\"; done; "
+            "printf '%s\\n' '__HERMES_RG_RESOLVED__'; }"
+        )
         if result.exit_code == 0 and result.stdout.strip():
-            resolved = result.stdout.strip().splitlines()[0]
+            resolved = _parse_rg_resolution_output(result.stdout)
             if resolved == "yes":  # compatibility with old boolean-probe fakes
                 resolved = "rg"
-            self._rg_resolution_cache[cmd] = resolved
-            return resolved
+            if resolved is not None:
+                self._rg_resolution_cache[cmd] = resolved
+                return resolved
         from tools.environments.local import LocalEnvironment, _IS_WINDOWS
 
         if _IS_WINDOWS and isinstance(self.env, LocalEnvironment):
@@ -780,7 +817,10 @@ class SearchMixin:
         result = self._run_rg_bounded([rg_cmd], fetch_limit, timeout=60, native_ok=not scoped_common,
                                       shell_prefix=f"set -o pipefail; {cd_prefix}")
         stdout, limit_reason = _search_stdout_and_limit(result)
-        all_files = [f for f in stdout.splitlines() if f]
+        all_files = [
+            f for f in stdout.splitlines()
+            if f and not _is_shell_locale_warning(f)
+        ]
         if scoped_common:
             all_files = [
                 f if posixpath.isabs(f) else posixpath.normpath(posixpath.join(scoped_common, f))

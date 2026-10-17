@@ -11,6 +11,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import re
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -1476,12 +1477,36 @@ class GatewayNotificationsMixin:
             return None
         # A site_id is emitted only by the validated BacklinkHub result contract.  An explicit
         # marker remains available for future event producers without changing generic notices.
-        status = str(result.get("status") or evt.get("status") or "completed")
+        stop_reason = str(
+            result.get("stop_reason")
+            or result.get("continuation_stop_kind")
+            or evt.get("stop_reason")
+            or evt.get("continuation_stop_kind")
+            or ""
+        ).strip().lower()
+        pause_messages = {
+            "permission_prompt_user_control": "原因：浏览器权限弹窗需要用户处理并确认后才能继续",
+            "user_control_or_permission_prompt": "原因：浏览器权限或用户接管需要处理后才能继续",
+            "task_space_unavailable": "原因：浏览器任务空间不可用，需要用户确认后才能继续",
+            "site_safety_pause": "原因：站点安全预算已暂停",
+        }
+        pause_message = pause_messages.get(stop_reason)
+        business_status = str(result.get("business_status") or "").strip()
+        delegation_status = str(
+            result.get("delegation_status") or evt.get("delegation_status") or ""
+        ).strip()
+        status = "已暂停" if pause_message else business_status or str(
+            result.get("status") or evt.get("status") or "completed"
+        )
         parts = [f"BacklinkHub 站点 {str(result['site_id']).strip()}", f"状态：{status}"]
+        if business_status and delegation_status and delegation_status != business_status:
+            parts.append(f"委托状态：{delegation_status}")
         if result.get("published") is not None:
             parts.append(f"已计入：{result['published']}")
         if result.get("remaining") is not None:
             parts.append(f"剩余：{result['remaining']}")
+        if pause_message:
+            parts.append(pause_message)
         return "；".join(parts)
 
     async def _send_backlinkhub_progress_notice(self, evt: dict, result: dict) -> None:
@@ -1490,23 +1515,38 @@ class GatewayNotificationsMixin:
 
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if source is None or getattr(source, "platform", None) != Platform.FEISHU:
-            return
+            return False
         adapter = self._resolve_injection_adapter("feishu", source)
         if adapter is None or not adapter_supports_push(adapter):
-            return
+            return False
         text = self._backlinkhub_progress_text(evt, result)
         if not text:
-            return
+            return False
         try:
-            metadata = self._thread_metadata_for_source(source)
+            metadata = dict(self._thread_metadata_for_source(source) or {})
+            metadata["_interim_send"] = True
+            from gateway.backlink_progress import backlinkhub_event_key
+            metadata["idempotency_key"] = backlinkhub_event_key(result | {"run_id": evt.get("run_id")}, kind="completion_progress")
             result_obj = await adapter.send(source.chat_id, text, metadata=metadata)
             if getattr(result_obj, "success", True) is False:
+                error = str(getattr(result_obj, "error", "") or "").strip()
+                if re.search(r"(?:^|\D)99992402(?:\D|$)", error) and "thread_id" in metadata:
+                    fallback_metadata = dict(metadata)
+                    fallback_metadata.pop("thread_id", None)
+                    fallback = await adapter.send(
+                        source.chat_id, text, metadata=fallback_metadata
+                    )
+                    if getattr(fallback, "success", True) is not False:
+                        return True
                 logger.warning(
                     "BacklinkHub progress notice with thread routing was rejected for site %s: %s",
-                    result.get("site_id"), getattr(result_obj, "error", "unknown error"),
+                    result.get("site_id"), error or "unknown error",
                 )
+                return False
         except Exception:
             logger.exception("BacklinkHub progress notice failed for site %s", result.get("site_id"))
+            return False
+        return True
 
     def _queue_backlinkhub_progress_notice(self, evt: dict) -> None:
         """Schedule at most one low-frequency notice per delegation/site identity."""
@@ -1516,21 +1556,49 @@ class GatewayNotificationsMixin:
         notified = getattr(self, "_backlinkhub_progress_notified", None)
         if notified is None:
             notified = self._backlinkhub_progress_notified = set()
+        deliveries = getattr(self, "_backlinkhub_progress_deliveries", None)
+        if deliveries is None:
+            deliveries = self._backlinkhub_progress_deliveries = {}
         lock = getattr(self, "_completion_delivery_lock", None)
+        from gateway.backlink_progress import backlinkhub_event_key
         for result in entries:
-            identity = (str(evt.get("delegation_id") or ""), str(result.get("site_id") or ""))
-            if not identity[0] or not identity[1]:
+            event = dict(result)
+            event.setdefault("run_id", evt.get("run_id"))
+            event_key = backlinkhub_event_key(event, kind="completion_progress")
+            route_identity = (str(evt.get("platform") or ""), str(evt.get("chat_id") or ""),
+                              str(evt.get("thread_id") or ""), str(evt.get("message_id") or ""))
+            if not result.get("site_id"):
                 continue
             if lock:
                 with lock:
-                    if identity in notified:
+                    state = deliveries.get(event_key)
+                    if state and state.get("status") in {"sending", "sent"}:
                         continue
-                    notified.add(identity)
-            elif identity in notified:
-                continue
-            else:
-                notified.add(identity)
-            task = asyncio.create_task(self._send_backlinkhub_progress_notice(evt, result))
+                    attempts = int(state.get("attempts", 0)) + 1 if state else 1
+                    deliveries[event_key] = {"status": "sending", "event_key": event_key,
+                                             "route_identity": route_identity, "attempts": attempts,
+                                             "last_error": None, "retryable": True}
+            task = asyncio.create_task(self._send_backlinkhub_progress_notice(evt, event))
+            def _settle(done, key=event_key):
+                try:
+                    error = done.exception()
+                except asyncio.CancelledError:
+                    error = RuntimeError("cancelled")
+                if lock:
+                    with lock:
+                        state = deliveries.get(key, {})
+                        try:
+                            succeeded = error is None and done.result() is True
+                        except Exception:
+                            succeeded = False
+                        if succeeded:
+                            state.update(status="sent", retryable=False, last_error=None)
+                            notified.add(key)
+                        else:
+                            state.update(status="failed", retryable=True,
+                                         last_error=str(error) if error else "adapter rejected or unavailable")
+                        deliveries[key] = state
+            task.add_done_callback(_settle)
             self._retain_background_task(task)
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
@@ -1541,8 +1609,71 @@ class GatewayNotificationsMixin:
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
+        from gateway.backlink_progress import (
+            build_live_progress, configured_interval, progress_due, relay_live_progress,
+        )
+        from tools.async_delegation import list_async_delegations
+        try:
+            from hermes_cli.config import load_config as _load_gateway_config
+            live_progress_interval = configured_interval(_load_gateway_config())
+        except Exception:
+            live_progress_interval = configured_interval({})
+        live_progress_sent = getattr(self, "_backlinkhub_live_progress_sent", None)
+        if live_progress_sent is None:
+            live_progress_sent = self._backlinkhub_live_progress_sent = {}
+        live_progress_attempted = getattr(self, "_backlinkhub_live_progress_attempted", None)
+        if live_progress_attempted is None:
+            live_progress_attempted = self._backlinkhub_live_progress_attempted = {}
+        live_deliveries = getattr(self, "_backlinkhub_live_progress_deliveries", None)
+        if live_deliveries is None:
+            live_deliveries = self._backlinkhub_live_progress_deliveries = {}
         while self._running:
             with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):
+                now = time.time()
+                for record in list_async_delegations():
+                    if record.get("status") not in {"running", "stalling", "stalled"}:
+                        continue
+                    if record.get("tool_profile") != "backlinkhub":
+                        continue
+                    delegation_id = str(record.get("delegation_id") or "")
+                    if not delegation_id or not progress_due(
+                        live_progress_attempted.get(delegation_id), now, live_progress_interval
+                    ):
+                        continue
+                    # Mark attempts before manifest I/O and relay so failures are
+                    # retried on the configured cadence, not every watcher tick.
+                    live_progress_attempted[delegation_id] = now
+                    snapshot = build_live_progress(record, now=now)
+                    if snapshot is None:
+                        continue
+                    from gateway.backlink_progress import backlinkhub_event_key
+                    event_key = backlinkhub_event_key(snapshot, kind="live_progress")
+                    lock = getattr(self, "_completion_delivery_lock", None)
+                    if lock:
+                        with lock:
+                            state = live_deliveries.get(event_key)
+                            if state and state.get("status") in {"sending", "sent"}:
+                                continue
+                            live_deliveries[event_key] = {
+                                "status": "sending", "event_key": event_key,
+                                "route_identity": (str(snapshot.get("platform") or ""), str(snapshot.get("chat_id") or ""), str(snapshot.get("thread_id") or "")),
+                                "attempts": int(state.get("attempts", 0)) + 1 if state else 1,
+                                "last_error": None, "retryable": True,
+                            }
+                    sent = await relay_live_progress(
+                        snapshot,
+                        validate_target=self._validate_backlinkhub_progress_target,
+                        build_source=self._build_process_event_source,
+                        resolve_adapter=self._resolve_injection_adapter,
+                        thread_metadata=self._thread_metadata_for_source,
+                        logger=logger,
+                    )
+                    if sent:
+                        live_progress_sent[delegation_id] = now
+                    if lock:
+                        with lock:
+                            live_deliveries[event_key].update(status="sent" if sent else "failed", retryable=not sent,
+                                                              last_error=None if sent else "adapter rejected or unavailable")
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.
@@ -1585,6 +1716,15 @@ class GatewayNotificationsMixin:
                         logger.error("Async delegation injection error: %s", e)
             await asyncio.sleep(interval)
 
+    async def _validate_backlinkhub_progress_target(self, event: dict) -> bool:
+        """Accept only the live canonical owner of an opaque parent session."""
+        session_key = str(event.get("session_key") or "").strip()
+        parent_id = str(event.get("parent_session_id") or "").strip()
+        if not session_key or not parent_id or parent_id == session_key:
+            return False
+        state, canonical = await self._resolve_recovery_parent_session_id(event, session_key)
+        return state == "deliver" and bool(canonical)
+
     async def _dispatch_recovery_continuation(self, evt: dict) -> Optional[bool]:
         """Dispatch a durable BacklinkHub recovery marker through the cached host agent.
 
@@ -1598,6 +1738,28 @@ class GatewayNotificationsMixin:
         delegation_id = str(evt.get("delegation_id") or "").strip()
         if not isinstance(request, dict) or not isinstance(task, dict) or not session_key or not delegation_id:
             return False
+        identity_state, canonical_session_id = await self._resolve_recovery_parent_session_id(evt, session_key)
+        if identity_state == "retry":
+            return None
+        if identity_state == "terminal":
+            # A legacy marker without a durable parent id must never attach to
+            # whichever session currently owns the route after /new. Consume
+            # it through the existing durable claim/drop path instead of
+            # retrying forever or resurrecting the wrong conversation.
+            claim_id = f"gateway-recovery:{id(self)}:{delegation_id}"
+            from tools.async_delegation import (
+                claim_completion_delivery, claim_recovery_continuation,
+                drop_completion_delivery, get_durable_delegation, recovery_continuation_state,
+            )
+            if not claim_recovery_continuation(delegation_id, claim_id):
+                durable = get_durable_delegation(delegation_id)
+                if durable and durable.get("delivery_state") in {"dropped", "delivered"}:
+                    return True
+                return None if recovery_continuation_state(delegation_id) == "claimed" else True
+            delivery_claim = f"gateway-recovery-drop:{id(self)}:{delegation_id}"
+            if claim_completion_delivery(delegation_id, delivery_claim):
+                drop_completion_delivery(delegation_id, delivery_claim)
+            return True
         cache = getattr(self, "_agent_cache", None)
         lock = getattr(self, "_agent_cache_lock", None)
         cached = None
@@ -1605,13 +1767,17 @@ class GatewayNotificationsMixin:
             with lock if lock is not None else suppress():
                 cached = cache.get(session_key)
         parent_agent = cached[0] if isinstance(cached, tuple) and cached else cached
+        if parent_agent is not None and str(getattr(parent_agent, "session_id", "") or "") != canonical_session_id:
+            # The route key can point at a fresh session after /new; never
+            # mutate or reuse a cached agent owned by the prior conversation.
+            parent_agent = None
         if parent_agent is None:
             source = await asyncio.to_thread(self._build_process_event_source, evt)
             if source is None:
                 return None
             try:
                 parent_agent = await asyncio.to_thread(
-                    self._build_recovery_parent_agent, source, session_key,
+                    self._build_recovery_parent_agent, source, session_key, canonical_session_id,
                 )
             except Exception:
                 logger.warning("Could not build recovery parent agent for %s", delegation_id, exc_info=True)
@@ -1634,7 +1800,7 @@ class GatewayNotificationsMixin:
                 chat_id=str(evt.get("chat_id") or ""), chat_type=str(evt.get("chat_type") or ""),
                 thread_id=str(evt.get("thread_id") or ""), user_id=str(evt.get("user_id") or ""),
                 user_name=str(evt.get("user_name") or ""), scope_id=str(evt.get("scope_id") or ""),
-                session_key=session_key, session_id=str(evt.get("parent_session_id") or session_key),
+                session_key=session_key, session_id=str(getattr(parent_agent, "session_id", "") or canonical_session_id),
                 ui_session_id=str(evt.get("origin_ui_session_id") or ""), async_delivery=True,
             )
             try:
@@ -1662,7 +1828,59 @@ class GatewayNotificationsMixin:
         release_recovery_continuation(delegation_id, claim_id)
         return False
 
-    def _build_recovery_parent_agent(self, source: SessionSource, session_key: str):
+    async def _resolve_recovery_parent_session_id(
+        self, evt: dict, session_key: str,
+    ) -> tuple[str, Optional[str]]:
+        """Resolve a recovery marker to ``(state, opaque parent session id)``.
+
+        Recovery markers created before this identity was persisted are deliberately
+        rejected: the route key alone cannot distinguish the original conversation
+        from a later ``/new`` session.
+        """
+        parent_id = str(evt.get("parent_session_id") or "").strip()
+        if not parent_id or parent_id == session_key:
+            return "terminal", None
+        session_db = getattr(self, "_session_db", None)
+        session_store = getattr(self, "session_store", None)
+        if session_db is None or session_store is None:
+            return "retry", None
+        try:
+            parent = await session_db.get_session(parent_id)
+            target_state = await self._classify_completion_target(parent_id)
+            if target_state == "retry":
+                return "retry", None
+            if target_state == "terminal":
+                return "terminal", None
+            entry = await asyncio.to_thread(session_store.lookup_by_session_key, session_key)
+        except Exception:
+            logger.debug("Recovery parent identity lookup failed for %s", session_key, exc_info=True)
+            return "retry", None
+        if not parent:
+            return "terminal", None
+        if entry is None:
+            return "retry", None
+        if str(entry.session_id) == parent_id:
+            return "deliver", parent_id
+        # Normal expiry/idle endings remain routable: the route may already point
+        # at the successor session, just as the async-completion resolver does.
+        # User boundaries were terminally classified above; compression has its
+        # explicit tip validation below.
+        if parent.get("ended_at") and str(parent.get("end_reason") or "") != "compression":
+            return "deliver", str(entry.session_id)
+        # Compression requires an explicit live tip. The existing classifier has
+        # already verified it; route ownership must also match that tip.
+        if str(parent.get("end_reason") or "") == "compression":
+            try:
+                tip_id = await session_db.get_compression_tip(parent_id)
+            except Exception:
+                return "retry", None
+            if tip_id and str(entry.session_id) == str(tip_id):
+                return "deliver", str(tip_id)
+        return "terminal", None
+
+    def _build_recovery_parent_agent(
+        self, source: SessionSource, session_key: str, session_id: str,
+    ):
         """Construct the host parent used by a recovery dispatch, without a model turn."""
         from run_agent import AIAgent
         from gateway.run import (
@@ -1683,7 +1901,7 @@ class GatewayNotificationsMixin:
             max_iterations=_current_max_iterations(), quiet_mode=True, verbose_logging=False,
             enabled_toolsets=enabled, disabled_toolsets=disabled,
             reasoning_config=reasoning, service_tier=service_tier,
-            session_id=session_key, platform=platform_key,
+            session_id=session_id, platform=platform_key,
             user_id=source.user_id, user_id_alt=source.user_id_alt, user_name=source.user_name,
             chat_id=source.chat_id, chat_name=source.chat_name, chat_type=source.chat_type,
             thread_id=source.thread_id, gateway_session_key=session_key,

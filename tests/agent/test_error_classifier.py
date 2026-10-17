@@ -464,6 +464,12 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
 
+    def test_524_cloudflare_timeout_falls_back_without_retry_loop(self):
+        result = classify_api_error(MockAPIError("Cloudflare timeout", status_code=524))
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
+
 
     def test_408_request_timeout_is_retryable_timeout(self):
         """HTTP 408 Request Timeout is a transient timing failure the server
@@ -518,6 +524,30 @@ class TestClassifyApiError:
             "Rate limit exceeded: too many requests", status_code=429
         )
         result = classify_api_error(e, provider="zai")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.should_rotate_credential is True
+
+    def test_glm_1308_usage_wall_is_billing_without_key_rotation(self):
+        e = MockAPIError(
+            "5-hour usage quota exhausted; usage window exhausted",
+            status_code=429,
+            body={"error": {"code": "1308", "message": "5-hour usage quota exhausted"}},
+        )
+        result = classify_api_error(e, provider="zai", model="glm-5.3-flash")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_rotate_credential is False
+        assert result.error_context["code"] == "1308"
+        assert result.error_context["quota_wall"] is True
+
+    def test_glm_1308_with_reset_is_regular_rate_limit(self):
+        e = MockAPIError(
+            "usage quota exceeded; retry after 30 seconds",
+            status_code=429,
+            body={"error": {"code": "1308", "message": "retry after 30 seconds"}},
+        )
+        result = classify_api_error(e, provider="zai", model="glm-5.3-flash")
         assert result.reason == FailoverReason.rate_limit
         assert result.should_rotate_credential is True
 
